@@ -1,5 +1,7 @@
 # Ada
 
+[![Deploy on Astropods](assets/deploy-button.svg)](https://astropods.com/astropods/ada-your-personal-coding-agent)
+
 **Ada** is a coding agent powered by Claude Code. It runs a Claude Code session
 headlessly inside a container and re-emits its output as **AG-UI** events over
 **SSE**, so any AG-UI-compatible frontend (CopilotKit, custom dashboards) can

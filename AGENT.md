@@ -11,7 +11,7 @@ capabilities:
   - "Serves an AG-UI-compatible frontend; external AG-UI clients (e.g. CopilotKit) can consume the stream"
   - "Connects each user's GitHub via per-user OAuth so git/gh act as them"
   - "Persists the final run result (cost, usage) and exports OTel traces/metrics"
-repository: github:rabbah/ada
+repository: github:astropods/ada
 integrations: [GitHub, Slack]
 ---
 
