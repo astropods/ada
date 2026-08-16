@@ -1,27 +1,28 @@
 /**
- * OpenTelemetry sink — subscribes to the SAME stream-json events as the
- * translator (source of truth) and turns them into OTLP traces + metrics for
- * the collector. Follows OTel GenAI semantic conventions (`gen_ai.*`).
+ * OpenTelemetry sink — subscribes to the SAME Flue events as the translator
+ * (source of truth) and turns them into OTLP traces + metrics for the
+ * collector. Follows OTel GenAI semantic conventions (`gen_ai.*`).
  *
- * Traces:  one root span per run; a child span per tool call (opened on the
- *          Claude `tool_use`, closed on the matching `tool_result`).
- * Metrics: token counters (input/output/cache r+w), tool-invocation counter by
- *          tool name, and a cost histogram in USD.
- * Cost:    prefer `result.total_cost_usd` / `model_usage[].cost_usd`; fall back
- *          to the pricing table in config/model.ts (the gateway-swap basis).
+ * Traces:  one root span per turn; a child span per tool call (opened on
+ *          `tool_start`, closed on the matching `tool`).
+ * Metrics: token counters (input/output/cache r+w), a tool-invocation counter
+ *          by tool name, and a cost histogram in USD.
+ * Cost:    taken from `turn.response.usage.cost.total`, which pi-ai computes
+ *          from the model catalog. The hand-maintained pricing table this
+ *          module used to fall back to is gone — the catalog covers both the
+ *          direct and gateway paths.
  *
- * Degrades to a no-op if `@opentelemetry/api` isn't installed, so the bridge
+ * Degrades to a no-op if `@opentelemetry/api` isn't installed, so the agent
  * runs without the telemetry deps during development. Wire the real SDK +
  * OTLP exporter via the astropods telemetry adapter (see README).
  *
  * Never records the API key or full env as span attributes.
  */
 
-import { computeCostUsd } from "../config/model.ts";
-import type { StreamJsonEvent } from "../types/streamjson.ts";
+import type { FlueEvent } from "@flue/runtime";
 
 export interface Telemetry {
-  onEvent(sessionId: string, ev: StreamJsonEvent): void;
+  onEvent(sessionId: string, ev: FlueEvent): void;
   endSession(sessionId: string): void;
 }
 
@@ -48,7 +49,7 @@ interface OtelApi {
  * Assumes an OTLP exporter/provider is configured out-of-process by the
  * astropods adapter (OTEL_EXPORTER_OTLP_ENDPOINT etc.); we only use the API.
  */
-export async function createTelemetry(serviceName = "claude-code-agui-bridge"): Promise<Telemetry> {
+export async function createTelemetry(serviceName = "ada"): Promise<Telemetry> {
   let otel: OtelApi;
   try {
     otel = (await import("@opentelemetry/api")) as unknown as OtelApi;
@@ -70,76 +71,89 @@ export async function createTelemetry(serviceName = "claude-code-agui-bridge"): 
     root: Span;
     rootCtx: unknown;
     model: string;
-    toolSpans: Map<string, { span: Span; name: string }>;
+    turns: number;
+    tokens: { input: number; output: number };
+    cost: number;
+    toolSpans: Map<string, Span>;
   }
   const ctx = new Map<string, Ctx>();
 
   return {
     onEvent(sessionId, ev) {
       switch (ev.type) {
-        case "system": {
-          if ("subtype" in ev && ev.subtype === "init") {
-            const model = ("model" in ev && ev.model) || "unknown";
-            const root = tracer.startSpan("claude_code.run");
-            root.setAttribute("gen_ai.system", "anthropic");
-            root.setAttribute("gen_ai.operation.name", "agent");
-            root.setAttribute("gen_ai.request.model", model);
-            root.setAttribute("claude_code.session_id", sessionId);
-            const rootCtx = otel.trace.setSpan(otel.context.active(), root);
-            ctx.set(sessionId, { root, rootCtx, model, toolSpans: new Map() });
-          }
-          break;
-        }
-        case "assistant": {
-          const c = ctx.get(sessionId);
-          if (!c) break;
-          for (const block of ev.message.content) {
-            if (block.type === "tool_use") {
-              const span = tracer.startSpan("claude_code.tool", undefined, c.rootCtx);
-              span.setAttribute("gen_ai.tool.name", block.name);
-              span.setAttribute("gen_ai.tool.call.id", block.id);
-              c.toolSpans.set(block.id, { span, name: block.name });
-              toolInvocations.add(1, { "gen_ai.tool.name": block.name });
-            }
-          }
-          const u = ev.message.usage;
-          if (u) {
-            inputTokens.add(u.input_tokens ?? 0, { "gen_ai.request.model": c.model });
-            outputTokens.add(u.output_tokens ?? 0, { "gen_ai.request.model": c.model });
-          }
-          break;
-        }
-        case "user": {
-          const c = ctx.get(sessionId);
-          if (!c) break;
-          for (const block of ev.message.content) {
-            if (block.type === "tool_result") {
-              const t = c.toolSpans.get(block.tool_use_id);
-              if (t) {
-                t.span.setAttribute("claude_code.tool.is_error", Boolean(block.is_error));
-                t.span.end();
-                c.toolSpans.delete(block.tool_use_id);
-              }
-            }
-          }
-          break;
-        }
-        case "result": {
-          const c = ctx.get(sessionId);
-          if (!c) break;
-          const u = ev.usage ?? {};
-          cacheReadTokens.add(u.cache_read_input_tokens ?? 0, { "gen_ai.request.model": c.model });
-          cacheWriteTokens.add(u.cache_creation_input_tokens ?? 0, { "gen_ai.request.model": c.model });
-          const cost = ev.total_cost_usd ?? computeCostUsd(c.model, u) ?? 0;
-          costUsd.record(cost, {
-            "gen_ai.request.model": c.model,
-            "claude_code.cost_source": ev.total_cost_usd != null ? "reported" : "computed",
+        case "agent_start": {
+          const root = tracer.startSpan("ada.run");
+          root.setAttribute("gen_ai.system", "anthropic");
+          root.setAttribute("gen_ai.operation.name", "agent");
+          root.setAttribute("ada.session_id", sessionId);
+          if (ev.agentName) root.setAttribute("gen_ai.agent.name", ev.agentName);
+          ctx.set(sessionId, {
+            root,
+            rootCtx: otel.trace.setSpan(otel.context.active(), root),
+            model: "unknown",
+            turns: 0,
+            tokens: { input: 0, output: 0 },
+            cost: 0,
+            toolSpans: new Map(),
           });
-          c.root.setAttribute("gen_ai.usage.input_tokens", u.input_tokens ?? 0);
-          c.root.setAttribute("gen_ai.usage.output_tokens", u.output_tokens ?? 0);
-          c.root.setAttribute("claude_code.cost_usd", cost);
-          c.root.setAttribute("claude_code.num_turns", ev.num_turns ?? 0);
-          c.root.setAttribute("claude_code.is_error", Boolean(ev.is_error));
+          break;
+        }
+        case "tool_start": {
+          const c = ctx.get(sessionId);
+          if (!c) break;
+          const span = tracer.startSpan("ada.tool", undefined, c.rootCtx);
+          span.setAttribute("gen_ai.tool.name", ev.toolName);
+          span.setAttribute("gen_ai.tool.call.id", ev.toolCallId);
+          c.toolSpans.set(ev.toolCallId, span);
+          toolInvocations.add(1, { "gen_ai.tool.name": ev.toolName });
+          break;
+        }
+        case "tool": {
+          const c = ctx.get(sessionId);
+          const span = c?.toolSpans.get(ev.toolCallId);
+          if (!c || !span) break;
+          span.setAttribute("ada.tool.is_error", Boolean(ev.isError));
+          span.setAttribute("ada.tool.duration_ms", ev.durationMs);
+          span.end();
+          c.toolSpans.delete(ev.toolCallId);
+          break;
+        }
+        case "turn": {
+          const c = ctx.get(sessionId);
+          if (!c) break;
+          c.turns += 1;
+          const model = ev.response?.responseModel;
+          if (model) c.model = model;
+          const u = ev.response?.usage;
+          if (!u) break;
+          const attrs = { "gen_ai.request.model": c.model };
+          inputTokens.add(u.input, attrs);
+          outputTokens.add(u.output, attrs);
+          cacheReadTokens.add(u.cacheRead, attrs);
+          cacheWriteTokens.add(u.cacheWrite, attrs);
+          c.tokens.input += u.input;
+          c.tokens.output += u.output;
+          const turnCost = u.cost?.total ?? 0;
+          c.cost += turnCost;
+          costUsd.record(turnCost, { ...attrs, "ada.cost_source": "catalog" });
+          break;
+        }
+        case "agent_end": {
+          const c = ctx.get(sessionId);
+          if (!c) break;
+          c.root.setAttribute("gen_ai.request.model", c.model);
+          c.root.setAttribute("gen_ai.usage.input_tokens", c.tokens.input);
+          c.root.setAttribute("gen_ai.usage.output_tokens", c.tokens.output);
+          c.root.setAttribute("ada.cost_usd", c.cost);
+          c.root.setAttribute("ada.num_turns", c.turns);
+          c.root.setAttribute("ada.is_error", false);
+          break;
+        }
+        case "submission_settled": {
+          const c = ctx.get(sessionId);
+          if (!c) break;
+          c.root.setAttribute("ada.is_error", ev.outcome !== "completed");
+          if (ev.error?.message) c.root.setAttribute("ada.error", ev.error.message);
           break;
         }
       }
@@ -147,7 +161,7 @@ export async function createTelemetry(serviceName = "claude-code-agui-bridge"): 
     endSession(sessionId) {
       const c = ctx.get(sessionId);
       if (!c) return;
-      for (const { span } of c.toolSpans.values()) span.end(); // close any leaked tool spans
+      for (const span of c.toolSpans.values()) span.end(); // close any leaked tool spans
       c.root.end();
       ctx.delete(sessionId);
     },

@@ -2,13 +2,12 @@
 
 [![Deploy on Astropods](assets/deploy-button.svg)](https://astropods.com/astropods/ada-your-personal-coding-agent)
 
-**Ada** is a coding agent powered by Claude Code. It runs a Claude Code session
-headlessly inside a container and re-emits its output as **AG-UI** events over
-**SSE**, so any AG-UI-compatible frontend (CopilotKit, custom dashboards) can
-consume it directly. You converse with it over **Slack / web chat** (the Astro
-messaging sidecar) or the built-in AG-UI frontend. It's an Astropods/K8s
-workload: a wrapper process that drives a Claude Agent SDK session and exposes it
-over a clean event API.
+**Ada** is a coding agent built on **[Flue 2.0](https://flueframework.com)**, the
+open TypeScript agent framework. The agent loop runs **in-process**; its event
+stream is re-emitted as **AG-UI** events over **SSE**, so any AG-UI-compatible
+frontend (CopilotKit, custom dashboards) can consume it directly. You converse
+with it over **Slack / web chat** (the Astro messaging sidecar) or the built-in
+AG-UI frontend. It's an Astropods/K8s workload.
 
 > **Why the name?** Named for **Ada Lovelace** (1815–1852), who wrote the first
 > algorithm intended to be carried out by a machine and is widely regarded as the
@@ -18,36 +17,55 @@ over a clean event API.
 
 > Status: **usable, with SCAFFOLD edges.** Multi-turn sessions, per-session
 > sandbox workspaces, GitHub per-user OAuth, the Astro AI Gateway path, and
-> Slack/web messaging are all real. Durability/GC of the in-memory session
-> registry, workspace cleanup, cookie signing, and token encryption-at-rest are
-> still `TODO` (grep the source).
+> Slack/web messaging are all real. Conversation durability across restarts,
+> registry GC, cookie signing, and token encryption-at-rest are still `TODO`
+> (grep the source, and see Limitations).
 
-## Run the demo (no API key, no network, no frontend)
+## The agent
 
-Node ≥ 23 runs the TypeScript sources directly (type-stripping). The demo needs
-no dependencies.
+The whole agent is a function. Flue's hooks decide what it can do, and the
+decision is re-made on every render — which is why the GitHub guidance and the
+`checkout_repo` tool appear the moment a user connects, mid-conversation, with
+no restart:
 
-```bash
-npm run demo         # AG-UI event list + sample SSE frames + cost summary
-npm run demo:sse     # raw SSE frames only
-# (or: node scripts/demo-translate.ts [--sse])
+```ts
+// agent/agents/ada.ts
+'use agent';
+
+export function Ada({ id }: AgentProps) {
+  const env = getSessionEnv(id);
+
+  useModel(env.modelRef, { thinkingLevel: 'medium' });
+  useSandbox(local({ cwd: env.cwd, env: env.sandboxEnv }), { cwd: env.cwd });
+  useInstruction(githubPromptGuidance({ ... }));
+  if (env.githubConnected) useTool(checkoutRepo(id));
+
+  return ROLE; // the return value IS the system instructions
+}
+Ada.agentName = 'ada';
 ```
 
-It feeds `fixtures/read-edit-report.streamjson.jsonl` (a recorded Claude Code
-`read → edit → report` run) through the translator and prints the AG-UI
-payloads. This validates the mapping logic only — it does not spawn anything.
-See "AG-UI output" below for the produced sequence.
+`useSandbox()` is what gives Ada `read`/`write`/`edit`/`bash`/`grep`/`glob` — the
+coding toolset is a property of having an environment, not a list we maintain.
 
-## Run live locally (real Claude Agent SDK + built-in test client)
+## Run it
 
-Prerequisites on your machine: the `claude` CLI on `PATH` (the SDK spawns it),
-and a model credential. Locally the simplest is a personal key, which routes
-directly to Anthropic (bypassing the gateway):
+Node ≥ 23 runs the TypeScript sources directly (type-stripping), so the default
+path needs no build step. Locally the simplest credential is a personal Anthropic
+key, which routes directly to Anthropic (bypassing the gateway):
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...        # never logged; only passed to the child
-node agent/index.ts                        # -> http://localhost:8080
+export ANTHROPIC_API_KEY=sk-ant-...
+node agent/index.ts                  # -> http://localhost:8080
 ```
+
+Three entry points, all sharing `agent/agents/ada.ts`:
+
+| Command | What it is |
+|---|---|
+| `node agent/index.ts` | No build step. Calls Flue's `start()` to configure the runtime, then serves `agent/app.ts`. |
+| `vite build && node dist/server.mjs` | The Flue Node target. The generated entry configures the runtime itself. |
+| `npx flue run agent/agents/ada.ts --message "…"` | One turn in the terminal, no HTTP. Quickest way to check a prompt or tool change. |
 
 Open `http://localhost:8080/`, type a prompt (e.g. "read package.json and tell
 me the version"), and watch the AG-UI stream render as chat. Keep replying to
@@ -60,37 +78,42 @@ connect/setup).
 chat by default. Append **`?debug`** (`http://localhost:8080/?debug`) to reveal
 a right-hand panel with the raw AG-UI events and their sequence numbers, plus
 **Disconnect** / **Reconnect (replay)** buttons that demonstrate lossless
-catch-up via `Last-Event-ID`. Dev/inspection tool only — hidden by default,
-never part of an end-user UI. (The built-in client is itself a test harness;
-real frontends like CopilotKit consume the same SSE stream.)
+catch-up via `Last-Event-ID`. Dev/inspection tool only — hidden by default.
 
 The client is a single dependency-free file (`public/index.html`) served
-same-origin (no CORS, no build). Each session runs in its own writable temp
-workspace (see `agent/session/workspace.ts`), not the process CWD.
+same-origin (no CORS, no build). Each session runs in its own writable workspace
+(see `agent/session/workspace.ts`), not the process CWD.
 
 ## HTTP API
 
-The built-in client and any external AG-UI client drive the same pipeline:
+Two front doors, deliberately. `/sessions/*` is Ada's own AG-UI-over-SSE
+contract — what the built-in client, the messaging adapter, and external AG-UI
+clients speak. `/agents/ada/*` is Flue's native router for `@flue/sdk` clients.
+Both address the **same durable instances**, so a session started over one is
+readable over the other.
 
 | Route | Purpose |
 |---|---|
 | `GET  /` | Built-in AG-UI test client (`public/index.html`) |
-| `POST /sessions` `{prompt, allowedTools?, permissionMode?}` | Start a session → `{sessionId}` |
+| `POST /sessions` `{prompt}` | Start a session → `{sessionId}` |
 | `POST /sessions/:id/messages` `{prompt}` | Continue a session with a follow-up turn |
+| `DELETE /sessions/:id` | Drop a session (event log, workspace, Flue state) |
 | `GET  /sessions/:id/events` | SSE AG-UI stream; honours `Last-Event-ID` replay |
+| `GET  /conversations` | List handled conversations (admin-gated) |
 | `GET  /api/whoami` | Resolved identity + admin + GitHub connection state |
 | `GET  /auth/github/login` · `/callback` · `/status` | Per-user GitHub App OAuth |
 | `GET  /api/setup/github/start` · `/callback` · `/api/setup/status` | Web-driven GitHub App provisioning |
+| `ALL  /agents/ada/:id` | Flue's native agent routes (`@flue/sdk`) |
 
 Only one turn runs at a time per session — an overlapping `POST .../messages`
-returns `409 busy`. When a deployment gates access, an unauthorized request gets
-a themed `401` instead of the app shell.
+returns `409 busy`. (Flue serializes concurrent deliveries to one instance
+anyway; the 409 is kept because the AG-UI client relies on it to keep its own
+turn state coherent.) When a deployment gates access, an unauthorized request
+gets a themed `401` instead of the app shell.
 
 ## Run on the Astro platform (container, cloud)
 
 The agent is packaged for Astropods (`astropods.yml` + `Dockerfile` + `AGENT.md`).
-Claude Code runs **inside the container** — the image bakes in the `claude` CLI
-(plus `git` + `gh`).
 
 ```bash
 ast project start        # build + run the container locally (frontend on :80)
@@ -103,24 +126,24 @@ Key facts:
   client + SSE API are served there and exposed at `ASTRO_EXTERNAL_AGENT_URL`.
 - **`agent.interfaces.messaging: true`** → the platform's messaging sidecar
   (web chat / Slack) is deployed. It normalizes each inbound message and streams
-  it over gRPC (`GRPC_SERVER_ADDR`); `agent/messaging/adapter.ts` (a Claude Code
-  `AgentAdapter`) runs our side, so a Slack thread becomes one continuous Claude
-  conversation. **No Slack tokens needed** — Slack is platform-managed.
+  it over gRPC (`GRPC_SERVER_ADDR`); `agent/messaging/adapter.ts` runs our side,
+  so a Slack thread becomes one durable Flue instance. **No Slack tokens
+  needed** — Slack is platform-managed.
 - **`astro_ai_gateway: true`** → model calls route through the Astro AI Gateway
   (injects `ASTRO_GATEWAY_URL` + `ASTRO_GATEWAY_API_KEY`); no personal key baked
-  in. See "Model routing & auth" below. Opt out per-deploy with the optional
+  in. See "Model routing & auth". Opt out per-deploy with the optional
   `ANTHROPIC_API_KEY` input (talks to Anthropic directly).
 - **`knowledge.db: postgres`** → platform-managed Postgres (`POSTGRES_*`) stores
-  per-user GitHub OAuth tokens, the GitHub App creds, and the server HMAC secret.
+  per-user GitHub OAuth tokens, the GitHub App creds, repo bindings, and the
+  server HMAC secret.
 - **`ADMIN_EMAILS`** (optional input) → comma-separated admin emails allowed to
   provision the GitHub App from the web UI (matched against the ALB-verified
   identity). Unset ⇒ any signed-in user may do the *initial* setup, then it locks.
 - **`GITHUB_APP_PUBLIC`** (optional input, default `false`) → provision the GitHub
-  App **private** (single-tenant: only the owning account can install it). Set
-  `true` for **multi-tenant** so any teammate can install it on their own repos
-  and connect via chat.
-- The `claude` CLI version is a **build arg** (`CLAUDE_CODE_VERSION`, default
-  `latest`) — **pin it** in production (see Pin list #1).
+  App **private** (single-tenant). Set `true` for **multi-tenant** so any
+  teammate can install it on their own repos and connect via chat.
+- The image bakes in **`git` + `gh`** — the toolchain the sandbox shells out to.
+  There is no `claude` CLI to install and no `CLAUDE_CODE_VERSION` to pin.
 
 `dev.command` (`node --watch agent/index.ts`) is the `ast dev` hot-reload path:
 the container bind-mounts `agent/` so host edits reload live (this is why the
@@ -129,13 +152,12 @@ source lives in `agent/`). Local `ast dev` adapters are `[web, slack]`.
 ## Tests
 
 End-to-end tests (Playwright) cover the SSE reconnect fix and session delete — no
-model credential needed. The server boots on Node alone (every external dep is
-dynamically imported and guarded), and a test-only `POST /test/seed` hook builds a
-replayable session from the recorded fixture, so the transport/registry behaviour
-is exercised without a real Claude run.
+model credential needed. A test-only `POST /test/seed` hook builds a replayable
+session from a recorded fixture of Flue events, so the transport/registry
+behaviour is exercised without a real model run.
 
 ```bash
-npm install                                   # brings in @playwright/test
+npm install
 npx playwright install --with-deps chromium   # one-time browser download
 npm test                                       # or: npm run test:ui
 ```
@@ -144,8 +166,7 @@ npm test                                       # or: npm run test:ui
   stale `?lastEventId=-1` query (reconnect *resumes*, not full-replays), plus
   `DELETE /sessions/:id` semantics (204 → 404; events 404 afterward).
 - `test/client-reconnect.spec.ts` — mocks the SSE endpoint to force repeated
-  full-buffer replays and asserts the client renders `✓ finished` exactly once
-  (the reconnect-dedupe fix).
+  full-buffer replays and asserts the client renders `✓ finished` exactly once.
 - `test/client-delete.spec.ts` — the ✕ in the session menu issues `DELETE
   /sessions/:id` and removes the row.
 
@@ -155,47 +176,70 @@ on every push to `main` and every PR (`.github/workflows/e2e.yml`).
 
 ## Architecture
 
-One internal pipeline, three sinks. The parsed stream-json event stream is the
-single source of truth; the translator, telemetry, and persistence each
-subscribe independently, so what the client sees can't drift from what's billed.
-The same pipeline feeds both the SSE/AG-UI frontend and the messaging sidecar.
+One internal pipeline, three sinks. Flue's event stream is the single source of
+truth; the translator, telemetry, and persistence each subscribe independently,
+so what the client sees can't drift from what's billed. The same pipeline feeds
+both the SSE/AG-UI frontend and the messaging sidecar.
 
 ```
  HTTP (POST /sessions) ─┐
- Slack / web (sidecar) ─┴─▶ per-session sandbox workspace (cwd)
-                                    │
-                                    ▼
- ClaudeAgentSession ──▶ Claude Agent SDK query() ──spawns──▶ `claude` (stream-json)
-        │  emits parsed stream-json / SDK-message events
-        ├──────────────▶ Translator ──▶ SessionRegistry (per-session AG-UI log, seq'd)
-        │                                        │
-        │                                        └──▶ SSE emitter (Last-Event-ID replay)
-        ├──────────────▶ Telemetry (OTel spans/metrics; cost → $)
-        └──────────────▶ ResultStore (final result persisted for billing)
+ Slack / web (sidecar) ─┴─▶ SessionRunner
+                                │  setSessionEnv(id, …)   ← workspace, GH token, repo
+                                │  init(Ada, {id}).dispatch(prompt)
+                                ▼
+                          Flue agent loop  (in-process; sandbox = local())
+                                │  observe() — FlueEvent stream
+        ┌───────────────────────┼───────────────────────┐
+        ▼                       ▼                       ▼
+   Translator            Telemetry (OTel          ResultStore
+        │                 spans/metrics)          (usage + cost)
+        ▼
+  SessionRegistry (per-session AG-UI log, seq'd)
+        │
+        └──▶ SSE emitter (Last-Event-ID replay)
 ```
 
 | Module | Responsibility |
 |---|---|
-| `agent/config/model.ts` | **Isolated swap seam.** Model resolution, the **sandboxed spawn env** (allowlist only; host secrets dropped), gateway-vs-direct routing, pricing table + cost. |
-| `agent/claude/agent.ts` | **Default source.** Runs the Claude Agent SDK `query()` with the `claude_code` preset via `@astropods/adapter-claude-agent-sdk` (OTel-instrumented); yields typed messages (same envelopes as stream-json) → same Translator. Spawns the `claude` binary, so it must be in the image. |
-| `agent/claude/supervisor.ts` | Alternative source: spawns `claude -p` directly and parses NDJSON. Kept as a fallback; same event interface as the SDK source. |
-| `agent/translate/translator.ts` | Pure stream-json/SDK-message → AG-UI mapping. Stateful per run. |
-| `agent/session/registry.ts` | Per-session AG-UI event log with monotonic seq → lossless reconnect. Decoupled from transport. Accumulates all turns of a session. |
-| `agent/session/workspace.ts` | Per-session writable temp workspace (the child's cwd), reused across turns. |
-| `agent/messaging/adapter.ts` | Claude Code `AgentAdapter` for the Astro messaging sidecar (web/Slack); maps AG-UI events onto the sidecar hooks and resumes threads. |
-| `agent/auth/*` | Per-user GitHub App OAuth (`github-app`, `app-config`), web-driven App-Manifest provisioning (`setup`), signed chat connect links (`connect`), and ALB-identity resolution (`authz`). |
-| `agent/store/*` | Postgres-backed store (GitHub tokens, App creds, server secret); in-memory fallback. |
+| `agent/agents/ada.ts` | **The agent.** A `'use agent'` function whose hooks declare model, sandbox, instructions, and tools per render. |
+| `agent/agents/session-env.ts` | Per-instance context (workspace, GH token, repo) held **out of durable state** — see below. |
+| `agent/agents/tools.ts` | Application tools (`checkout_repo`) — work needing a credential or a server-side decision. |
+| `agent/config/model.ts` | **Isolated swap seam.** Model resolution, the custom Astro AI Gateway pi-ai provider, and the scrubbed sandbox env. |
+| `agent/session/runner.ts` | Drives Flue instances (`init`/`dispatch`/`read`), fans `observe()` events into the registry, telemetry, and results. |
+| `agent/translate/translator.ts` | Pure `FlueEvent` → AG-UI mapping. Stateful per session. |
+| `agent/session/registry.ts` | Per-session AG-UI event log with monotonic seq → lossless reconnect. Decoupled from transport. |
+| `agent/session/workspace.ts` | Per-session writable workspace (the sandbox cwd), reused across turns, TTL-GC'd. |
+| `agent/db.ts` | Flue's durable conversation store (SQLite). Read by both server entries. |
+| `agent/app.ts` | The Hono route map: AG-UI routes, Flue's native routes, auth, setup. |
+| `agent/index.ts` | Standalone Node entry — `start()`s the runtime, then serves `app.ts`. |
+| `agent/messaging/adapter.ts` | `AgentAdapter` for the Astro messaging sidecar (web/Slack); directives + delegation to the runner. |
+| `agent/auth/*` | Per-user GitHub App OAuth, App-Manifest provisioning, signed chat connect links, ALB-identity resolution. |
+| `agent/store/*` | Postgres-backed store (GitHub tokens, App creds, repo bindings, server secret); in-memory fallback. |
 | `agent/transport/sse.ts` | AG-UI SSE framing + `Last-Event-ID` replay. |
 | `agent/telemetry/*` | OTel GenAI-semconv traces + metrics; cost. No-op without `@opentelemetry/api`. |
-| `agent/persistence/results.ts` | Persist final `result` (cost, usage, turns) for billing/observability. |
-| `agent/index.ts` | HTTP wiring, session lifecycle, GitHub/auth routes, messaging bootstrap. |
+
+### Keeping secrets out of durable state
+
+Flue offers two ways to get data into a render — `useInitialData()` and
+`useDelivery()` signal attributes — and **both are recorded in the instance's
+durable conversation log.** That is exactly wrong for a GitHub token: it would
+be persisted, replayed on recovery, and outlive its own expiry.
+
+So Ada keeps the sensitive per-turn bits in a process-local table
+(`agents/session-env.ts`). The runner resolves a fresh token and publishes the
+context immediately **before** each dispatch; the render reads it synchronously
+by instance id. Nothing there is durable — after a restart the runner
+repopulates it on the next turn, which is the right lifetime for a credential.
+A render with no published context (Flue recovering an interrupted submission
+after a restart) degrades to a credential-free one rather than throwing
+mid-recovery.
 
 ## Working on Slack (threads, repos, concurrency)
 
 Ada is multi-threaded over Slack: the **conversation (thread) is the unit of
-work and isolation**. The messaging sidecar dispatches threads concurrently, and
-each thread gets its own workspace, its own repo checkout, and its own Claude
-session — so different threads work on different repos at the same time without
+work and isolation**. The thread id *is* the Flue instance id, so each thread
+gets its own durable conversation, its own workspace, and its own repo checkout
+— different threads work on different repos at the same time without
 interfering.
 
 **One thread = one task = one repo.** In a thread, bind the repo once:
@@ -206,244 +250,246 @@ work on owner/repo        (or: /work owner/repo)
 
 Ada clones it into that thread's workspace and reuses the checkout across turns
 (your work-in-progress is kept between messages — it is *not* reset). To work on
-a **different** repo, start a **new thread**; a thread stays bound to its first
-repo. `/whoami` shows the thread's bound repo and your GitHub connection.
+a **different** repo, start a **new thread**. `whoami` shows the thread's bound
+repo and your GitHub connection.
 
 How it behaves under load:
 
 - **Concurrent threads** run in parallel, bounded by `MAX_CONCURRENT_RUNS`
   (default 3) so a burst of threads can't exhaust the box — excess runs queue.
 - **Rapid messages in one thread**: a new message supersedes the in-flight run.
-  The sidecar aborts it and Ada kills the old `claude` child, so two runs never
-  race in one workspace.
-- **Idle workspaces** are reclaimed by a TTL sweep (`startWorkspaceGc`); set
-  `WORKSPACE_ROOT` to a persistent volume so a thread can resume days later.
+  The sidecar aborts it and the runner calls `handle.abort()`, so the old turn is
+  durably stopped rather than racing the new one in one workspace.
+- **Idle workspaces** are reclaimed by a TTL sweep (`startWorkspaceGc`).
 
 ### Execution sandbox (isolation)
 
-By default Claude runs **in-process**. Deploy the **sandbox** container
-(`knowledge.sandbox` in `astropods.yml`, code in `sandbox/`) and execution moves
-to a separate, secret-less container reached over HTTP — it holds none of the
-control plane's secrets (DB, GitHub tokens, HMAC key), only the model credential
-and one user's `GH_TOKEN` forwarded per request. The switch is automatic: when
-the platform injects `KNOWLEDGE_SANDBOX_HOST`, `agent/sandbox-client.ts` routes
-there; `SandboxSession` mirrors `ClaudeAgentSession`, so the rest is unchanged.
-(The browser `/sessions` test client still runs in-process today — the sandbox
-split currently covers the messaging/Slack path.)
+Ada uses Flue's **`local()`** sandbox: real filesystem, real processes, bound to
+the session's workspace directory. `local()` scrubs the host env down to its own
+allowlist (`PATH`/`HOME`/`SHELL`/`LANG`/`TMPDIR`/…), and `agent/config/model.ts`
+layers on only the proxy/TLS vars, the build-cache tuning, and — when the user
+has connected — their `GH_TOKEN`. So `bash → env` cannot read the container's
+AWS/database/gateway secrets. The **model credential is no longer forwarded at
+all**, because no child process needs it.
 
-Relevant modules: `agent/messaging/adapter.ts` (Slack turn: workspace + repo +
-concurrency + abort), `agent/session/repo.ts` (`work on` checkout), `agent/session/workspace.ts`
-(per-thread workspace + GC), `agent/concurrency.ts` (`runLimiter`),
-`agent/sandbox-client.ts` + `sandbox/index.ts` (the isolated runner).
+**This is a smaller isolation boundary than before.** Ada used to run Claude Code
+in a separate, secret-less sandbox container reached over HTTP (`knowledge.sandbox`
++ `sandbox/`), so a rogue tool reached at most one thread's checkout in a process
+that held no control-plane secrets. Flue runs the loop in-process, so that split
+is gone and the model's shell shares the control plane's container. Flue's
+sandbox interface makes restoring it a one-line change at the `useSandbox()`
+call — swap `local()` for a remote adapter (E2B, Daytona, Modal) and provision
+that provider.
 
-### Tool policy, lean mode & limits
+### Tool policy
 
-The spawned `claude` is deliberately locked down and slimmed (in `agent/claude/agent.ts`,
-applied to **both** the in-process and sandbox paths, and to `supervisor.ts`). This
-keeps it cheap, predictable, and within a container we can't resize — **but it
-removes capabilities on purpose. If a future feature seems "missing," it's likely here.**
+Under Claude Code, the toolset arrived via the `claude_code` preset and had to be
+pruned with a `DEFAULT_DISALLOWED_TOOLS` deny list (`WebSearch`/`WebFetch` were
+dead on the Bedrock gateway; `Task`/`Workflow` multiplied `claude` child
+processes; a dozen harness tools were irrelevant to a coding turn). **That deny
+list is gone.** Flue mounts only what the render declares, so the default is
+closed:
 
-**Tools removed from the model** (`DEFAULT_DISALLOWED_TOOLS`, via `disallowedTools` —
-note `allowedTools` only *auto-approves*, it does **not** restrict availability):
+- File + shell verbs from `useSandbox()`: `read`, `write`, `edit`, `bash`,
+  `grep`, `glob`.
+- `checkout_repo` from `useTool()`, only when the user has connected GitHub.
 
-| Removed | Why |
+Nothing else is reachable. There is no skill discovery, no MCP server, no
+subagent — add them explicitly with `useSkill()`, `useMcpConnection()`, and
+`useSubagent()` if you want them.
+
+Concurrency is bounded by `MAX_CONCURRENT_RUNS` (astropods input, default 3),
+which both the browser and messaging paths route through.
+
+## Flue events → AG-UI mapping
+
+| Flue event | AG-UI event(s) |
 |---|---|
-| `WebSearch`, `WebFetch` | Anthropic server tools — **dead on the Bedrock-backed gateway** (would error). Need web data? Give the agent a client-side tool. |
-| `Task`, `Workflow` | Sub-agent / multi-agent orchestration. Each sub-agent is another `claude` process → memory blow-up. Also means **no sub-agent transcripts** to review. |
-| `CronCreate/Delete/List`, `ScheduleWakeup`, `SendMessage`, `DesignSync`, `ReportFindings`, `Skill`, `EnterWorktree`/`ExitWorktree`, `Task*` board tools | Platform/harness tools irrelevant to a coding turn. |
+| `agent_start` | `RUN_STARTED` (threadId = instance id) + `STATE_SNAPSHOT` |
+| `message_start` | — (opens an assistant message id) |
+| `text_delta` | `TEXT_MESSAGE_START` (lazily) + `TEXT_MESSAGE_CONTENT` |
+| `message_end` | `TEXT_MESSAGE_END` for the open text message |
+| `thinking_start` / `_delta` / `_end` | `REASONING_MESSAGE_*` — **off by default** (version-dependent) |
+| `toolcall_delta` | `TOOL_CALL_START` (lazily) + `TOOL_CALL_ARGS` (`delta` = argument-text fragment, 1:1) |
+| `tool_start` | `TOOL_CALL_START`/`ARGS` if no deltas arrived, then `TOOL_CALL_END` |
+| `tool` | `TOOL_CALL_RESULT` (`toolCallId`, `content` string) |
+| `turn` | `CUSTOM` `ada.usage` — per-turn tokens + cost |
+| `log` | `CUSTOM` `ada.log` |
+| `compaction` | `CUSTOM` `ada.compaction` |
+| `agent_end` | `RUN_FINISHED` |
+| `submission_settled` (failed/aborted) | `RUN_ERROR` (`message`, `code`) |
 
-Auto-approved coding tools: `Read, Edit, Write, Bash, Grep, Glob`.
+`turn_start` / `turn_request` / `turn_messages` / `operation*` / `task*` /
+`submission_queued|running|recovery` / `idle` produce no AG-UI event
+(telemetry-only).
 
-**Lean startup** (query options): `settingSources: []` (no `.claude/` skills, subagents,
-slash-commands, or `CLAUDE.md` loaded), `skills: []`, `mcpServers: {}` + `strictMcpConfig: true`
-(no MCP discovery). Cuts cold-start and per-process memory. **Limitations this imposes:**
-no user/project skills, **no MCP servers**, no custom slash-commands, no `CLAUDE.md` memory —
-if you later want any of those, you must re-enable the relevant source here. (The bundled
-`Explore`/`Plan`/`general-purpose` subagents can't be fully unloaded via options, but can't
-spawn either, since `Task` is denied. The `claude_code` preset, gateway model, and
-multi-turn agentic loop are kept.)
-
-**Concurrency / memory tuning:**
-- `MAX_CONCURRENT_RUNS` (astropods input, default 3) — caps concurrent runs agent-side;
-  messaging routes through it, so **lower it to 1–2 to ease sandbox memory pressure**.
-- `SANDBOX_MAX_CONCURRENT` (default 3) — sandbox-side backstop bounding `claude` children
-  in the sandbox container, independent of how many agent replicas call it.
-- Not yet addressed: the ~78s **cold-start** (spawn + gateway/model init).
-
-**Sandbox resource ceiling (hard limit — important).** The `knowledge.sandbox`
-container gets the platform default of **~1 GiB memory / 100m CPU**, and there is
-**no way to raise it from `astropods.yml`** — `ContainerConfig` exposes only
-image/build/gpu/port/volume/environment/healthcheck, no cpu/memory. Compiling a
-large project (e.g. a Go repo with `cgo`/sqlite + full dep tree) **OOM-kills the
-sandbox** (observed: memory pegged at the 1 GiB cap, repeated OOM kills + restarts,
-manifesting to the control plane as `terminated: other side closed`), and 100m CPU
-makes such builds extremely slow. Mitigations in place (`sandbox/Dockerfile`):
-- **Go baked into the image** + `GOMODCACHE`/`GOCACHE` on the `/data` volume — no
-  toolchain re-download, and modules/build cache survive across requests so repeat
-  builds compile far fewer packages.
-- **`GOMEMLIMIT=600MiB` + `GOMAXPROCS=1`** — the Go toolchain GCs hard and compiles
-  serially, so a build fits under the 1 GiB cap instead of OOM-ing (trades speed for
-  survival). npm/pip caches also on `/data`.
-
-These help builds *complete* and make repeats cheap, but **1 GiB / 100m CPU is
-fundamentally under-provisioned for compiling large projects**. Durable fixes are
-platform-side, not in this repo: (a) raise the knowledge-container limits (needs a
-platform/spec change — there's no astropods.yml knob today), or (b) have the agent
-verify narrowly (build/`vet` only the changed package) and leave full builds to CI.
-
-## stream-json → AG-UI mapping
-
-| Claude Code stream-json | AG-UI event(s) |
-|---|---|
-| `system` / `init` | `RUN_STARTED` (threadId = session_id) + `STATE_SNAPSHOT` (model, cwd, tools, capabilities) |
-| `system` / `api_retry` | `CUSTOM` `name: "claude.api_retry"` (no native AG-UI event) |
-| `stream_event` `content_block_start` (text) | `TEXT_MESSAGE_START` |
-| `stream_event` `content_block_delta` (`text_delta`) | `TEXT_MESSAGE_CONTENT` (`delta`) |
-| `stream_event` `content_block_start` (tool_use) | `TOOL_CALL_START` (`toolCallId`, `toolCallName`) |
-| `stream_event` `content_block_delta` (`input_json_delta`) | `TOOL_CALL_ARGS` (`delta` = `partial_json`, 1:1) |
-| `stream_event` `content_block_stop` | `TEXT_MESSAGE_END` / `TOOL_CALL_END` (per open block) |
-| `assistant` (complete) | fallback full triples **iff** not already streamed; else usage-only |
-| `user` (tool_result block) | `TOOL_CALL_RESULT` (`toolCallId`, `content` string) |
-| `assistant`/`stream_event` (thinking) | `REASONING_MESSAGE_*` — **off by default** (version-dependent) |
-| `result` (success) | `RUN_FINISHED` (`result`) + a `CUSTOM` `claude.usage` (per-turn tokens/cost) |
-| `result` (error / is_error) | `RUN_ERROR` (`message`, `code`) |
-
-`message_delta` / `message_stop` produce no AG-UI event (telemetry-only). The
-`claude.usage` CUSTOM event carries each turn's tokens + cost so the client can
-sum a session total that survives reconnect/replay.
+**Ordering, because it's easy to get wrong.** `toolcall_delta` is a *live
+preview* of arguments while the model is still emitting them; `tool_start` fires
+later, when the call executes, carrying the complete `args`. A tool call may
+arrive either way round. The translator opens the AG-UI tool call on whichever
+comes first and closes it exactly once, on `tool_start` — never twice, and never
+on a preview alone (a previewed call the runtime then drops must not leave the
+client with a spinner that never resolves).
 
 ## AG-UI output for `read → edit → report`
 
-This is exactly what `npm run demo` prints from the recorded fixture:
+`POST /test/seed` replays `fixtures/read-edit-report.flue.jsonl` through the
+translator, producing 23 AG-UI events:
 
 ```
-RUN_STARTED               threadId=sess_7f3a runId=run_1
-STATE_SNAPSHOT            {sessionId, model, cwd, permissionMode, tools, capabilities}
-TEXT_MESSAGE_START        msg_a1
-TEXT_MESSAGE_CONTENT ×2   "I'll read the config, " / "edit it, then report back."
-TEXT_MESSAGE_END          msg_a1
-TOOL_CALL_START           toolu_read  Read
-TOOL_CALL_ARGS ×2         {"file_path":"/workspace/  +  config.json"}
-TOOL_CALL_END             toolu_read
-TOOL_CALL_RESULT          toolu_read  -> file contents
-TEXT_MESSAGE_START/…/END  msg_a2  "Found retries=3. Bumping to 5."
-TOOL_CALL_START/ARGS/END  toolu_edit  Edit
-TOOL_CALL_RESULT          toolu_edit  "Applied 1 edit…"
-TEXT_MESSAGE_START/…/END  msg_a3  "Done. …retries: 5 (was 3)."
-RUN_FINISHED              result="Done. …"
+RUN_STARTED               threadId=fixture runId=run_1
+STATE_SNAPSHOT            {sessionId, agentName, submissionId}
+TEXT_MESSAGE_START        msg_1
+TEXT_MESSAGE_CONTENT ×2   "I'll read " / "config.json first."
+TEXT_MESSAGE_END          msg_1
+TOOL_CALL_START           tc_read  read
+TOOL_CALL_ARGS ×2         {"path":  +  "config.json"}
+TOOL_CALL_END             tc_read
+TOOL_CALL_RESULT          tc_read  -> file contents
+TEXT_MESSAGE_START/…/END  msg_2  "Bumping retries to 5."
+TOOL_CALL_START/ARGS/END  tc_edit  edit
+TOOL_CALL_RESULT          tc_edit  "Applied 1 edit to config.json"
+CUSTOM ada.usage          {inputTokens, outputTokens, cache*, costUsd}
+TEXT_MESSAGE_START/…/END  msg_3  "Done — retries is now 5."
+RUN_FINISHED
 ```
 
 ## Model routing & auth
 
 All of "which model, which credentials, what does a token cost" lives in
-`agent/config/model.ts`. Precedence for the spawned child's model endpoint:
+`agent/config/model.ts`. Precedence:
 
 1. **Explicit `ANTHROPIC_BASE_URL`** — always wins.
-2. **`ANTHROPIC_API_KEY` (opt-out)** — direct to `api.anthropic.com`, bare model
-   id. This is the simple local path.
+2. **`ANTHROPIC_API_KEY` (opt-out)** — direct to `api.anthropic.com` via pi-ai's
+   built-in `anthropic` provider, bare model id. The simple local path.
 3. **Astro AI Gateway (default in-cluster)** — `ASTRO_GATEWAY_URL/anthropic`
-   (Bifrost's Anthropic ingress → Bedrock). The virtual key goes via the
-   `x-bf-vk` header (Bifrost ignores `Authorization`/`x-api-key`), model ids are
-   `bedrock/`-prefixed to the gateway's served names, and Bedrock-incompatible
-   pre-release `anthropic-beta` flags are disabled client-side.
+   (Bifrost's Anthropic ingress → Bedrock), registered as a **custom pi-ai
+   provider** with `createProvider()` + `setProvider()`.
 
-**Sandboxed spawn env.** The child gets a *clean* env — an allowlist of
-non-secret essentials (PATH/HOME, locale, proxy/TLS) plus only the model
-credential and the user's `GH_TOKEN`. Everything else in the host env (AWS, DB,
-gateway keys) is **dropped**, so neither the model nor a tool it runs
-(`bash → env`) can read the container's secrets. Secrets are never logged;
-`describeAuth()` prints a redacted summary.
+Two gateway quirks worth knowing, both load-bearing:
+
+- **Auth goes in two headers.** Bifrost reads the virtual key only from
+  `x-bf-vk`; it ignores `Authorization`/`x-api-key`. But pi-ai's
+  anthropic-messages API refuses to send a request that has none of
+  `authorization` / `x-api-key` / `cf-aig-authorization`, so we set
+  `Authorization: Bearer` too. Bifrost ignores it; it exists to satisfy the
+  client-side guard.
+- **Model ids are `bedrock/`-prefixed.** Bifrost serves Claude as
+  `bedrock/claude-opus-4-8` and the virtual key is scoped to those exact names.
+  `Model.id` is *both* the wire id and the key Flue resolves a `useModel()` ref
+  against, so the ref is `astro-gateway/bedrock/claude-opus-4-8` (Flue splits
+  the specifier on the first slash). `ANTHROPIC_MODEL` stays prefix-agnostic —
+  give it either form.
+
+**Providers are registered at agent-module scope** (`agents/ada.ts`), not in a
+server bootstrap, because `flue run` loads only the agent module. Registering in
+`app.ts` left the CLI path resolving against a registry that had never heard of
+the gateway.
+
+Secrets are never logged; `describeAuth()` prints a redacted summary.
 
 ## Cost → money
 
-Prefer Claude's reported `result.total_cost_usd` (and per-model
-`model_usage[].cost_usd`); fall back to `usage × pricing table` from
-`config/model.ts`. In the demo these differ (reported `0.0429` vs computed
-`0.0288`) because reported cost includes the full per-turn accumulated input
-across the agentic loop, which the aggregate `usage` block doesn't reconstruct
-— **so `total_cost_usd` is authoritative; the table is for fallback / the
-gateway case.**
+Cost comes from **pi-ai's model catalog**, which prices each turn's usage
+(`turn.response.usage.cost.total`) for both the direct and gateway paths. The
+hand-maintained `PRICING` table the old build fell back to is gone, along with
+the `reported`-vs-`computed` distinction it existed to resolve: there is no
+upstream CLI reporting a `total_cost_usd` to prefer any more.
 
-**Telemetry — SDK OpenInference spans (primary).** The Claude Agent SDK is
-imported through `@astropods/adapter-claude-agent-sdk`, whose `query()` is
-patched with OpenInference OTel instrumentation wired to Astro's tracer
-provider. So query / sub-agent / tool / model spans flow to the Astro dashboard
-automatically when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, and no-op locally — no
-native-CLI telemetry env needed.
+Per-turn figures are surfaced three ways from the same `turn` events: a
+replayable `CUSTOM ada.usage` AG-UI event (so the client can sum a session total
+that survives reconnect), OTel metrics + span attributes, and a `RunRecord` in
+the `ResultStore`.
 
-**Wrapper self-telemetry (opt-in).** `telemetry/otel.ts` also subscribes to the
-same stream-json events and can emit bridge-level GenAI-semconv spans (root
-`claude_code.run` + child `claude_code.tool`, token/cost attributes) via an
-in-process OTLP/proto exporter — **off by default** to avoid double-emitting.
-Enable with `BRIDGE_SELF_TELEMETRY=1` (plus an OTLP endpoint) for bridge/session
-correlation spans.
+**Telemetry.** `telemetry/otel.ts` subscribes to the same Flue events and emits
+GenAI-semconv spans (root `ada.run` + child `ada.tool`, with token/cost
+attributes) plus counters and a cost histogram, via an in-process OTLP/proto
+exporter.
+
+> **Changed in the rewrite:** this used to be **opt-in** (`BRIDGE_SELF_TELEMETRY=1`)
+> because the `claude` child emitted its own native Claude Code OTel and we
+> didn't want to double-emit. There is no child now and no second source, so
+> these are the only spans Ada produces — telemetry is **on by default**
+> whenever an OTLP endpoint is set. Opt out with `ADA_SELF_TELEMETRY=0`.
 
 | env | purpose |
 |---|---|
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector (injected by the runner); unset ⇒ no export |
 | `OTEL_SERVICE_NAME` | `service.name` (Dockerfile default `ada`) |
-| `BRIDGE_SELF_TELEMETRY` | `1` to also emit wrapper-level spans (off by default; SDK spans are primary) |
-| `OTEL_METRICS_ENABLED` | `1` to add wrapper OTLP metrics when self-telemetry is on |
+| `ADA_SELF_TELEMETRY` | `0` to disable spans even with an endpoint set |
+| `OTEL_METRICS_ENABLED` | `1` to add OTLP metrics alongside traces |
 
-Self-telemetry OTel dep versions mirror the proven `0.217.0` train used across
-the other Astro agents.
+OTel dep versions mirror the proven `0.217.0` train used across the other Astro
+agents.
 
 ---
 
 ## Pin list — unstable / version-dependent, pin before production
 
-### Claude Code `stream-json` (pin the CLI version in the image)
-1. **stream-json input/output is not a stable, versioned public contract.** The
-   headless docs are thin and the input format is under-documented. Pin the exact
-   `claude` version in the Dockerfile; treat a CLI bump as a breaking-change
-   review. (The SDK yields the same envelopes, so this applies either way.)
-2. **Feature-detect via `system/init.capabilities[]`, not a version string.**
-   Whether `--include-partial-messages` yields `stream_event` deltas, and the
-   exact partial shapes, can shift between releases.
-3. **`result` cost/usage field names** (`total_cost_usd`, `model_usage[].cost_usd`,
-   `cache_*_input_tokens`). Cost accuracy for billing depends on these — assert
-   they're present in a startup smoke test; fall back to the pricing table if not.
-4. **`--resume` does NOT replay prior events** — only a fresh `system/init` +
-   the new turn. Client replay is entirely our registry's job.
-5. **Claude Agent SDK is now the default source** (`@astropods/adapter-claude-agent-sdk`,
-   re-exporting `@anthropic-ai/claude-agent-sdk`) — a typed message stream instead
-   of scraping `claude -p` stdout, and the OTel seam. The CLI supervisor is kept
-   as a fallback. Pin the SDK + adapter versions.
+### Flue (pin `@flue/runtime`, `@flue/cli`, `@flue/vite`)
+1. **All three are pinned to an exact version (`2.0.3`), not a range.** Flue 2.0
+   is a fresh stable release; the hooks API, the `FlueEvent` union, and the
+   generated Node entry are all young surfaces. Treat a bump as a
+   breaking-change review — especially of `agent/translate/translator.ts`, which
+   pattern-matches the event union exhaustively.
+2. **`FlueEvent` carries a format version (`v: 3`).** Branch on it if the shape
+   changes rather than assuming.
+3. **`@earendil-works/pi-ai` is pinned to `0.83.0`** — the exact version
+   `@flue/runtime` resolves. It's a **direct** dependency because
+   `config/model.ts` builds a custom provider with `createProvider()`; if the two
+   drift apart, npm installs a second copy and the `Provider` types stop being
+   assignable (`setProvider()` fails to typecheck). Bump them together.
+4. **`toolcall_delta` is in-process only** — never persisted, never replayed. It
+   drives live argument previews; `tool_start` remains the source of truth for
+   complete arguments. A consumer reading durable history sees only the latter.
 
 ### AG-UI (pin `@ag-ui/core`)
-6. **Reasoning events changed:** `THINKING_*` was removed in AG-UI **1.0.0** in
+5. **Reasoning events changed:** `THINKING_*` was removed in AG-UI **1.0.0** in
    favour of `REASONING_*`. We default reasoning OFF; if enabled, pin the core
    version so we emit the right names.
-7. **`RUN_FINISHED.outcome`** is a newer optional field (Python SDK may emit
-   `outcome: null`). We omit it for legacy-safety — revisit when we pin ≥ a
-   version where it's expected.
-8. **Validate against the canonical Zod schemas.** Local types in
+6. **`RUN_FINISHED.outcome`** is a newer optional field. We omit it for
+   legacy-safety — revisit when we pin ≥ a version where it's expected.
+7. **Validate against the canonical Zod schemas.** Local types in
    `agent/types/agui.ts` mirror `@ag-ui/core`; add a CI step that parses emitted
    events with the pinned package's schemas so drift fails the build.
 
 ### Gateway (Bifrost → Bedrock)
-9. **`x-bf-vk` header + `bedrock/`-prefixed model ids** are how Bifrost reads the
+8. **`x-bf-vk` header + `bedrock/`-prefixed model ids** are how Bifrost reads the
    virtual key and resolves models; both were probed empirically and can change
-   with the gateway. The Bedrock-incompatible `anthropic-beta` flags are disabled
-   client-side (`CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`) — revisit if the gateway
-   starts accepting them. All overridable via env.
+   with the gateway. (The `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` workaround is
+   gone with the CLI — pi-ai doesn't send Claude Code's first-party-only
+   pre-release `anthropic-beta` flags.)
 
-### Bridge-specific extension (document for frontends)
-10. **SSE `id:` line for reconnect.** AG-UI's own SSE encoder emits only
-    `data: {json}\n\n` (no `event:`/`id:`). We add `id: <seq>` so the browser's
-    `EventSource` sends `Last-Event-ID` and we replay the gap from the registry.
-    Valid SSE, ignored by clients that don't use it — but it's *our* extension
-    to the transport, not part of AG-UI. Reconnect is by `session_id`, and the
-    process outlives the connection.
+### Ada-specific extension (document for frontends)
+9. **SSE `id:` line for reconnect.** AG-UI's own SSE encoder emits only
+   `data: {json}\n\n` (no `event:`/`id:`). We add `id: <seq>` so the browser's
+   `EventSource` sends `Last-Event-ID` and we replay the gap from the registry.
+   Valid SSE, ignored by clients that don't use it — but it's *our* extension
+   to the transport, not part of AG-UI.
+
+## Limitations
+
+- **Conversation history does not survive a restart or redeploy.** Flue's
+  conversation database (`agent/db.ts`, SQLite) and the sandbox workspaces live
+  on the container filesystem. An Astropods `volume:` can only attach to a
+  knowledge *container*, and the out-of-process sandbox that used to provide one
+  is gone — so a resumed Slack thread re-clones its repo and starts a fresh
+  conversation. GitHub tokens and repo bindings are unaffected (Postgres). The
+  durable fix is a Postgres-backed Flue `PersistenceAdapter`
+  (`defineSqlConversationStreamStore` in `@flue/runtime/adapter`).
+- The model's shell runs in the same container as the control plane — see
+  "Execution sandbox" above.
+- The AG-UI event log and GitHub OAuth CSRF state are in memory with no GC yet.
 
 ## Next steps
-- Registry durability: cap/spool the event log, GC terminated sessions, and
-  clean up per-session workspaces (currently kept).
+- **Postgres `PersistenceAdapter`** so conversations survive a restart — the
+  single biggest gap, and the one that also restores "resume a Slack thread days
+  later".
+- Registry durability: cap/spool the event log, GC terminated sessions.
 - Harden auth: sign the `bridge_uid` cookie, GC OAuth CSRF state, encrypt tokens
   at rest.
-- Fix the outstanding `tsc` errors (adapter `getConfig` shape, `@types/pg`,
-  OTel SDK types) and add a CI typecheck + AG-UI schema validation alongside the
-  e2e workflow (see "Tests").
-- Verify `claude`/the SDK boots headless in the container with only the gateway
-  credential (no interactive onboarding/TTY).
-</content>
+- Fix the two remaining `tsc` errors (`@types/pg`, OTel SDK `metricReader` types
+  — both pre-date this rewrite) and add a CI typecheck + AG-UI schema validation
+  alongside the e2e workflow.
+- Consider a remote sandbox adapter to restore the out-of-process isolation
+  boundary.

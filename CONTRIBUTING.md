@@ -1,6 +1,6 @@
 # Contributing to Ada
 
-Thanks for your interest in contributing to **Ada** — a coding agent (powered by Claude Code) you talk to over Slack, web chat, or an AG-UI/SSE frontend. Ada is packaged to run on the Astro AI platform, with either the Astropods CLI (`ast`) or from astropods.com. This document outlines the process for contributing and provides specific guidance for code contributions.
+Thanks for your interest in contributing to **Ada** — a coding agent (built on Flue 2.0) you talk to over Slack, web chat, or an AG-UI/SSE frontend. Ada is packaged to run on the Astro AI platform, with either the Astropods CLI (`ast`) or from astropods.com. This document outlines the process for contributing and provides specific guidance for code contributions.
 
 ---
 

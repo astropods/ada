@@ -42,7 +42,7 @@ export interface BaseEvent {
   type: EventType;
   /** epoch ms; optional per BaseEvent. */
   timestamp?: number;
-  /** original upstream (Claude stream-json) event, for debugging/lossless passthrough. */
+  /** original upstream (Flue) event, for debugging/lossless passthrough. */
   rawEvent?: unknown;
 }
 

@@ -14,8 +14,8 @@ agent:
     # Also deploy the platform's messaging sidecar (chat UI / Slack). The sidecar
     # runs the channel adapters, normalizes every inbound message to one shape,
     # and streams it to us over gRPC (GRPC_SERVER_ADDR). agent/messaging/adapter.ts
-    # (a Claude Code AgentAdapter) + adapter-core `serve()` handle our side, so a
-    # Slack thread becomes a continuous Claude Code conversation. Slack itself is
+    # + adapter-core `serve()` handle our side, so a Slack thread becomes one
+    # durable Flue agent instance (thread id == instance id). Slack itself is
     # platform-managed (its app + workspace linking + user identity live in
     # astro-server) — this agent needs NO Slack tokens. frontend + messaging
     # coexist: our UI on its hostname, Slack/web on the sidecar's routes.
@@ -47,8 +47,9 @@ inputs:
   # Optional opt-out of the Astro AI Gateway (see astro_ai_gateway above). Provide
   # your own Anthropic API key and model calls go DIRECTLY to api.anthropic.com
   # with it, bypassing the gateway/Bedrock. Leave unset to use the gateway
-  # (default). In config/model.ts a set ANTHROPIC_API_KEY takes precedence over the
-  # injected ASTRO_GATEWAY_* and switches claudeSpawnEnv to direct mode.
+  # (default). In config/model.ts a set ANTHROPIC_API_KEY takes precedence over
+  # the injected ASTRO_GATEWAY_* and selects the built-in `anthropic` pi-ai
+  # provider instead of the custom gateway provider.
   ANTHROPIC_API_KEY:
     name: ANTHROPIC_API_KEY
     datatype: string
@@ -56,16 +57,16 @@ inputs:
     optional: true
     description: "Optional: use this Anthropic API key directly and bypass the Astro AI Gateway"
     display-as: short-text
-  # Max concurrent Claude runs. Each run is a `claude` child process (CPU+memory);
-  # messaging turns route through this limiter, so LOWERING it (e.g. 1–2) is the
-  # main lever to reduce memory pressure on the sandbox when its container can't
-  # be sized up. Default 3.
+  # Max concurrent agent runs. A run holds a sandbox and spawns real build/test
+  # commands in it (CPU+memory); both browser and messaging turns route through
+  # this limiter, so LOWERING it (e.g. 1–2) is the main lever to reduce memory
+  # pressure when the container can't be sized up. Default 3.
   MAX_CONCURRENT_RUNS:
     name: MAX_CONCURRENT_RUNS
     datatype: number
     optional: true
     default: "3"
-    description: "Max concurrent Claude runs (each is a child process). Lower to 1–2 to ease sandbox memory pressure."
+    description: "Max concurrent agent runs. Lower to 1–2 to ease container memory pressure."
     display-as: short-text
   # GitHub App visibility. Default PRIVATE (single-tenant): only the account that
   # created the App can install it — right when one user/org runs their own Ada.
@@ -88,22 +89,32 @@ knowledge:
   # fall back to container mode — see the migrate-to-astropods notes.)
   db:
     provider: postgres
-  # Isolated execution sandbox (the "gold standard" split). Runs Claude Code + git
-  # on per-conversation repo checkouts in a container that holds NONE of the
-  # control plane's secrets (DB, GitHub tokens, HMAC key) — a rogue tool the model
-  # runs can reach at most one thread's checkout. The agent reaches it over HTTP;
-  # the platform injects KNOWLEDGE_SANDBOX_HOST/PORT, which agent/sandbox-client.ts
-  # picks up to route execution here automatically. The model credential and the
-  # per-user GH_TOKEN are forwarded per request, so nothing sensitive lives here at
-  # rest. /data holds per-thread workspaces (TTL-GC'd). Remove this block to run
-  # Claude in-process in the agent container instead.
-  sandbox:
-    container:
-      build:
-        context: .
-        dockerfile: sandbox/Dockerfile
-      port: 3000
-      volume: /data
+  #
+  # REMOVED BY THE FLUE REWRITE: a `sandbox:` knowledge container.
+  #
+  # It used to build a SEPARATE, secret-less container that executed Claude Code
+  # out-of-process over HTTP, on a /data volume holding per-conversation repo
+  # checkouts. Flue runs the agent loop in-process with a `local()` sandbox, so
+  # that service is gone (`sandbox/` and `agent/sandbox-client.ts` deleted).
+  #
+  # Two consequences, both deliberate and both worth knowing:
+  #
+  # 1. BLAST RADIUS. The model's shell now runs in the SAME container as the
+  #    control plane. `local()` scrubs the env so tools can't read the DB /
+  #    GitHub / HMAC credentials from it (agent/config/model.ts), but they are
+  #    no longer behind a process boundary. To restore that split, swap
+  #    `local()` in agents/ada.ts for a remote sandbox adapter (E2B, Daytona,
+  #    Modal) — Flue's sandbox interface makes that a one-line change.
+  #
+  # 2. DURABILITY. A `volume:` attaches to a knowledge CONTAINER, not to the
+  #    agent container, so with the sandbox gone there is no persistent volume
+  #    for WORKSPACE_ROOT (/data). Repo checkouts and Flue's conversation
+  #    database (agent/db.ts) therefore live on the container filesystem and do
+  #    NOT survive a restart or redeploy: a Slack thread resumed after one
+  #    re-clones its repo and starts a fresh conversation. Per-user GitHub
+  #    tokens and repo bindings are unaffected — those are in Postgres above.
+  #    Fixing this properly means a Postgres-backed Flue PersistenceAdapter
+  #    (`defineSqlConversationStreamStore` in @flue/runtime/adapter).
 
 dev:
   # Local hot-reload path (`ast dev` / `ast project`): runs the agent in a

@@ -1,0 +1,20 @@
+{"v":3,"eventIndex":0,"timestamp":"2026-01-01T00:00:00.000Z","instanceId":"fixture","agentName":"ada","submissionId":"sub_fixture","type":"agent_start"}
+{"v":3,"eventIndex":1,"timestamp":"2026-01-01T00:00:00.100Z","instanceId":"fixture","type":"message_start","turnId":"turn_1","message":{"id":"msg_1","role":"assistant"}}
+{"v":3,"eventIndex":2,"timestamp":"2026-01-01T00:00:00.200Z","instanceId":"fixture","type":"text_delta","text":"I'll read "}
+{"v":3,"eventIndex":3,"timestamp":"2026-01-01T00:00:00.300Z","instanceId":"fixture","type":"text_delta","text":"config.json first."}
+{"v":3,"eventIndex":4,"timestamp":"2026-01-01T00:00:00.400Z","instanceId":"fixture","type":"toolcall_delta","toolCallId":"tc_read","toolName":"read","argumentTextDelta":"{\"path\":"}
+{"v":3,"eventIndex":5,"timestamp":"2026-01-01T00:00:00.500Z","instanceId":"fixture","type":"toolcall_delta","toolCallId":"tc_read","toolName":"read","argumentTextDelta":"\"config.json\"}"}
+{"v":3,"eventIndex":6,"timestamp":"2026-01-01T00:00:00.600Z","instanceId":"fixture","type":"tool_start","toolCallId":"tc_read","toolName":"read","args":{"path":"config.json"}}
+{"v":3,"eventIndex":7,"timestamp":"2026-01-01T00:00:00.700Z","instanceId":"fixture","type":"tool","toolCallId":"tc_read","toolName":"read","isError":false,"durationMs":12,"result":"{\n  \"retries\": 3\n}\n"}
+{"v":3,"eventIndex":8,"timestamp":"2026-01-01T00:00:00.800Z","instanceId":"fixture","type":"message_end","turnId":"turn_1","message":{"id":"msg_1","role":"assistant"}}
+{"v":3,"eventIndex":9,"timestamp":"2026-01-01T00:00:00.900Z","instanceId":"fixture","type":"message_start","turnId":"turn_2","message":{"id":"msg_2","role":"assistant"}}
+{"v":3,"eventIndex":10,"timestamp":"2026-01-01T00:00:01.000Z","instanceId":"fixture","type":"text_delta","text":"Bumping retries to 5."}
+{"v":3,"eventIndex":11,"timestamp":"2026-01-01T00:00:01.100Z","instanceId":"fixture","type":"toolcall_delta","toolCallId":"tc_edit","toolName":"edit","argumentTextDelta":"{\"path\":\"config.json\",\"old\":\"\\\"retries\\\": 3\",\"new\":\"\\\"retries\\\": 5\"}"}
+{"v":3,"eventIndex":12,"timestamp":"2026-01-01T00:00:01.200Z","instanceId":"fixture","type":"tool_start","toolCallId":"tc_edit","toolName":"edit","args":{"path":"config.json","old":"\"retries\": 3","new":"\"retries\": 5"}}
+{"v":3,"eventIndex":13,"timestamp":"2026-01-01T00:00:01.300Z","instanceId":"fixture","type":"tool","toolCallId":"tc_edit","toolName":"edit","isError":false,"durationMs":8,"result":"Applied 1 edit to config.json"}
+{"v":3,"eventIndex":14,"timestamp":"2026-01-01T00:00:01.400Z","instanceId":"fixture","type":"message_end","turnId":"turn_2","message":{"id":"msg_2","role":"assistant"}}
+{"v":3,"eventIndex":15,"timestamp":"2026-01-01T00:00:01.500Z","instanceId":"fixture","type":"turn","turnId":"turn_2","purpose":"agent","durationMs":1400,"isError":false,"request":{"model":"claude-opus-4-8"},"response":{"responseModel":"claude-opus-4-8","finishReason":"toolUse","usage":{"input":1840,"output":96,"cacheRead":0,"cacheWrite":1024,"totalTokens":2960,"cost":{"input":0.0092,"output":0.0024,"cacheRead":0,"cacheWrite":0.0064,"total":0.018}}}}
+{"v":3,"eventIndex":16,"timestamp":"2026-01-01T00:00:01.600Z","instanceId":"fixture","type":"message_start","turnId":"turn_3","message":{"id":"msg_3","role":"assistant"}}
+{"v":3,"eventIndex":17,"timestamp":"2026-01-01T00:00:01.700Z","instanceId":"fixture","type":"text_delta","text":"Done — retries is now 5."}
+{"v":3,"eventIndex":18,"timestamp":"2026-01-01T00:00:01.800Z","instanceId":"fixture","type":"message_end","turnId":"turn_3","message":{"id":"msg_3","role":"assistant"}}
+{"v":3,"eventIndex":19,"timestamp":"2026-01-01T00:00:01.900Z","instanceId":"fixture","type":"agent_end","messages":[]}

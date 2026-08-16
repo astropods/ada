@@ -1,7 +1,11 @@
 node_modules
 .git
 .gitignore
-fixtures
-scripts
+dist
+test
+test-results
+playwright.config.ts
+vite.config.ts
+tsconfig.json
 *.md
 !AGENT.md

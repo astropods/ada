@@ -92,4 +92,8 @@ export class PostgresStore implements Store {
       [namespace, key, JSON.stringify(value)],
     );
   }
+
+  async kvDelete(namespace: string, key: string): Promise<void> {
+    await this.q("DELETE FROM kv WHERE ns=$1 AND k=$2", [namespace, key]);
+  }
 }

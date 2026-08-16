@@ -112,7 +112,7 @@ function ghGet(url: string, token: string, fetchImpl: typeof fetch): Promise<Res
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github+json",
-      "User-Agent": "claude-code-agui-bridge",
+      "User-Agent": "ada",
     },
   });
 }
