@@ -238,6 +238,69 @@ A render with no published context (Flue recovering an interrupted submission
 after a restart) degrades to a credential-free one rather than throwing
 mid-recovery.
 
+## Secure by default
+
+Ada is opinionated about how code gets written. The opinions live in three
+layers, and the layering is the design — each does something the others can't.
+
+| Layer | Where | Cost | What it achieves |
+|---|---|---|---|
+| **Principles** | `security/principles.ts` → `useInstruction()` | every turn | Suggests. Five rules that apply to nearly every change |
+| **Skills** | `security/skills.ts` → `useSkill()` | one catalog line until activated | Informs. Detailed playbooks, loaded only when relevant |
+| **Gates** | `security/gates.ts` → `useAgentFinish()` | per stop-point | **Enforces.** Reads the real diff and sends the model back |
+
+**Why not just a bigger system prompt?** Because a twenty-point security
+checklist in the prompt does not make the agent twenty points safer — it makes
+each point less likely to be noticed, and it bills you for the whole list on
+every request. The principles file is deliberately five items long. Everything
+detailed is a skill, which costs one catalog line until the model decides it's
+relevant. Everything that must not be skipped is a gate, which is checked rather
+than trusted.
+
+### The skills
+
+`secure-api-endpoint` · `safe-db-migration` · `injection-defence` ·
+`maintain-api-docs` · `dependency-hygiene` · `secrets-handling` ·
+`agent-integrity`
+
+They're framework-agnostic — Ada works on whatever repo it's pointed at, so they
+describe the shape of the correct answer rather than one library's API — and
+each names its anti-patterns explicitly, since a labelled wrong example steers a
+model better than an imperative.
+
+### The gates
+
+`useAgentFinish` runs at every would-stop point. Ada diffs against the commit
+recorded at `useAgentStart`, so it sees committed work too — not just the
+working tree — then applies:
+
+| Rule | Kind | Fires when |
+|---|---|---|
+| `secret-in-diff` | blocking | A credential shape or a committed `.env` appears in added lines |
+| `weakened-check` | blocking | A `.skip`, `@ts-ignore`, `eslint-disable`, `--no-verify`, or a net deletion of assertions |
+| `route-without-test` | advisory | Request-handling code changed, no test touched *(only if the repo has tests)* |
+| `api-change-without-spec` | advisory | Routes changed, spec didn't *(only if the repo has a spec)* |
+| `migration-without-down` | advisory | A migration with no visible reversal |
+| `dependency-without-lockfile` | advisory | A manifest changed without its lockfile |
+
+Three properties worth knowing, all covered by `test/security-gates.spec.ts`:
+
+- **Budgets.** A gate that can't be satisfied is an infinite loop billed to you.
+  Advisory rules fire once per session; blocking rules get three attempts, then
+  emit a terminal "stop and tell the user" signal. A blocking rule never goes
+  quiet — a suppressed secret warning is worse than none.
+- **Conditional on capability.** Rules that ask "you changed X but not Y" first
+  check that Y is something the project does at all. A gate that cries wolf is
+  one the model learns to argue past.
+- **Arguable.** Every signal invites the model to explain why a rule doesn't
+  apply rather than demanding compliance, because they're heuristics over paths
+  and diff text and will sometimes misfire.
+
+The Ada-specific one is `secrets-handling`. Ada's tool output is streamed to
+Slack and retained in a replayable event log, and `GH_TOKEN` is in the sandbox
+env — so a casual `env`, `cat .env`, or `curl -v` publishes a live credential to
+everyone in the channel. The skill calls those commands out by name.
+
 ## Working on Slack (threads, repos, concurrency)
 
 Ada is multi-threaded over Slack: the **conversation (thread) is the unit of
@@ -518,7 +581,8 @@ agents.
   (`defineSqlConversationStreamStore` in `@flue/runtime/adapter`).
 - The model's shell runs in the same container as the control plane — see
   "Execution sandbox" above.
-- The AG-UI event log and GitHub OAuth CSRF state are in memory with no GC yet.
+- The AG-UI event log is in memory with no GC yet. (The OAuth CSRF state is no
+  longer among these — it is a signed, self-contained token now.)
 
 ## Next steps
 - **Postgres `PersistenceAdapter`** so conversations survive a restart — the

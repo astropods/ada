@@ -3,6 +3,7 @@ description: "Ada — a coding agent (built on Flue 2.0) you talk to over Slack,
 tags: [ada, flue, ag-ui, sse, slack, github, coding-agent]
 capabilities:
   - "Runs a Flue 2.0 agent loop in-process — no CLI child, no stream-json contract"
+  - "Secure by default: always-on principles, on-demand security playbooks, and enforced diff gates"
   - "Holds multi-turn conversations; Flue keeps the history durably per instance id"
   - "Isolates each session in its own writable sandbox workspace"
   - "Scrubs the sandbox env so tools can't read host secrets (AWS/DB/gateway)"
@@ -95,6 +96,21 @@ baked into the container.
   If `ADMIN_EMAILS` is unset, any signed-in user can perform the *initial* setup;
   provisioning then locks.)
 
+## Secure by default
+
+Ada is opinionated about how code gets written, in three layers: a short set of
+always-on principles, seven security playbooks loaded on demand as Flue skills
+(API authorization, safe migrations, injection defence, docs, dependencies,
+secrets, agent integrity), and enforcement gates that read the real diff at
+every would-stop point and send the model back when a default was missed.
+
+The gates block on credentials appearing in a diff and on controls being
+weakened to reach green (a skipped test, a `@ts-ignore`, `--no-verify`), and
+advise on endpoints changed without tests, stale API specs, migrations without a
+reversal, and dependencies added without a lockfile. Advisory rules fire once
+per session and blocking ones escalate three times then stop, so a gate can
+never loop.
+
 ## Limitations
 
 - Flue's conversation database and the sandbox workspaces live on the container
@@ -108,5 +124,6 @@ baked into the container.
   env is scrubbed, but this is a smaller blast radius than the previous
   out-of-process sandbox. Swap `local()` in `agents/ada.ts` for a remote
   sandbox adapter (E2B, Daytona, Modal) to restore that split.
-- The AG-UI event log and GitHub OAuth CSRF state are in memory with no GC yet.
+- The AG-UI event log is in memory with no GC yet. (The OAuth CSRF state is no
+  longer among these — it is a signed, self-contained token now.)
 - One turn runs at a time per session — an overlapping follow-up gets `409 busy`.

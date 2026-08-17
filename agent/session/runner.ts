@@ -24,6 +24,7 @@ import { randomUUID } from "node:crypto";
 import { init, observe, type FlueEvent } from "@flue/runtime";
 import { Ada } from "../agents/ada.ts";
 import { clearSessionEnv, setSessionEnv } from "../agents/session-env.ts";
+import { clearGateState } from "../agents/security/gates.ts";
 import { Translator } from "../translate/translator.ts";
 import { SessionRegistry, type SessionMeta } from "./registry.ts";
 import { createWorkspace, ensureWorkspace, removeWorkspace } from "./workspace.ts";
@@ -281,6 +282,7 @@ export class SessionRunner {
     const existed = this.registry.delete(instanceId);
     this.sessions.delete(instanceId);
     clearSessionEnv(instanceId);
+    clearGateState(instanceId);
     removeWorkspace(this.workspaces.get(instanceId));
     this.workspaces.delete(instanceId);
     await this.store.kvDelete(WS_NS, instanceId);

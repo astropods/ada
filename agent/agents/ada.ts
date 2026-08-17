@@ -25,13 +25,24 @@
 
 "use agent";
 
-import { useInstruction, useModel, useSandbox, useTool } from "@flue/runtime";
+import {
+  useAgentFinish,
+  useAgentStart,
+  useInstruction,
+  useModel,
+  useSandbox,
+  useSkill,
+  useTool,
+} from "@flue/runtime";
 import { local } from "@flue/runtime/node";
 import type { AgentProps } from "@flue/runtime";
 import { getSessionEnv } from "./session-env.ts";
 import { checkoutRepo } from "./tools.ts";
 import { registerProviders } from "../config/model.ts";
 import { githubPromptGuidance } from "../github-guidance.ts";
+import { SECURITY_PRINCIPLES } from "./security/principles.ts";
+import { SECURITY_SKILLS } from "./security/skills.ts";
+import { captureBaseline, runSecurityGates } from "./security/gates.ts";
 
 // Register the Astro AI Gateway provider HERE, at agent-module scope, rather
 // than in a server bootstrap. Every entry point loads this module — the Hono
@@ -87,6 +98,33 @@ export function Ada({ id }: AgentProps) {
   // is applied server-side: the model names a repo, it never handles a
   // credential and cannot redirect one to an arbitrary host.
   if (env.githubConnected) useTool(checkoutRepo(id));
+
+  /* ---------------- secure-by-default, in three layers ----------------
+   *
+   * The layering is the point. Each does something the others can't:
+   *
+   *   principles  always in the prompt — a handful of rules that apply to
+   *               nearly every change. Kept short on purpose; a long checklist
+   *               here costs tokens on every turn and dilutes itself.
+   *   skills      one catalog line each until the model activates them, so the
+   *               detailed playbooks are effectively free when not relevant.
+   *   gates       read the real diff at every would-stop point and send the
+   *               model back. The only layer that actually ENFORCES anything.
+   */
+
+  useInstruction(SECURITY_PRINCIPLES);
+
+  for (const skill of SECURITY_SKILLS) useSkill(skill);
+
+  // Record the commit the turn starts from, so the gate can diff against it and
+  // see work the agent has already committed — not just the working tree.
+  useAgentStart(async (ctx) => {
+    await captureBaseline(id, ctx);
+  });
+
+  useAgentFinish(async (ctx) => {
+    await runSecurityGates(id, ctx);
+  });
 
   return ROLE;
 }
