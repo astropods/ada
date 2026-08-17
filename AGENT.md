@@ -12,7 +12,7 @@ capabilities:
   - "Serves an AG-UI-compatible frontend; external AG-UI clients (e.g. CopilotKit) can consume the stream"
   - "Also exposes Flue's native agent routes for @flue/sdk clients"
   - "Connects each user's GitHub via per-user OAuth so git/gh act as them"
-  - "Persists the final run result (cost, usage) and exports OTel traces/metrics"
+  - "Exports OTel traces/metrics via @flue/opentelemetry; content capture off by default"
 repository: github:astropods/ada
 integrations: [GitHub, Slack]
 ---

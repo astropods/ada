@@ -5,6 +5,12 @@ import {
   SimpleSpanProcessor,
 } from "@opentelemetry/sdk-trace-base";
 import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
+import {
+  AggregationTemporality,
+  InMemoryMetricExporter,
+  MeterProvider,
+  PeriodicExportingMetricReader,
+} from "@opentelemetry/sdk-metrics";
 import * as api from "@opentelemetry/api";
 import {
   fauxProvider,
@@ -18,23 +24,24 @@ import * as v from "valibot";
 import { installTelemetry } from "../agent/telemetry/otel.ts";
 
 /**
- * OpenTelemetry instrumentation, verified against a REAL Flue agent turn.
+ * OpenTelemetry wiring, verified against a REAL Flue agent turn.
  *
- * There is no Astropods adapter for Flue and no Node tracing backend in the
- * framework, so `agent/telemetry/otel.ts` is hand-written on `instrument()`.
- * That makes it exactly the kind of code that silently rots: it has no
- * compile-time contract with Flue, and a broken trace looks identical to a
- * working one until someone opens a dashboard.
+ * Tracing itself is `@flue/opentelemetry`'s job, so this is not testing the
+ * framework — it is testing that WE INSTALLED IT, and installed it with the
+ * settings this deployment requires. Both are easy to get silently wrong: a
+ * broken or absent trace looks exactly like a working one until someone opens
+ * a dashboard, and a content-capture regression looks like nothing at all
+ * while quietly shipping private source to a collector.
  *
  * So this drives an actual agent — real runtime, real interceptor, real tool
- * call — against a faux model provider (no network, no credential) and asserts
- * on the spans that come out.
+ * call — against a faux model provider (no network, no credential).
  *
- * The property that matters most is PARENTING. The predecessor built spans from
- * the event stream, which produced plausible-looking spans that did not wrap the
- * work: zero durations and no parent/child structure, so nothing nested inside
- * an operation was ever attributed to it. Asserting a single trace with the
- * right shape is what catches a regression back to that.
+ * The structural assertion that matters most is PARENTING. An earlier
+ * hand-written version built spans from the event stream, which produced
+ * plausible-looking spans that did not wrap the work: zero durations and no
+ * parent/child structure, so nothing nested inside an operation was ever
+ * attributed to it. Asserting one correlated trace catches a regression to
+ * anything of that shape.
  *
  * Runs as one test because the tracer provider, the context manager, and Flue's
  * runtime are all process-global — `start()` refuses a second registration.
@@ -53,6 +60,17 @@ test("emits a correctly parented GenAI trace for a real agent turn", async () =>
   const provider = new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] });
   api.trace.setGlobalTracerProvider(provider);
   api.context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());
+
+  // Metrics too, because the cost histogram is the one instrument Ada adds
+  // itself — the GenAI semconv has no cost metric and Flue deliberately emits
+  // none, so nothing but this test would notice it disappearing.
+  const metricExporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
+  const metricReader = new PeriodicExportingMetricReader({
+    exporter: metricExporter,
+    exportIntervalMillis: 60_000,
+  });
+  const meterProvider = new MeterProvider({ readers: [metricReader] });
+  api.metrics.setGlobalMeterProvider(meterProvider);
 
   const dispose = await installTelemetry("ada-test");
 
@@ -96,6 +114,7 @@ test("emits a correctly parented GenAI trace for a real agent turn", async () =>
     await dispose();
   }
   await provider.forceFlush();
+  await metricReader.forceFlush();
 
   const raw = exporter.getFinishedSpans();
   const byId = new Map(raw.map((s) => [s.spanContext().spanId, s]));
@@ -140,6 +159,10 @@ test("emits a correctly parented GenAI trace for a real agent turn", async () =>
   expect(agent!.attributes["gen_ai.agent.name"]).toBe("probe");
   expect(agent!.attributes["flue.instance.id"]).toBe("probe-1");
   expect(agent!.attributes["flue.submission.id"]).toBeTruthy();
+  // Correlation keys the framework's instrumentation provides and the previous
+  // hand-written mapping did not.
+  expect(agent!.attributes["flue.harness.name"], "harness correlation").toBeTruthy();
+  expect(agent!.attributes["flue.session.name"], "session correlation").toBeTruthy();
 
   expect(tool!.attributes["gen_ai.tool.name"]).toBe("ping");
   expect(tool!.attributes["gen_ai.tool.call.id"]).toBe("call_1");
@@ -149,7 +172,7 @@ test("emits a correctly parented GenAI trace for a real agent turn", async () =>
   expect(chat.attributes["gen_ai.operation.name"]).toBe("chat");
   expect(chat.attributes["gen_ai.provider.name"]).toBe("faux");
   expect(chat.attributes["gen_ai.request.model"]).toBe("faux-1");
-  expect(chat.attributes["flue.response.finish_reason"]).toBeTruthy();
+  expect(chat.attributes["gen_ai.response.finish_reasons"]).toBeTruthy();
 
   // Usage must be split across the four buckets. `input_tokens` is the semconv
   // total-sent figure (non-cached + cache read + cache write), not Flue's
@@ -160,6 +183,17 @@ test("emits a correctly parented GenAI trace for a real agent turn", async () =>
     Number(chat.attributes["gen_ai.usage.cache_creation.input_tokens"]);
   expect(Number(chat.attributes["gen_ai.usage.input_tokens"])).toBeGreaterThanOrEqual(totalSent);
   expect(chat.attributes["gen_ai.usage.output_tokens"]).toBeDefined();
+
+  // ---- Ada's own cost metric --------------------------------------------
+  const metricNames = metricExporter
+    .getMetrics()
+    .flatMap((m) => m.scopeMetrics)
+    .flatMap((sm) => sm.metrics)
+    .map((m) => m.descriptor.name);
+  expect(metricNames, "the framework's semconv metrics are present").toContain(
+    "gen_ai.client.token.usage",
+  );
+  expect(metricNames, "Ada's cost histogram survives the swap").toContain("gen_ai.usage.cost_usd");
 
   // ---- no content capture ------------------------------------------------
   // Ada works on private repositories; prompts, completions and tool payloads

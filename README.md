@@ -503,52 +503,61 @@ replayable `CUSTOM ada.usage` AG-UI event (so the client can sum a session total
 that survives reconnect), OTel metrics + span attributes, and a `RunRecord` in
 the `ResultStore`.
 
-**Telemetry.** There is no Astropods adapter for Flue, and the framework's only
-tracing backend (`createCloudflareTracing`) is Cloudflare-only — it imports
-`cloudflare:workers`. So `telemetry/otel.ts` is a hand-written
-`FlueInstrumentation` on raw OpenTelemetry, modelled on that reference so the
-spans match what Flue's own backend emits.
+**Telemetry.** Tracing and the standard GenAI metrics come from
+**`@flue/opentelemetry`**, the framework's own instrumentation, installed in
+`telemetry/otel.ts`:
 
-It registers **both halves** of `instrument()`, and the second is the one that
-matters:
-
-- `observe` — the event stream carries the detail (model, usage, finish reason)
-  and builds a *pending* span descriptor.
-- `interceptor` — wraps the real operation (`startActiveSpan(…) → next()`),
-  which is what gives true durations and makes the span the active context so
-  nested work parents correctly.
-
-Building spans from events alone — the obvious approach, and what this used to
-do — produces plausible-looking spans that don't wrap anything: zero durations,
-no parent/child structure, and every HTTP call the provider makes landing
-unparented. A real turn now produces one correlated trace:
-
-```
-invoke_agent ada          39.3ms   ROOT
-├─ chat claude-opus-4-8    1.7ms   gen_ai.provider.name, request.model, usage.*
-├─ execute_tool bash      27.4ms   gen_ai.tool.name, tool.call.id
-└─ chat claude-opus-4-8    1.7ms
+```ts
+instrument(createOpenTelemetryInstrumentation({ content: false }))
 ```
 
-Span names follow the GenAI semconv (`invoke_agent` / `chat` / `execute_tool`),
-attributes use `gen_ai.*` plus Flue's `flue.*` keys, and `gen_ai.usage.input_tokens`
-is the semconv **total sent** — non-cached + cache read + cache write — not
-Flue's non-cached `input`, which would under-report spend by the entire
-cache-read volume.
+> This replaced ~440 lines that reimplemented Flue's Cloudflare tracing backend
+> for Node. The official package was missed because it is a **sibling package**,
+> not re-exported from `@flue/runtime` — the only tracing symbol visible there is
+> `createCloudflareTracing`, which imports `cloudflare:workers` and so reads as
+> Cloudflare-only. If you need a Flue integration, check the registry for a
+> `@flue/*` sibling before writing one.
 
-Two deliberate choices:
+A real turn produces one correlated trace, with spans that WRAP the work — so
+durations are real and nested instrumentation parents correctly:
 
-- **No content capture.** Prompts, completions, and tool payloads never become
+```
+invoke_agent ada          39ms   ROOT
+├─ chat claude-opus-4-8    2ms   gen_ai.provider.name, request.model, usage.*
+├─ execute_tool bash      27ms   gen_ai.tool.name, tool.call.id, flue.tool.origin
+└─ chat claude-opus-4-8    1ms
+```
+
+Span names follow the GenAI semconv (`invoke_agent` / `chat` / `execute_tool`)
+and `gen_ai.usage.input_tokens` is the semconv **total sent** — non-cached +
+cache read + cache write.
+
+Two things are ours rather than the framework's, both deliberate:
+
+- **`content: false`.** Prompts, completions, and tool payloads never become
   span attributes. Ada works on private repositories and attributes are retained
-  by the collector.
-- **Registered globally at boot, not from the session runner.** The runner's
-  observer returns early for instances it doesn't track, so driving telemetry
-  from there silently excluded every session started through Flue's native
-  `/agents/ada/:id` routes.
+  by the collector. If content is ever wanted, use the package's `transform`
+  hook to redact in place rather than flipping this on.
+- **A cost histogram** (`gen_ai.usage.cost_usd`). Cost is absent from the GenAI
+  semconv and from Flue's instrumentation — it's provider- and pricing-specific
+  — but pi-ai computes it per turn, and "tool usage + token usage → money" is a
+  question this deployment has to answer.
+
+Instrumentation is registered **globally at boot**, not from the session runner:
+the runner's observer returns early for instances it doesn't track, so driving
+telemetry from there silently excluded every session started through Flue's
+native `/agents/ada/:id` routes.
 
 `test/telemetry.spec.ts` drives a real agent turn against a faux model provider
 (no network, no credential) and asserts span names, parenting, a single trace,
-non-zero durations, and the absence of content attributes.
+non-zero durations, the cost metric, and the absence of content attributes.
+
+| env | purpose |
+|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector (injected by the runner); unset ⇒ instrumentation still registers, but spans are discarded |
+| `OTEL_SERVICE_NAME` | `service.name` (Dockerfile default `ada`) |
+| `ADA_SELF_TELEMETRY` | `0` to skip starting the OTLP exporter even with an endpoint set |
+| `OTEL_METRICS_ENABLED` | `1` to export OTLP metrics alongside traces |
 
 OTel dep versions mirror the proven `0.217.0` train used across the other Astro
 agents.
@@ -620,8 +629,7 @@ agents.
 - Registry durability: cap/spool the event log, GC terminated sessions.
 - Harden auth: sign the `bridge_uid` cookie, GC OAuth CSRF state, encrypt tokens
   at rest.
-- Fix the two remaining `tsc` errors (`@types/pg`, OTel SDK `metricReader` types
-  — both pre-date this rewrite) and add a CI typecheck + AG-UI schema validation
-  alongside the e2e workflow.
+- Add a CI typecheck step (`tsc --noEmit` is clean as of the telemetry work) and
+  AG-UI schema validation alongside the e2e workflow.
 - Consider a remote sandbox adapter to restore the out-of-process isolation
   boundary.
