@@ -50,7 +50,7 @@ import { describeAuth } from "./config/model.ts";
 import { SessionRegistry } from "./session/registry.ts";
 import { SessionRunner } from "./session/runner.ts";
 import { startWorkspaceGc } from "./session/workspace.ts";
-import { createTelemetry } from "./telemetry/otel.ts";
+import { installTelemetry } from "./telemetry/otel.ts";
 import { InMemoryResultStore } from "./persistence/results.ts";
 import { createStore, type Store } from "./store/index.ts";
 import { authorizeUrl, exchangeCode, listConnectedRepos } from "./auth/github-app.ts";
@@ -107,11 +107,13 @@ function boot(): Promise<void> {
     // NB: providers are registered at agent-module scope (agents/ada.ts), which
     // this module imports — so they are already in place by the time any route
     // can run, on every entry point including `flue run`.
-    const telemetry = await createTelemetry();
+    // Registered globally, before any agent can run, so it covers sessions
+    // driven through Flue's native routes as well as our own.
+    await installTelemetry();
     store = await createStore();
     await loadAppCreds(store);
     await getServerSecret(store); // stable HMAC secret for messaging connect links
-    runner = new SessionRunner(registry, store, telemetry, resultStore);
+    runner = new SessionRunner(registry, store, resultStore);
     runner.start();
 
     console.log(`[ada] ${describeAuth()}`);

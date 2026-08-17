@@ -503,23 +503,52 @@ replayable `CUSTOM ada.usage` AG-UI event (so the client can sum a session total
 that survives reconnect), OTel metrics + span attributes, and a `RunRecord` in
 the `ResultStore`.
 
-**Telemetry.** `telemetry/otel.ts` subscribes to the same Flue events and emits
-GenAI-semconv spans (root `ada.run` + child `ada.tool`, with token/cost
-attributes) plus counters and a cost histogram, via an in-process OTLP/proto
-exporter.
+**Telemetry.** There is no Astropods adapter for Flue, and the framework's only
+tracing backend (`createCloudflareTracing`) is Cloudflare-only — it imports
+`cloudflare:workers`. So `telemetry/otel.ts` is a hand-written
+`FlueInstrumentation` on raw OpenTelemetry, modelled on that reference so the
+spans match what Flue's own backend emits.
 
-> **Changed in the rewrite:** this used to be **opt-in** (`BRIDGE_SELF_TELEMETRY=1`)
-> because the `claude` child emitted its own native Claude Code OTel and we
-> didn't want to double-emit. There is no child now and no second source, so
-> these are the only spans Ada produces — telemetry is **on by default**
-> whenever an OTLP endpoint is set. Opt out with `ADA_SELF_TELEMETRY=0`.
+It registers **both halves** of `instrument()`, and the second is the one that
+matters:
 
-| env | purpose |
-|---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector (injected by the runner); unset ⇒ no export |
-| `OTEL_SERVICE_NAME` | `service.name` (Dockerfile default `ada`) |
-| `ADA_SELF_TELEMETRY` | `0` to disable spans even with an endpoint set |
-| `OTEL_METRICS_ENABLED` | `1` to add OTLP metrics alongside traces |
+- `observe` — the event stream carries the detail (model, usage, finish reason)
+  and builds a *pending* span descriptor.
+- `interceptor` — wraps the real operation (`startActiveSpan(…) → next()`),
+  which is what gives true durations and makes the span the active context so
+  nested work parents correctly.
+
+Building spans from events alone — the obvious approach, and what this used to
+do — produces plausible-looking spans that don't wrap anything: zero durations,
+no parent/child structure, and every HTTP call the provider makes landing
+unparented. A real turn now produces one correlated trace:
+
+```
+invoke_agent ada          39.3ms   ROOT
+├─ chat claude-opus-4-8    1.7ms   gen_ai.provider.name, request.model, usage.*
+├─ execute_tool bash      27.4ms   gen_ai.tool.name, tool.call.id
+└─ chat claude-opus-4-8    1.7ms
+```
+
+Span names follow the GenAI semconv (`invoke_agent` / `chat` / `execute_tool`),
+attributes use `gen_ai.*` plus Flue's `flue.*` keys, and `gen_ai.usage.input_tokens`
+is the semconv **total sent** — non-cached + cache read + cache write — not
+Flue's non-cached `input`, which would under-report spend by the entire
+cache-read volume.
+
+Two deliberate choices:
+
+- **No content capture.** Prompts, completions, and tool payloads never become
+  span attributes. Ada works on private repositories and attributes are retained
+  by the collector.
+- **Registered globally at boot, not from the session runner.** The runner's
+  observer returns early for instances it doesn't track, so driving telemetry
+  from there silently excluded every session started through Flue's native
+  `/agents/ada/:id` routes.
+
+`test/telemetry.spec.ts` drives a real agent turn against a faux model provider
+(no network, no credential) and asserts span names, parenting, a single trace,
+non-zero durations, and the absence of content attributes.
 
 OTel dep versions mirror the proven `0.217.0` train used across the other Astro
 agents.

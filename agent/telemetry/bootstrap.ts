@@ -50,8 +50,12 @@ export async function startTelemetrySdk(): Promise<boolean> {
 
     const traceExporter = new OTLPTraceExporter(); // reads OTEL_EXPORTER_OTLP_ENDPOINT
 
+    // Typed as the SDK's own config rather than `unknown`: the reader is
+    // structurally an IMetricReader, and widening it to `unknown` only moved
+    // the mismatch to the NodeSDK call site as an unassignable-argument error.
+    type SdkConfig = ConstructorParameters<typeof NodeSDK>[0];
     const metricsOn = process.env.OTEL_METRICS_ENABLED === "1";
-    let metricReader: unknown;
+    let metricReader: NonNullable<SdkConfig>["metricReader"];
     if (metricsOn) {
       const { OTLPMetricExporter } = await import("@opentelemetry/exporter-metrics-otlp-proto");
       const { PeriodicExportingMetricReader } = await import("@opentelemetry/sdk-metrics");

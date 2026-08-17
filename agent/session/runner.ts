@@ -41,7 +41,6 @@ import {
   type RunUsage,
 } from "../persistence/results.ts";
 import type { Store } from "../store/store.ts";
-import type { Telemetry } from "../telemetry/otel.ts";
 import type { AguiEvent } from "../types/agui.ts";
 
 export interface TurnOpts {
@@ -84,13 +83,16 @@ export class SessionRunner {
   // rejects those.
   private readonly registry: SessionRegistry;
   private readonly store: Store;
-  private readonly telemetry: Telemetry;
   private readonly results: ResultStore;
 
-  constructor(registry: SessionRegistry, store: Store, telemetry: Telemetry, results: ResultStore) {
+  // NB: no telemetry here. Tracing is registered globally via
+  // `installTelemetry()` (telemetry/otel.ts) rather than driven from this
+  // observer, which returns early for instances it doesn't track — that
+  // silently excluded every session started through Flue's native
+  // `/agents/ada/:id` routes.
+  constructor(registry: SessionRegistry, store: Store, results: ResultStore) {
     this.registry = registry;
     this.store = store;
-    this.telemetry = telemetry;
     this.results = results;
   }
 
@@ -108,7 +110,6 @@ export class SessionRunner {
       if (!live) return;
       try {
         const flueEvent = event as FlueEvent;
-        this.telemetry.onEvent(instanceId, flueEvent);
         this.accumulate(live, flueEvent);
         for (const agui of live.translator.handle(flueEvent)) {
           this.registry.append(instanceId, agui);
@@ -134,7 +135,7 @@ export class SessionRunner {
     if (event.response?.usage) addTurnUsage(live.usage, event.response.usage);
   }
 
-  /** Advance registry status, persist the run record, close the telemetry span. */
+  /** Advance registry status and persist the run record. */
   private settleStatus(instanceId: string, event: FlueEvent): void {
     const terminal =
       event.type === "agent_end" ||
@@ -156,9 +157,6 @@ export class SessionRunner {
         )
         .catch((e) => console.warn(`[runner] result save failed: ${(e as Error).message}`));
     }
-    // One telemetry root span per delivery: endSession drops the ctx entry, so
-    // the next turn's agent_start opens a fresh span under the same id.
-    this.telemetry.endSession(instanceId);
   }
 
   /** Whether a turn is currently in flight for this session. */
@@ -256,7 +254,6 @@ export class SessionRunner {
         // the settlement. Anything else is a real error for the client.
         if (hooks?.signal?.aborted) return;
         this.registry.setStatus(instanceId, "errored");
-        this.telemetry.endSession(instanceId);
         throw e;
       } finally {
         hooks?.signal?.removeEventListener("abort", onAbort);
@@ -286,7 +283,6 @@ export class SessionRunner {
     removeWorkspace(this.workspaces.get(instanceId));
     this.workspaces.delete(instanceId);
     await this.store.kvDelete(WS_NS, instanceId);
-    this.telemetry.endSession(instanceId);
     return existed;
   }
 }
