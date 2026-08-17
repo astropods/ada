@@ -41,7 +41,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { Hono, type Context } from "hono";
-import { getCookie, setCookie } from "hono/cookie";
+import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { createAgentRouter } from "@flue/runtime/routing";
 import type { FlueEvent } from "@flue/runtime";
 import { Ada } from "./agents/ada.ts";
@@ -59,7 +59,7 @@ import {
   verifyState, buildManifest, convertManifestCode, renderManifestForm,
   isAdmin, adminListConfigured, canProvision,
 } from "./auth/setup.ts";
-import { getServerSecret, verifyLink } from "./auth/connect.ts";
+import { getServerSecret, mintLink, verifyLink } from "./auth/connect.ts";
 import { resolveBaseUrl } from "./auth/base-url.ts";
 import { Authorizer, oidcIdentity, oidcEmail, type AuthzResult } from "./auth/authz.ts";
 import { SSE_HEADERS, frameLogged, sseHeartbeat, parseLastEventId } from "./transport/sse.ts";
@@ -71,8 +71,14 @@ const PUBLIC_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "public")
 
 export const registry = new SessionRegistry();
 const resultStore = new InMemoryResultStore();
-/** OAuth CSRF: state nonce -> user key (bridge_uid, or a messaging userId). TODO: TTL/GC. */
-const pendingStates = new Map<string, string>();
+
+/**
+ * How long an OAuth round-trip may take. Generous because it spans GitHub's
+ * install and repo-picker screens, not just a consent click.
+ */
+const OAUTH_STATE_TTL_MS = 30 * 60 * 1000;
+/** Guards the one automatic retry below; short-lived, cleared on settle. */
+const RETRY_COOKIE = "gh_connect_retry";
 /** Manual-authz client: resolves the platform user id the sidecar keys chat on. */
 const authorizer = new Authorizer();
 
@@ -469,17 +475,31 @@ app.get("/auth/github/login", async (c) => {
     if (!id.allowed) return c.text("forbidden", 403);
     userKey = id.userKey;
   }
-  const state = randomUUID();
-  pendingStates.set(state, userKey);
+  // The OAuth `state` is a SIGNED TOKEN CARRYING the user key, not a nonce
+  // indexing a server-side map.
+  //
+  // It used to be `randomUUID()` plus an in-memory `pendingStates` Map. That
+  // broke in two ways: the Map died on every restart (fatal under
+  // `node --watch`), and it made the callback unable to identify anyone whose
+  // flow didn't originate here. Signing the user key into the state makes the
+  // round-trip stateless — restart-proof, no GC, and still unforgeable and
+  // time-limited, which is all CSRF protection needs. Reuses the same
+  // primitives as the chat connect links.
+  const state = mintLink("connect", userKey, await getServerSecret(store), OAUTH_STATE_TTL_MS);
+
   // Route through the App INSTALLATION (repo picker + write grant), not the
   // bare OAuth authorize. With `request_oauth_on_install` on the App,
   // installing also authorizes, and GitHub redirects back to
-  // /auth/github/callback with `code` (+ installation_id). Fall back to OAuth
-  // authorize only when we lack the App slug (e.g. env-supplied creds) — that
-  // grants identity but no repo access.
+  // /auth/github/callback with `code` (+ installation_id).
+  //
+  // `?authorize=1` skips the picker and goes straight to OAuth — used when the
+  // App is ALREADY installed and only the user authorization is missing (see
+  // the callback's recovery path). Sending them back to the install screen in
+  // that case just shows a confusing "configure" page.
   const slug = getAppCreds()?.slug;
+  const authorizeOnly = c.req.query("authorize") === "1";
   return c.redirect(
-    slug
+    slug && !authorizeOnly
       ? `https://github.com/apps/${slug}/installations/new?state=${encodeURIComponent(state)}`
       : authorizeUrl(state, baseUrlFor(c)),
   );
@@ -488,9 +508,47 @@ app.get("/auth/github/login", async (c) => {
 app.get("/auth/github/callback", async (c) => {
   const code = c.req.query("code");
   const state = c.req.query("state");
-  const uid = state ? pendingStates.get(state) : undefined;
-  if (state) pendingStates.delete(state);
-  if (!code || !uid) return c.text("invalid OAuth callback", 400);
+  const uid = state ? verifyLink(state, "connect", await getServerSecret(store)) : null;
+
+  // No usable state. Two ways to get here, and neither is the user's fault:
+  //
+  //   1. The flow started on GitHub rather than in Ada — someone opened
+  //      github.com/apps/<slug>/installations/new directly, or an org owner
+  //      approved an installation request. GitHub then calls back with
+  //      `code` + `installation_id` + `setup_action=install` and NO state,
+  //      because there was no Ada redirect to put one there.
+  //   2. The state genuinely expired (>30 min on GitHub's screens).
+  //
+  // We deliberately do NOT consume `code` here. Without a valid state nothing
+  // binds this callback to a session, and trusting it anyway is precisely the
+  // login-CSRF that state exists to prevent — an attacker could graft their
+  // GitHub account onto someone else's Ada identity.
+  //
+  // Instead, restart the flow properly: one redirect through /auth/github/login
+  // mints a real state and returns here able to identify the user. The App is
+  // already installed in case (1), so skip the picker with `authorize=1`. A
+  // short-lived cookie bounds this to a single attempt so a persistently
+  // failing state can't ping-pong.
+  if (!uid) {
+    if (getCookie(c, RETRY_COOKIE)) {
+      deleteCookie(c, RETRY_COOKIE, { path: "/" });
+      return c.html(
+        renderPage(
+          "Couldn't complete the connection",
+          "The GitHub authorization couldn't be matched to your session. Open the app and click " +
+            "<b>Connect GitHub</b> in Settings to try again. If this keeps happening, check that " +
+            "cookies are enabled for this origin.",
+        ),
+        400,
+      );
+    }
+    setCookie(c, RETRY_COOKIE, "1", { httpOnly: true, path: "/", sameSite: "Lax", maxAge: 300 });
+    const installed = Boolean(c.req.query("installation_id"));
+    return c.redirect(`/auth/github/login${installed ? "?authorize=1" : ""}`);
+  }
+
+  if (!code) return c.text("invalid OAuth callback (no code)", 400);
+  deleteCookie(c, RETRY_COOKIE, { path: "/" });
   try {
     // Same base as the authorize redirect — GitHub compares the two
     // `redirect_uri`s and rejects a mismatch.

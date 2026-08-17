@@ -58,9 +58,15 @@ function safeEqual(a: string, b: string): boolean {
   return timingSafeEqual(ab, bb);
 }
 
-/** Mint a signed, time-limited link token of a given kind, binding a userId. */
-export function mintLink(kind: LinkKind, userId: string, secret: string): string {
-  const body = b64url(Buffer.from(JSON.stringify({ k: kind, u: userId, e: Date.now() + LINK_TTL_MS })));
+/**
+ * Mint a signed, time-limited link token of a given kind, binding a userId.
+ *
+ * `ttlMs` overrides the default lifetime. The OAuth `state` uses a longer one
+ * than a chat link: that round-trip includes GitHub's install + repo-picker
+ * screens, which a user can easily sit on for more than ten minutes.
+ */
+export function mintLink(kind: LinkKind, userId: string, secret: string, ttlMs = LINK_TTL_MS): string {
+  const body = b64url(Buffer.from(JSON.stringify({ k: kind, u: userId, e: Date.now() + ttlMs })));
   const mac = b64url(createHmac("sha256", secret).update(body).digest());
   return `${body}.${mac}`;
 }
