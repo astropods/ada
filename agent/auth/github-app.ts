@@ -17,6 +17,7 @@
 
 import type { GithubTokenRecord, Store } from "../store/store.ts";
 import { getAppCreds, type GithubAppCreds } from "./app-config.ts";
+import { callbackPath, resolveBaseUrl } from "./base-url.ts";
 
 const AUTHORIZE_URL = "https://github.com/login/oauth/authorize";
 const TOKEN_URL = "https://github.com/login/oauth/access_token";
@@ -30,16 +31,26 @@ function requireCreds(): GithubAppCreds {
   return c;
 }
 
-export function callbackUrl(env: NodeJS.ProcessEnv = process.env): string {
-  const base = env.ASTRO_EXTERNAL_AGENT_URL ?? `http://localhost:${env.PORT ?? 8080}`;
-  return `${base.replace(/\/+$/, "")}/auth/github/callback`;
+/**
+ * The OAuth callback URL. `baseUrl` should come from `resolveBaseUrl(request)`
+ * so a local run uses the port the browser actually reached us on; omitting it
+ * falls back to config/localhost (the only option off a request, e.g. chat).
+ */
+export function callbackUrl(baseUrl?: string): string {
+  return callbackPath(baseUrl ?? resolveBaseUrl());
 }
 
-/** The authorize URL to redirect the user to. `state` is a CSRF nonce. */
-export function authorizeUrl(state: string, env: NodeJS.ProcessEnv = process.env): string {
+/**
+ * The authorize URL to redirect the user to. `state` is a CSRF nonce.
+ *
+ * The `redirect_uri` here MUST be byte-identical to the one `exchangeCode()`
+ * sends later, and must be one of the App's registered `callback_urls` — hence
+ * both taking the same resolved `baseUrl`.
+ */
+export function authorizeUrl(state: string, baseUrl?: string): string {
   const params = new URLSearchParams({
     client_id: requireCreds().clientId,
-    redirect_uri: callbackUrl(env),
+    redirect_uri: callbackUrl(baseUrl),
     state,
     // no `scope` — GitHub Apps use configured permissions
   });
@@ -81,15 +92,20 @@ async function postToken(
   };
 }
 
-/** Exchange an authorization code for a user token record (+ user identity). */
+/**
+ * Exchange an authorization code for a user token record (+ user identity).
+ *
+ * `baseUrl` must be the SAME value `authorizeUrl()` used — GitHub compares the
+ * two `redirect_uri`s and rejects the exchange if they differ.
+ */
 export async function exchangeCode(
   code: string,
-  env: NodeJS.ProcessEnv = process.env,
+  baseUrl?: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<GithubTokenRecord> {
   const c = requireCreds();
   const rec = await postToken(
-    { client_id: c.clientId, client_secret: c.clientSecret, code, redirect_uri: callbackUrl(env) },
+    { client_id: c.clientId, client_secret: c.clientSecret, code, redirect_uri: callbackUrl(baseUrl) },
     fetchImpl,
   );
   return attachUser(rec, fetchImpl);

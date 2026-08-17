@@ -60,6 +60,7 @@ import {
   isAdmin, adminListConfigured, canProvision,
 } from "./auth/setup.ts";
 import { getServerSecret, verifyLink } from "./auth/connect.ts";
+import { resolveBaseUrl } from "./auth/base-url.ts";
 import { Authorizer, oidcIdentity, oidcEmail, type AuthzResult } from "./auth/authz.ts";
 import { SSE_HEADERS, frameLogged, sseHeartbeat, parseLastEventId } from "./transport/sse.ts";
 import { render401, renderPage } from "./transport/pages.ts";
@@ -220,6 +221,15 @@ async function resolveIdentity(c: Ctx): Promise<Identity> {
 /** Admin gate for cross-user views: an admin email, or no admin list configured. */
 function mayViewOthers(id: Identity): boolean {
   return id.allowed && (isAdmin(id.email) || !adminListConfigured());
+}
+
+/**
+ * The public base URL for THIS request — what we register with GitHub and hand
+ * to the browser. Derived from the request so a local run on a non-default port
+ * works; explicit config still wins. See auth/base-url.ts.
+ */
+function baseUrlFor(c: Ctx): string {
+  return resolveBaseUrl({ headers: Object.fromEntries(c.req.raw.headers) });
 }
 
 /* ---------------- app ---------------- */
@@ -471,7 +481,7 @@ app.get("/auth/github/login", async (c) => {
   return c.redirect(
     slug
       ? `https://github.com/apps/${slug}/installations/new?state=${encodeURIComponent(state)}`
-      : authorizeUrl(state),
+      : authorizeUrl(state, baseUrlFor(c)),
   );
 });
 
@@ -482,7 +492,9 @@ app.get("/auth/github/callback", async (c) => {
   if (state) pendingStates.delete(state);
   if (!code || !uid) return c.text("invalid OAuth callback", 400);
   try {
-    const rec = await exchangeCode(code);
+    // Same base as the authorize redirect — GitHub compares the two
+    // `redirect_uri`s and rejects a mismatch.
+    const rec = await exchangeCode(code, baseUrlFor(c));
     await store.putGithubToken(uid, rec);
     const installationId = c.req.query("installation_id");
     console.log(
@@ -593,10 +605,11 @@ app.get("/api/setup/github/start", async (c) => {
       403,
     );
   }
-  const { manifest, manifestUrl } = buildManifest(
-    await getServerSecret(store),
-    c.req.query("org") || undefined,
-  );
+  const { manifest, manifestUrl } = buildManifest(await getServerSecret(store), {
+    org: c.req.query("org") || undefined,
+    // Registered with GitHub permanently — see ManifestOptions.baseUrl.
+    baseUrl: baseUrlFor(c),
+  });
   return c.html(renderManifestForm(manifest, manifestUrl));
 });
 

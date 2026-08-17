@@ -136,6 +136,10 @@ Key facts:
 - **`knowledge.db: postgres`** → platform-managed Postgres (`POSTGRES_*`) stores
   per-user GitHub OAuth tokens, the GitHub App creds, repo bindings, and the
   server HMAC secret.
+- **`PUBLIC_BASE_URL`** (optional env) → overrides the agent's public base URL,
+  ahead of `ASTRO_EXTERNAL_AGENT_URL`. Needed only when the origin a browser
+  reaches Ada on isn't loopback and isn't the platform URL (ngrok, a LAN IP).
+  See "GitHub App callback URLs".
 - **`ADMIN_EMAILS`** (optional input) → comma-separated admin emails allowed to
   provision the GitHub App from the web UI (matched against the ALB-verified
   identity). Unset ⇒ any signed-in user may do the *initial* setup, then it locks.
@@ -353,6 +357,41 @@ CUSTOM ada.usage          {inputTokens, outputTokens, cache*, costUsd}
 TEXT_MESSAGE_START/…/END  msg_3  "Done — retries is now 5."
 RUN_FINISHED
 ```
+
+## GitHub App callback URLs
+
+Three things have to agree on the agent's public base URL, and if any two
+disagree the flow fails as a confusing **404**:
+
+1. the App manifest's `callback_urls` / `redirect_url`, registered with GitHub
+   **once, permanently**, at App-creation time;
+2. the `redirect_uri` on the authorize redirect *and* on the code exchange —
+   GitHub rejects the exchange if the two differ;
+3. the connect link handed to a chat user.
+
+`agent/auth/base-url.ts` is the single source of truth, resolving in order:
+
+1. `PUBLIC_BASE_URL`, then `ASTRO_EXTERNAL_AGENT_URL` — explicit config wins.
+2. The request's own `Host`, **but only for loopback hosts**.
+3. `http://localhost:${PORT ?? 8080}`.
+
+Step 2 is what makes local setup work. Under `ast project start` the container
+sets `PORT=80` while the frontend is mapped to `8080` on your host, so deriving
+the base from `PORT` registered `http://localhost:80/...` and GitHub sent the
+browser to a port nothing was listening on.
+
+**Why `Host` is only trusted for loopback:** it's a client-controlled header,
+and building an OAuth `redirect_uri` from it is a known injection vector — an
+attacker who can send a request with a poisoned `Host` could have a victim's
+authorization code delivered to their own origin. Restricting it to
+`localhost`/`127.0.0.1`/`[::1]` fixes exactly the broken case (your browser
+talking to your own machine on a non-default port) and leaves every reachable
+deployment on explicit config. For a non-loopback dev origin, set
+`PUBLIC_BASE_URL`.
+
+> **If you already provisioned an App with a bad callback**, this fix can't
+> repair it — the URLs live on the GitHub App. Either edit them in the App's
+> settings on GitHub, or delete the App and run setup again.
 
 ## Model routing & auth
 

@@ -19,6 +19,7 @@
 
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { Store } from "../store/store.ts";
+import { resolveBaseUrl } from "./base-url.ts";
 
 const SECRET_NS = "server";
 const SECRET_KEY = "hmac_secret";
@@ -91,11 +92,15 @@ export function verifyLink(token: string | null | undefined, kind: LinkKind, sec
   }
 }
 
-function externalBase(env: NodeJS.ProcessEnv): string {
-  return (env.ASTRO_EXTERNAL_AGENT_URL ?? `http://localhost:${env.PORT ?? 8080}`).replace(/\/+$/, "");
-}
-
-/** Link a messaging user clicks to connect their own GitHub account. */
-export function buildConnectUrl(userId: string, secret: string, env: NodeJS.ProcessEnv = process.env): string {
-  return `${externalBase(env)}/auth/github/login?link=${encodeURIComponent(mintLink("connect", userId, secret))}`;
+/**
+ * Link a messaging user clicks to connect their own GitHub account.
+ *
+ * Usually minted from chat, where there is no HTTP request to derive an origin
+ * from — so this relies on `PUBLIC_BASE_URL` / `ASTRO_EXTERNAL_AGENT_URL` being
+ * set, which is the case in any deployment that has Slack attached. `baseUrl`
+ * is accepted for the browser-initiated path. See auth/base-url.ts.
+ */
+export function buildConnectUrl(userId: string, secret: string, baseUrl?: string): string {
+  const base = baseUrl ?? resolveBaseUrl();
+  return `${base}/auth/github/login?link=${encodeURIComponent(mintLink("connect", userId, secret))}`;
 }

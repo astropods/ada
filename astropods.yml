@@ -87,7 +87,7 @@ knowledge:
   # and other per-interaction state. Platform-managed Postgres injects
   # POSTGRES_HOST/PORT/USER/PASSWORD/DB. (If provider-mode injection misbehaves,
   # fall back to container mode — see the migrate-to-astropods notes.)
-  db:
+  ada-db:
     provider: postgres
   #
   # REMOVED BY THE FLUE REWRITE: a `sandbox:` knowledge container.
