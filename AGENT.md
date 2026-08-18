@@ -5,7 +5,8 @@ capabilities:
   - "Runs a Flue 2.0 agent loop in-process — no CLI child, no stream-json contract"
   - "Secure by default: always-on principles, on-demand security playbooks, and enforced diff gates"
   - "Holds multi-turn conversations; Flue keeps the history durably per instance id"
-  - "Isolates each session in its own writable sandbox workspace"
+  - "Runs the model's commands in a separate, secret-less sandbox container"
+  - "Isolates each session in its own writable workspace"
   - "Scrubs the sandbox env so tools can't read host secrets (AWS/DB/gateway)"
   - "Translates Flue's event stream into AG-UI protocol events, one-to-one"
   - "Re-emits AG-UI events over SSE with lossless reconnect (Last-Event-ID replay)"
@@ -133,10 +134,10 @@ never loop.
   sandbox that used to provide one is gone; the durable fix is a
   Postgres-backed Flue `PersistenceAdapter`. GitHub tokens and repo bindings
   are unaffected (those are in Postgres).
-- The model's shell runs in the **same container as the control plane**. The
-  env is scrubbed, but this is a smaller blast radius than the previous
-  out-of-process sandbox. Swap `local()` in `agents/ada.ts` for a remote
-  sandbox adapter (E2B, Daytona, Modal) to restore that split.
+- Conversation history still lives in SQLite on the control-plane container,
+  so it does not survive a restart even though repo checkouts now do (they are
+  on the sandbox volume). The durable fix remains a Postgres-backed Flue
+  `PersistenceAdapter`.
 - The AG-UI event log is in memory with no GC yet. (The OAuth CSRF state is no
   longer among these — it is a signed, self-contained token now.)
 - One turn runs at a time per session — an overlapping follow-up gets `409 busy`.

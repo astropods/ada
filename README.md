@@ -395,22 +395,55 @@ How it behaves under load:
 
 ### Execution sandbox (isolation)
 
-Ada uses Flue's **`local()`** sandbox: real filesystem, real processes, bound to
-the session's workspace directory. `local()` scrubs the host env down to its own
-allowlist (`PATH`/`HOME`/`SHELL`/`LANG`/`TMPDIR`/…), and `agent/config/model.ts`
-layers on only the proxy/TLS vars, the build-cache tuning, and — when the user
-has connected — their `GH_TOKEN`. So `bash → env` cannot read the container's
-AWS/database/gateway secrets. The **model credential is no longer forwarded at
-all**, because no child process needs it.
+The model's commands run in a **separate container** that holds none of the
+control plane's secrets — no database credentials, no GitHub App client secret,
+no HMAC signing key, no model credential. A rogue `bash` therefore reaches at
+most one conversation's checkout, in a process with nothing else worth taking.
 
-**This is a smaller isolation boundary than before.** Ada used to run Claude Code
-in a separate, secret-less sandbox container reached over HTTP (`knowledge.sandbox`
-+ `sandbox/`), so a rogue tool reached at most one thread's checkout in a process
-that held no control-plane secrets. Flue runs the loop in-process, so that split
-is gone and the model's shell shares the control plane's container. Flue's
-sandbox interface makes restoring it a one-line change at the `useSandbox()`
-call — swap `local()` for a remote adapter (E2B, Daytona, Modal) and provision
-that provider.
+The switch is automatic. The platform injects `KNOWLEDGE_SANDBOX_HOST` when
+`knowledge.sandbox` is deployed, and `agent/session/remote-sandbox.ts` routes
+execution there; with no sandbox service, Ada falls back to Flue's in-process
+`local()` sandbox, which is how `node agent/index.ts` and `flue run` work.
+
+**What Flue changed about this.** The pre-rewrite version of the split was a
+Claude Code runner: it took a prompt, spawned `claude -p`, and streamed raw
+stream-json back over SSE — so it had to know about models, credentials, resume
+ids, and tool policy, and it shared source with the control plane. It is now a
+dumb filesystem-and-shell server implementing exactly Flue's `SandboxDriver`:
+
+```ts
+interface SandboxDriver {
+  readFile, readFileBuffer, writeFile, stat, readdir, exists, mkdir, rm,
+  exec(command, { cwd, env, timeoutMs, signal }): Promise<ShellResult>
+}
+```
+
+Nine operations, no agent concepts at all. The agent loop, the built-in
+file/shell tools, the security gates, the reviewer subagent, and `AGENTS.md`
+discovery all talk to the `Sandbox` interface and neither know nor care that
+execution is a network hop away. Swapping in E2B, Daytona, or Modal instead is
+the same one-line change at `useSandbox()`.
+
+Two properties make the isolation real, and `test/remote-sandbox.spec.ts`
+asserts both against the service over real HTTP:
+
+- **Workspace containment.** Every path is resolved inside the requesting
+  instance's own directory and rejected if it escapes — resolve-then-compare,
+  not `../` stripping, which encodings and absolute paths defeat. One
+  conversation cannot read another's checkout.
+- **Environment.** The service builds each command's env from an allowlist
+  rather than inheriting its own, so a variable an operator adds to the
+  container never reaches a command the model runs. The user's `GH_TOKEN` is
+  sent **per request** and never persisted, so it exists there only for the
+  duration of the command using it.
+
+`SANDBOX_TOKEN`, when set on both sides, requires a shared secret on every
+call. Unset, the service trusts its network — acceptable only because the
+platform does not route to a knowledge container externally, and it warns
+loudly at startup.
+
+`/data` is the sandbox's volume: one directory per conversation (TTL-swept) plus
+build caches, so a repeat build doesn't re-download a toolchain.
 
 ### Tool policy
 
@@ -681,8 +714,6 @@ agents.
   conversation. GitHub tokens and repo bindings are unaffected (Postgres). The
   durable fix is a Postgres-backed Flue `PersistenceAdapter`
   (`defineSqlConversationStreamStore` in `@flue/runtime/adapter`).
-- The model's shell runs in the same container as the control plane — see
-  "Execution sandbox" above.
 - The AG-UI event log is in memory with no GC yet. (The OAuth CSRF state is no
   longer among these — it is a signed, self-contained token now.)
 
@@ -695,5 +726,5 @@ agents.
   at rest.
 - Add a CI typecheck step (`tsc --noEmit` is clean as of the telemetry work) and
   AG-UI schema validation alongside the e2e workflow.
-- Consider a remote sandbox adapter to restore the out-of-process isolation
-  boundary.
+- Consider a managed sandbox provider (E2B, Daytona, Modal) as an alternative
+  to self-hosting the execution container — same one-line `useSandbox()` swap.

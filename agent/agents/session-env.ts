@@ -27,6 +27,13 @@ export interface SessionEnv {
   modelRef: string;
   /** Writable workspace that is the sandbox cwd (repo checkout lives inside). */
   cwd: string;
+  /**
+   * Set when execution is delegated to the isolated sandbox container. `cwd`
+   * here is relative to the instance's own workspace INSIDE that container —
+   * the control plane never sees its filesystem layout. Absent means the
+   * in-process `local()` sandbox, keyed on the absolute `cwd` above.
+   */
+  remote?: { baseUrl: string; token?: string; cwd: string };
   /** Scrubbed env for the local sandbox, incl. GH_TOKEN when connected. */
   sandboxEnv: Record<string, string | undefined>;
   /** Whether the GitHub App is provisioned on this deployment at all. */

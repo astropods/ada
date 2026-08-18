@@ -1,15 +1,16 @@
 # Node 24 runs the .ts sources natively via type-stripping (requires >= 23).
 FROM node:24-slim
 
-# --- toolchain the agent's sandbox shells out to ---------------------------
-# The Claude Code CLI is GONE: since the Flue rewrite the agent loop runs
-# in-process (see agent/agents/ada.ts), so there is no `claude` binary to
-# install and no stream-json contract to pin against a CLI version. What the
-# image still needs is the toolchain the agent's sandbox actually invokes —
-# `git` and the GitHub CLI (`gh`) — so it can do authenticated GitHub work
-# (clone/push/PR) inside the container. NOTE: no inline `#` comments inside
-# this RUN — line continuations collapse to one shell line and a `#` would
-# comment out the rest.
+# --- toolchain --------------------------------------------------------------
+# No Claude Code CLI: the agent loop runs in-process (agent/agents/ada.ts), so
+# there is no `claude` binary to install and no stream-json contract to pin.
+#
+# `git` and `gh` are still here, but only for the FALLBACK path. When a sandbox
+# container is deployed (knowledge.sandbox in astropods.yml) the model's
+# commands run there instead and this image never shells out for the agent.
+# They remain so `node agent/index.ts` works locally with no sandbox service.
+# NOTE: no inline `#` comments inside this RUN — line continuations collapse to
+# one shell line and a `#` would comment out the rest.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git curl ca-certificates \
  && mkdir -p -m 755 /etc/apt/keyrings \
@@ -27,9 +28,10 @@ RUN apt-get update \
 RUN git config --system credential."https://github.com".helper "!gh auth git-credential"
 
 WORKDIR /app
-# WORKSPACE_ROOT holds BOTH the per-session workspaces and Flue's conversation
-# database (agent/db.ts), so multi-turn sessions survive a restart when it is
-# backed by a persistent volume.
+# WORKSPACE_ROOT holds the fallback local workspaces and Flue's conversation
+# database (agent/db.ts). With a sandbox container deployed, checkouts live on
+# ITS /data volume instead and only the database is written here — which is why
+# conversation durability across restarts still wants attention (see README).
 ENV NODE_ENV=production \
     PORT=80 \
     GIT_TERMINAL_PROMPT=0 \

@@ -29,6 +29,11 @@ import { Translator } from "../translate/translator.ts";
 import { SessionRegistry, type SessionMeta } from "./registry.ts";
 import { createWorkspace, ensureWorkspace, removeWorkspace } from "./workspace.ts";
 import { ensureRepo, type RepoSpec } from "./repo.ts";
+import {
+  ensureRepoInSandbox,
+  remoteSandboxDriver,
+  sandboxHost,
+} from "./remote-sandbox.ts";
 import { resolveModel, sandboxEnv } from "../config/model.ts";
 import { githubConfigured } from "../auth/app-config.ts";
 import { getValidToken } from "../auth/github-app.ts";
@@ -42,6 +47,9 @@ import {
 } from "../persistence/results.ts";
 import type { Store } from "../store/store.ts";
 import type { AguiEvent } from "../types/agui.ts";
+import type { SessionEnv } from "../agents/session-env.ts";
+
+type SessionEnvRemote = NonNullable<SessionEnv["remote"]>;
 
 export interface TurnOpts {
   prompt: string;
@@ -217,8 +225,21 @@ export class SessionRunner {
     // workspace instead leaves the repo one level down, where Flue's workspace
     // discovery does not look — which is how a session ends up never seeing the
     // project's AGENTS.md.
+    const baseUrl = sandboxHost();
     let sandboxCwd = cwd;
-    if (opts.repo) {
+    let remote: SessionEnvRemote | undefined;
+
+    if (baseUrl) {
+      // Isolated execution: the checkout lives in the sandbox container, and
+      // every path the agent sees is relative to its own workspace there.
+      const token = process.env.SANDBOX_TOKEN;
+      let remoteCwd = ".";
+      if (opts.repo) {
+        const driver = remoteSandboxDriver({ baseUrl, id: instanceId, token, env: sandboxEnv({ githubToken }) });
+        remoteCwd = (await ensureRepoInSandbox(driver, opts.repo, { githubToken })).dir;
+      }
+      remote = { baseUrl, token, cwd: remoteCwd };
+    } else if (opts.repo) {
       sandboxCwd = (await ensureRepo(cwd, opts.repo, { githubToken })).dir;
     } else {
       const checkout = getCheckoutDir(instanceId);
@@ -228,6 +249,7 @@ export class SessionRunner {
     setSessionEnv(instanceId, {
       modelRef: resolveModel().ref,
       cwd: sandboxCwd,
+      remote,
       sandboxEnv: sandboxEnv({ githubToken }),
       githubConfigured: configured,
       githubConnected: Boolean(githubToken),

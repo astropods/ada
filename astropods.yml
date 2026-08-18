@@ -107,32 +107,33 @@ knowledge:
   # fall back to container mode — see the migrate-to-astropods notes.)
   ada-db:
     provider: postgres
+  # Isolated execution sandbox — where the model's commands actually run.
   #
-  # REMOVED BY THE FLUE REWRITE: a `sandbox:` knowledge container.
+  # This container holds NONE of the control plane's secrets: no database
+  # credentials, no GitHub App client secret, no HMAC signing key, no model
+  # credential. It implements Flue's `SandboxDriver` over HTTP (nine filesystem
+  # and shell operations, no agent concepts), and the control plane sends a
+  # user's GH_TOKEN per command so it lives only as long as the command using
+  # it. A rogue `bash` the model runs therefore reaches at most one
+  # conversation's checkout, in a process with nothing else worth taking.
   #
-  # It used to build a SEPARATE, secret-less container that executed Claude Code
-  # out-of-process over HTTP, on a /data volume holding per-conversation repo
-  # checkouts. Flue runs the agent loop in-process with a `local()` sandbox, so
-  # that service is gone (`sandbox/` and `agent/sandbox-client.ts` deleted).
+  # Every path is resolved inside the requesting instance's own directory and
+  # rejected if it escapes — one conversation cannot read another's work.
   #
-  # Two consequences, both deliberate and both worth knowing:
+  # The switch is automatic: the platform injects KNOWLEDGE_SANDBOX_HOST/PORT,
+  # and agent/session/remote-sandbox.ts routes execution here. Remove this block
+  # and Ada falls back to Flue's in-process `local()` sandbox, which is how
+  # `node agent/index.ts` and `flue run` work locally.
   #
-  # 1. BLAST RADIUS. The model's shell now runs in the SAME container as the
-  #    control plane. `local()` scrubs the env so tools can't read the DB /
-  #    GitHub / HMAC credentials from it (agent/config/model.ts), but they are
-  #    no longer behind a process boundary. To restore that split, swap
-  #    `local()` in agents/ada.ts for a remote sandbox adapter (E2B, Daytona,
-  #    Modal) — Flue's sandbox interface makes that a one-line change.
-  #
-  # 2. DURABILITY. A `volume:` attaches to a knowledge CONTAINER, not to the
-  #    agent container, so with the sandbox gone there is no persistent volume
-  #    for WORKSPACE_ROOT (/data). Repo checkouts and Flue's conversation
-  #    database (agent/db.ts) therefore live on the container filesystem and do
-  #    NOT survive a restart or redeploy: a Slack thread resumed after one
-  #    re-clones its repo and starts a fresh conversation. Per-user GitHub
-  #    tokens and repo bindings are unaffected — those are in Postgres above.
-  #    Fixing this properly means a Postgres-backed Flue PersistenceAdapter
-  #    (`defineSqlConversationStreamStore` in @flue/runtime/adapter).
+  # /data also gives the deployment a persistent volume: per-conversation repo
+  # checkouts (TTL-swept) and build caches survive a restart.
+  sandbox:
+    container:
+      build:
+        context: .
+        dockerfile: sandbox/Dockerfile
+      port: 3000
+      volume: /data
 
 dev:
   # Local hot-reload path (`ast dev` / `ast project`): runs the agent in a

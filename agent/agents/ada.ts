@@ -37,6 +37,7 @@ import {
   useTool,
 } from "@flue/runtime";
 import { local } from "@flue/runtime/node";
+import { remote } from "../session/remote-sandbox.ts";
 import type { AgentProps } from "@flue/runtime";
 import { getSessionEnv } from "./session-env.ts";
 import { checkoutRepo } from "./tools.ts";
@@ -73,12 +74,23 @@ export function Ada({ id }: AgentProps) {
 
   useModel(env.modelRef, { thinkingLevel: "medium" });
 
-  // The local sandbox binds the session's own workspace directory. Flue's
-  // `local()` scrubs the host env down to its own allowlist (PATH/HOME/…), and
-  // we layer on the proxy/TLS and build-cache vars plus — only when the user has
-  // connected — their GH_TOKEN. A command the model runs (`bash` → `env`) still
-  // cannot read the container's AWS/database/gateway secrets.
-  useSandbox(local({ cwd: env.cwd, env: env.sandboxEnv }), { cwd: env.cwd });
+  // Where the model's commands actually run.
+  //
+  // REMOTE when the platform injected a sandbox container: execution happens in
+  // a process holding none of this one's secrets, so a rogue `bash` reaches at
+  // most one conversation's checkout. LOCAL otherwise, which keeps
+  // `node agent/index.ts` and `flue run` working with no configuration.
+  //
+  // Either way the env is scrubbed to an allowlist plus — only when the user
+  // has connected — their GH_TOKEN, so `bash` → `env` cannot read the
+  // container's AWS/database/gateway credentials.
+  if (env.remote) {
+    useSandbox(remote({ baseUrl: env.remote.baseUrl, token: env.remote.token, env: env.sandboxEnv, cwd: env.remote.cwd }), {
+      cwd: env.remote.cwd,
+    });
+  } else {
+    useSandbox(local({ cwd: env.cwd, env: env.sandboxEnv }), { cwd: env.cwd });
+  }
 
   // Tell the model how GitHub auth works here, so that asked to "auth to
   // github" it guides the user through Ada's App flow instead of improvising
