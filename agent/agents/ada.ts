@@ -132,7 +132,7 @@ export function Ada({ id }: AgentProps) {
    * review off can always turn it back on.
    */
   const [reviewEnabled, setReviewEnabled] = usePersistentState("securityReview", reviewerDefault());
-  if (reviewEnabled) useSubagent(codeReviewer(id));
+  if (reviewEnabled) useSubagent(codeReviewer);
   useTool(setReviewMode(setReviewEnabled));
 
   // Record the commit the turn starts from, so the gate can diff against it and

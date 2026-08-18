@@ -30,10 +30,8 @@
  * asserts nothing".
  */
 
-import { defineSubagent, defineTool, useInstruction, useModel, useSandbox } from "@flue/runtime";
-import { local } from "@flue/runtime/node";
+import { defineSubagent, defineTool } from "@flue/runtime";
 import * as v from "valibot";
-import { getSessionEnv } from "../session-env.ts";
 
 /** Default for the reviewer, overridable per deployment. Runtime state wins. */
 export function reviewerDefault(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -137,38 +135,43 @@ export const FINDING_SCHEMA = v.object({
 });
 
 /**
- * The delegate's agent function. Subagents receive no props — a delegate is
- * isolated from its parent by design — so the session context is closed over
- * explicitly at definition time.
+ * The delegate's agent function.
+ *
+ * Deliberately almost empty, because a subagent render may contain almost
+ * nothing. Flue rejects `useModel`, `useSandbox`, `usePersistentState`,
+ * `useAgentStart`/`useAgentFinish`, `useDataWriter`, `useDispatchMessage`,
+ * `useResponseStart`/`useResponseFinish`, and `useMcpConnection` inside one —
+ * a delegate is a detached task, not an instance. The model comes from the
+ * `useSubagent()` definition below, and the sandbox is inherited: delegates
+ * share the parent's environment, and the caller scopes the work with the
+ * `cwd` on the task call.
+ *
+ * The return value is the delegate's whole system prompt. (An earlier version
+ * also passed the brief to `useInstruction`, which just sent it twice.)
  */
-function reviewerAgent(instanceId: string) {
-  return function CodeReviewer() {
-    const env = getSessionEnv(instanceId);
-    // A reviewer that reasons harder is worth the tokens: this runs at most
-    // once per substantive change, and a missed critical finding costs more.
-    useModel(env.modelRef, { thinkingLevel: "high" });
-    // Same workspace as the parent, so the reviewer reads the real files rather
-    // than a description of them. Read-only in practice — the brief never asks
-    // it to write, and its findings go back to the parent to act on.
-    useSandbox(local({ cwd: env.cwd, env: env.sandboxEnv }), { cwd: env.cwd });
-    useInstruction(REVIEWER_BRIEF);
-    return REVIEWER_BRIEF;
-  };
+function CodeReviewer() {
+  return REVIEWER_BRIEF;
 }
 
-/** The reviewer, as a `task`-tool delegate. */
-export function codeReviewer(instanceId: string) {
-  return defineSubagent({
-    name: "code-reviewer",
-    description:
-      "An independent senior engineer who reviews the changes in the working directory with " +
-      "fresh eyes — correctness, security, test quality, error handling, API contracts, and " +
-      "concurrency. Delegate to this before finishing a substantive change. Returns structured " +
-      "findings with severities.",
-    agent: reviewerAgent(instanceId),
-    thinkingLevel: "high",
-  });
-}
+/**
+ * The reviewer, as a `task`-tool delegate.
+ *
+ * The model is inherited from the parent rather than pinned, so the reviewer
+ * automatically follows whichever provider the deployment resolved — gateway or
+ * Anthropic direct — with no second place to keep in sync. Only the reasoning
+ * effort is raised: this runs at most once per substantive change, and a missed
+ * critical finding costs more than the thinking tokens.
+ */
+export const codeReviewer = defineSubagent({
+  name: "code-reviewer",
+  description:
+    "An independent senior engineer who reviews the changes in the working directory with " +
+    "fresh eyes — correctness, security, test quality, error handling, API contracts, and " +
+    "concurrency. Delegate to this before finishing a substantive change. Returns structured " +
+    "findings with severities.",
+  agent: CodeReviewer,
+  thinkingLevel: "high",
+});
 
 /**
  * Turn the reviewer on or off mid-conversation.
