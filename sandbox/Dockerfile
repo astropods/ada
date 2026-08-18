@@ -21,18 +21,36 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends gh \
  && rm -rf /var/lib/apt/lists/*
 
-# --- project toolchain -------------------------------------------------------
+# --- project toolchain (configurable) ----------------------------------------
 # THIS IS WHERE PROJECT TOOLCHAINS GO. The agent's commands run here, not in the
 # control plane, so a tool this image lacks is a tool the agent cannot use — it
-# will report "not verified locally" and open a PR without running the checks.
+# will report "not verified locally" and open a PR without having run the
+# project's checks.
 #
-# bun is installed because the repositories Ada works on use it (bun.lock,
-# `bun run typecheck`). Add whatever else your repos need; there is no way to
-# make this image universal, so treat it as a deliberate, reviewed list rather
-# than something to grow reflexively — every addition is attack surface in the
-# one container that runs model-authored commands.
-ARG BUN_VERSION=1.3.9
-RUN npm install -g "bun@${BUN_VERSION}" && bun --version
+# Both lists are BUILD ARGS so a deployment can change them without editing this
+# file:
+#
+#   ast/docker build -f sandbox/Dockerfile \
+#     --build-arg SANDBOX_NPM_PACKAGES="bun@1.3.9 pnpm" \
+#     --build-arg SANDBOX_APT_PACKAGES="python3 python3-pip golang-go" .
+#
+# Build args rather than runtime env on purpose. Installing packages at boot
+# would mean an apt/npm fetch on every cold start, a network dependency in the
+# one container that must keep working when things are broken, and — worst —
+# mutable tooling in the process that runs model-authored commands. Build time
+# keeps the image reproducible and the layer cached.
+#
+# There is no way to make this image universal, so treat the list as deliberate
+# and reviewed. Every addition is attack surface exactly where it matters most.
+ARG SANDBOX_NPM_PACKAGES="bun@1.3.9"
+ARG SANDBOX_APT_PACKAGES=""
+RUN if [ -n "$SANDBOX_APT_PACKAGES" ]; then \
+      apt-get update \
+      && apt-get install -y --no-install-recommends $SANDBOX_APT_PACKAGES \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi \
+ && if [ -n "$SANDBOX_NPM_PACKAGES" ]; then npm install -g $SANDBOX_NPM_PACKAGES; fi \
+ && echo "sandbox toolchain: apt=[$SANDBOX_APT_PACKAGES] npm=[$SANDBOX_NPM_PACKAGES]"
 
 # git uses gh's credential helper; gh vends whatever GH_TOKEN is in the
 # environment of the command being run. The control plane sends that per

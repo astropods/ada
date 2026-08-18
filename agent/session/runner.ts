@@ -21,6 +21,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { init, observe, type FlueEvent } from "@flue/runtime";
 import { Ada } from "../agents/ada.ts";
 import { clearSessionEnv, getCheckoutDir, setSessionEnv } from "../agents/session-env.ts";
@@ -249,8 +250,11 @@ export class SessionRunner {
     } else if (opts.repo) {
       sandboxCwd = (await ensureRepo(cwd, opts.repo, { githubToken })).dir;
     } else {
+      // Always relative to the workspace now — `checkout_repo` clones through
+      // the agent's own sandbox, so it names a directory rather than a
+      // control-plane path.
       const checkout = getCheckoutDir(instanceId);
-      if (checkout) sandboxCwd = ensureWorkspace(checkout);
+      if (checkout) sandboxCwd = ensureWorkspace(join(cwd, checkout));
     }
 
     setSessionEnv(instanceId, {

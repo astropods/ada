@@ -530,9 +530,19 @@ build caches, so a repeat build doesn't re-download a toolchain.
 **The sandbox image is where project toolchains go.** The agent's commands run
 there, not in the control plane, so a tool the image lacks is a tool Ada cannot
 use — it will report "not verified locally" and open a PR without having run
-the checks. `bun` is installed for that reason. There is no way to make the
-image universal, so treat the list as deliberate and reviewed: every addition
-is attack surface in the one container that runs model-authored commands.
+the checks. The image ships `git`, `gh` and `bun`; extend it with build args:
+
+```bash
+--build-arg SANDBOX_NPM_PACKAGES="bun@1.3.9 pnpm"
+--build-arg SANDBOX_APT_PACKAGES="python3 golang-go"
+```
+
+Build args rather than runtime env deliberately: installing at boot would mean
+a package fetch on every cold start, a network dependency in the container that
+must keep working when things are broken, and mutable tooling in the one
+process that runs model-authored commands. There is no way to make the image
+universal, so treat the list as deliberate and reviewed — every addition is
+attack surface exactly where it matters most.
 
 > **Two things this got wrong on the first deploy**, both worth knowing if you
 > touch this code. The sandbox cwd handed to `sandboxFromDriver` **must be

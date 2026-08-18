@@ -138,6 +138,19 @@ knowledge:
   #
   # /data also gives the deployment a persistent volume: per-conversation repo
   # checkouts (TTL-swept) and build caches survive a restart.
+  #
+  # TOOLCHAIN: the agent's commands run in THIS container, so a tool it lacks is
+  # a tool Ada cannot use — it will report "not verified locally" and open a PR
+  # without having run the project's checks. sandbox/Dockerfile ships `git`,
+  # `gh` and `bun`; extend it with build args rather than editing the file:
+  #
+  #   SANDBOX_NPM_PACKAGES  default "bun@1.3.9"   e.g. "bun@1.3.9 pnpm"
+  #   SANDBOX_APT_PACKAGES  default ""            e.g. "python3 golang-go"
+  #
+  # Build args, not runtime env: installing at boot would add a network
+  # dependency and mutable tooling to the one container that runs
+  # model-authored commands. If your platform cannot pass build args here,
+  # change the ARG defaults at the top of sandbox/Dockerfile.
   sandbox:
     container:
       build:

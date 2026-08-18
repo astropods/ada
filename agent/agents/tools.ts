@@ -15,14 +15,16 @@
 
 import { defineTool } from "@flue/runtime";
 import * as v from "valibot";
-import { ensureRepo, parseRepoSpec } from "../session/repo.ts";
-import { ensureRepoInSandbox, remoteSandboxDriver } from "../session/remote-sandbox.ts";
+import { parseRepoSpec } from "../session/repo.ts";
 import { getSessionEnv, setCheckoutDir } from "./session-env.ts";
+import { readRepoRules, renderRules, sandboxExec } from "./repo-rules.ts";
 
 /**
- * Clone (or reuse) a GitHub repository into the session's workspace, using the
- * connected user's App token. Bound to one instance id so the token and cwd are
- * resolved from that session's context rather than passed through the model.
+ * Clone (or reuse) a GitHub repository, using the connected user's App token,
+ * and hand back the project's own conventions along with it.
+ *
+ * Bound to one instance id so the token is resolved from that session's context
+ * rather than passed through the model.
  */
 export function checkoutRepo(instanceId: string) {
   return defineTool({
@@ -30,6 +32,7 @@ export function checkoutRepo(instanceId: string) {
     description:
       "Clone a GitHub repository into the working directory so you can read and edit it. " +
       "Reuses the existing checkout if it is already present (work in progress is preserved). " +
+      "Also returns the repository's own conventions, which you must follow. " +
       "Takes owner/repo — you never supply a URL or a credential.",
     input: v.object({
       repo: v.pipe(
@@ -40,8 +43,14 @@ export function checkoutRepo(instanceId: string) {
     output: v.object({
       dir: v.string(),
       cloned: v.boolean(),
+      conventions: v.optional(v.string()),
     }),
-    async run({ data, log }) {
+    // Harness access so the clone runs in the agent's OWN sandbox — the same
+    // filesystem its shell and file tools see. Branching on local-vs-remote
+    // here is what previously put a clone in the control-plane container that
+    // the agent could never reach.
+    harness: true,
+    async run({ data, log, harness }) {
       const spec = parseRepoSpec(data.repo);
       if (!spec) {
         throw new Error(`"${data.repo}" is not a valid repository — use the form owner/repo.`);
@@ -54,32 +63,44 @@ export function checkoutRepo(instanceId: string) {
             "Ask the user to send `connect github` in chat.",
         );
       }
-      log.info(`Checking out ${spec.owner}/${spec.repo}…`);
 
-      // Clone WHERE EXECUTION HAPPENS. This tool used to always clone locally,
-      // which was invisible to a deployment running the isolated sandbox: the
-      // clone reported success at a control-plane path the agent's own bash
-      // could never reach, and every subsequent tool call failed. The clone has
-      // to land in the same filesystem the shell runs in.
-      const result = env.remote
-        ? await ensureRepoInSandbox(
-            remoteSandboxDriver({
-              baseUrl: env.remote.baseUrl,
-              token: env.remote.token,
-              id: instanceId,
-              env: env.sandboxEnv,
-            }),
-            spec,
-            { githubToken: token },
-          )
-        : await ensureRepo(env.cwd, spec, { githubToken: token });
+      const sandbox = harness.sandbox;
+      const dir = spec.repo;
+      const cloned = !(await sandbox.exists(`${dir}/.git`));
+      if (cloned) {
+        log.info(`Cloning ${spec.owner}/${spec.repo}…`);
+        // owner/repo have been through parseRepoSpec, whose pattern excludes
+        // every shell metacharacter — they are safe to interpolate here.
+        const result = await sandbox.exec(
+          `git clone --depth=1 https://github.com/${spec.owner}/${spec.repo}.git ${dir}`,
+          { env: { GH_TOKEN: token, GITHUB_TOKEN: token }, timeoutMs: 10 * 60 * 1000 },
+        );
+        if (result.exitCode !== 0) {
+          throw new Error(`clone failed: ${(result.stderr || result.stdout).trim().slice(0, 300)}`);
+        }
+      } else {
+        log.info(`Reusing existing checkout at ${dir}`);
+      }
 
-      log.info(result.cloned ? `Cloned into ${result.dir}` : `Reusing existing checkout at ${result.dir}`);
+      // Surface the project's conventions HERE, with the clone.
+      //
+      // The start-of-turn hook cannot help a repository that does not exist
+      // yet: on a first turn the workspace is empty, the agent clones
+      // mid-turn, and it would otherwise branch, commit and open a pull
+      // request without ever having read the rules. That is exactly how a PR
+      // shipped with no changelog entry against a repo whose `agents.md`
+      // requires one. Flue's own AGENTS.md discovery has the same blind spot,
+      // for the same reason — it reads at submission start.
+      const rules = await readRepoRules(sandboxExec(sandbox));
+      const conventions = renderRules(rules);
+      if (conventions) {
+        log.info(`Read repository conventions: ${rules.map((r) => r.path).join(", ")}`);
+      }
+
       // Root the NEXT turn inside the checkout, so Flue's own workspace
-      // discovery (AGENTS.md, .agents/skills) sees the repo rather than the
-      // directory it happens to sit in.
-      setCheckoutDir(instanceId, result.dir);
-      return { output: result };
+      // discovery sees the repo rather than the directory it sits in.
+      setCheckoutDir(instanceId, dir);
+      return { output: { dir, cloned, conventions } };
     },
   });
 }

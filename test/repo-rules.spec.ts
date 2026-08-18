@@ -4,7 +4,7 @@ import { promisify } from "node:util";
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { injectRepoRules } from "../agent/agents/repo-rules.ts";
+import { injectRepoRules, readRepoRules, renderRules, sandboxExec } from "../agent/agents/repo-rules.ts";
 
 /**
  * Repository conventions reaching the model.
@@ -129,4 +129,70 @@ test("truncates a runaway rules file rather than crowding out the task", async (
   expect(bodies.length).toBe(1);
   expect(bodies[0].length).toBeLessThan(60_000);
   expect(bodies[0], "says so instead of silently cutting the project's rules").toContain("truncated");
+});
+
+/* ---------------- rules for a repo cloned mid-turn ---------------- */
+
+/**
+ * The start-of-turn hook cannot help a repository that does not exist yet.
+ *
+ * On a first turn the workspace is empty; the agent clones mid-turn and then
+ * branches, commits and opens a PR in that same turn. `useAgentStart` already
+ * ran against an empty directory, and Flue's own AGENTS.md discovery reads at
+ * submission start, so neither sees the rules. A PR shipped with no changelog
+ * entry against a repo whose `agents.md` requires one, exactly this way.
+ *
+ * So `checkout_repo` reads the conventions itself and returns them with the
+ * clone. These cover the reader it uses.
+ */
+
+/** A sandbox-shaped exec rooted at `cwd`, matching what the tool is handed. */
+function execIn(cwd: string) {
+  return sandboxExec({
+    async exec(command: string) {
+      try {
+        const { stdout } = await exec("sh", ["-c", command], { cwd, maxBuffer: 1e7 });
+        return { stdout, stderr: "", exitCode: 0 };
+      } catch (e) {
+        return { stdout: (e as { stdout?: string }).stdout ?? "", stderr: "", exitCode: 1 };
+      }
+    },
+  } as never);
+}
+
+test("an empty workspace yields nothing — the start-of-turn blind spot", async () => {
+  const ws = mkdtempSync(join(tmpdir(), "ada-rules-"));
+  try {
+    // This is the state useAgentStart actually sees on turn one.
+    expect(await readRepoRules(execIn(ws))).toEqual([]);
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test("the same workspace yields the rules once the repo is cloned into it", async () => {
+  const ws = mkdtempSync(join(tmpdir(), "ada-rules-"));
+  try {
+    // …and this is the state checkout_repo sees, moments later.
+    const repo = join(ws, "astro");
+    mkdirSync(repo, { recursive: true });
+    await gitInit(repo);
+    writeFileSync(join(repo, "agents.md"), `# Rules\n\n${RULE}\n`);
+
+    const rules = await readRepoRules(execIn(ws));
+    expect(rules.length).toBe(1);
+
+    const rendered = renderRules(rules);
+    expect(rendered).toContain(RULE);
+    // The framing has to make clear these outrank Ada's own defaults, and name
+    // the failure mode that actually happened.
+    expect(rendered).toContain("OVERRIDE");
+    expect(rendered).toContain("ADD FILES");
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test("renders nothing when the repo has no conventions", async () => {
+  expect(renderRules([])).toBeUndefined();
 });

@@ -66,12 +66,10 @@ const checkouts = new Map<string, string>();
 /**
  * Record a checkout made mid-turn, so later turns start inside it.
  *
- * NB the stored value means different things per mode, matching what each
- * consumer needs: an ABSOLUTE control-plane path locally, and a path RELATIVE
- * to the instance's sandbox workspace when execution is remote (the control
- * plane cannot see that container's layout). Both come straight from the
- * `ensureRepo*` that produced them, so they cannot be mixed up in practice —
- * but read the runner's two call sites together before changing either.
+ * Always a directory name RELATIVE to the instance's workspace. It used to be
+ * absolute in local mode and relative in remote mode, which is the kind of
+ * asymmetry that eventually gets mixed up; now `checkout_repo` clones through
+ * the agent's own sandbox in both modes and the runner resolves it per mode.
  */
 export function setCheckoutDir(instanceId: string, dir: string): void {
   checkouts.set(instanceId, dir);

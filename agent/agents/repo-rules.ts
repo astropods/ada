@@ -28,6 +28,9 @@
 
 import type { AgentStartContext } from "@flue/runtime";
 
+/** Run a shell command in the agent's sandbox and return stdout ("" on failure). */
+export type Exec = (command: string) => Promise<string>;
+
 /** Rule filenames worth reading, matched case-insensitively. */
 const RULE_FILES = ["AGENTS.md", "AGENT.md", "CLAUDE.md", "CONVENTIONS.md"];
 
@@ -41,13 +44,16 @@ const FLUE_READS = ["AGENTS.md", "CLAUDE.md"];
  */
 const MAX_RULES_BYTES = Number(process.env.ADA_MAX_RULES_BYTES ?? 24_000);
 
-async function sh(ctx: AgentStartContext, command: string): Promise<string> {
-  try {
-    const r = await ctx.harness.sandbox.exec(command, { timeoutMs: 10_000 });
-    return r.exitCode === 0 ? r.stdout : "";
-  } catch {
-    return "";
-  }
+/** Adapt a Flue sandbox to the `Exec` shape, swallowing failures. */
+export function sandboxExec(sandbox: { exec: AgentStartContext["harness"]["sandbox"]["exec"] }): Exec {
+  return async (command) => {
+    try {
+      const r = await sandbox.exec(command, { timeoutMs: 10_000 });
+      return r.exitCode === 0 ? r.stdout : "";
+    } catch {
+      return "";
+    }
+  };
 }
 
 /**
@@ -55,10 +61,10 @@ async function sh(ctx: AgentStartContext, command: string): Promise<string> {
  * checkout. Depth 1 only — a session works on one repo, and walking deeper
  * turns a node_modules tree into a filesystem crawl.
  */
-async function candidateDirs(ctx: AgentStartContext): Promise<string[]> {
-  const cwd = (await sh(ctx, "pwd")).trim();
+async function candidateDirs(sh: Exec): Promise<string[]> {
+  const cwd = (await sh("pwd")).trim();
   if (!cwd) return [];
-  const nested = (await sh(ctx, `find . -maxdepth 2 -name .git -not -path './.git' 2>/dev/null | head -5`))
+  const nested = (await sh(`find . -maxdepth 2 -name .git -not -path './.git' 2>/dev/null | head -5`))
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean)
@@ -69,7 +75,7 @@ async function candidateDirs(ctx: AgentStartContext): Promise<string[]> {
   return [cwd, ...nested];
 }
 
-interface RulesFile {
+export interface RulesFile {
   path: string;
   body: string;
   /** The file was longer than the read cap — the model is told, not left guessing. */
@@ -82,8 +88,8 @@ interface RulesFile {
  * Dedupes on CONTENT, not path: `CLAUDE.md` is frequently a symlink to
  * `agents.md`, and injecting the same document twice is pure waste.
  */
-async function collectRules(ctx: AgentStartContext): Promise<RulesFile[]> {
-  const dirs = await candidateDirs(ctx);
+export async function readRepoRules(sh: Exec): Promise<RulesFile[]> {
+  const dirs = await candidateDirs(sh);
   if (dirs.length === 0) return [];
   const cwd = dirs[0];
   const out: RulesFile[] = [];
@@ -98,7 +104,7 @@ async function collectRules(ctx: AgentStartContext): Promise<RulesFile[]> {
     // `-iname` is the whole point: Flue's lookup is case-sensitive, and
     // lowercase `agents.md` is common.
     const names = RULE_FILES.map((n) => `-iname ${JSON.stringify(n)}`).join(" -o ");
-    const found = (await sh(ctx, `find ${JSON.stringify(dir)} -maxdepth 1 \\( ${names} \\) 2>/dev/null`))
+    const found = (await sh(`find ${JSON.stringify(dir)} -maxdepth 1 \\( ${names} \\) 2>/dev/null`))
       .split("\n")
       .map((l) => l.trim())
       .filter(Boolean);
@@ -111,7 +117,7 @@ async function collectRules(ctx: AgentStartContext): Promise<RulesFile[]> {
       // distinguishable from one that merely happens to be exactly that long.
       // Without this the truncation is silent, which is the worst outcome: the
       // model reads half a rulebook and believes it read all of it.
-      const raw = await sh(ctx, `head -c ${MAX_RULES_BYTES + 1} -- ${JSON.stringify(path)}`);
+      const raw = await sh(`head -c ${MAX_RULES_BYTES + 1} -- ${JSON.stringify(path)}`);
       const truncated = raw.length > MAX_RULES_BYTES;
       const body = (truncated ? raw.slice(0, MAX_RULES_BYTES) : raw).trim();
       if (!body) continue;
@@ -134,7 +140,7 @@ async function collectRules(ctx: AgentStartContext): Promise<RulesFile[]> {
 export async function injectRepoRules(ctx: AgentStartContext): Promise<void> {
   let rules: RulesFile[];
   try {
-    rules = await collectRules(ctx);
+    rules = await readRepoRules(sandboxExec(ctx.harness.sandbox));
   } catch (e) {
     ctx.log.warn(`repo rules: could not read conventions (${(e as Error).message})`);
     return;
@@ -158,15 +164,44 @@ export async function injectRepoRules(ctx: AgentStartContext): Promise<void> {
     sections.push(`### ${r.path}\n\n${kept}${note}`);
   }
 
-  ctx.append({
-    kind: "signal",
-    type: "repo.conventions",
-    body:
-      `This repository ships its own conventions. They are the project's rules and they OVERRIDE ` +
-      `your defaults wherever the two disagree — including any requirement to add files (changelog ` +
-      `entries, ADRs), follow a commit or branch format, or run particular checks before opening a ` +
-      `pull request. Follow them, and if you cannot, say so explicitly rather than ignoring them.\n\n` +
-      sections.join("\n\n"),
-  });
+  ctx.append({ kind: "signal", type: "repo.conventions", body: formatRules(sections) });
   ctx.log.info(`repo rules: injected ${rules.map((r) => r.path).join(", ")}`);
+}
+
+/** The preamble that makes clear these rules outrank Ada's own defaults. */
+export function formatRules(sections: string[]): string {
+  return (
+    `This repository ships its own conventions. They are the project's rules and they OVERRIDE ` +
+    `your defaults wherever the two disagree — including any requirement to ADD FILES (a changelog ` +
+    `entry, an ADR), follow a commit or branch naming format, or run particular checks before ` +
+    `opening a pull request. Read them now and follow them. If you cannot, say so explicitly ` +
+    `rather than ignoring them.\n\n` +
+    sections.join("\n\n")
+  );
+}
+
+/**
+ * Rules formatted for a tool result, budgeted the same way as the signal.
+ *
+ * Used by `checkout_repo`, because the start-of-turn hook cannot help a repo
+ * that does not exist yet: on the first turn the workspace is empty, the agent
+ * clones mid-turn, and it would otherwise finish the whole task — branch,
+ * commit, PR — without ever having seen the project's conventions. That is
+ * exactly how a PR shipped with no changelog entry.
+ */
+export function renderRules(rules: RulesFile[]): string | undefined {
+  if (rules.length === 0) return undefined;
+  let budget = MAX_RULES_BYTES;
+  const sections: string[] = [];
+  for (const r of rules) {
+    if (budget <= 0) break;
+    const kept = r.body.length > budget ? r.body.slice(0, budget) : r.body;
+    budget -= kept.length;
+    const note =
+      r.body.length > budget || r.truncated
+        ? `\n\n[…truncated — read ${r.path} yourself before making changes]`
+        : "";
+    sections.push(`### ${r.path}\n\n${kept}${note}`);
+  }
+  return formatRules(sections);
 }
