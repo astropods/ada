@@ -527,6 +527,13 @@ loudly at startup.
 `/data` is the sandbox's volume: one directory per conversation (TTL-swept) plus
 build caches, so a repeat build doesn't re-download a toolchain.
 
+**The sandbox image is where project toolchains go.** The agent's commands run
+there, not in the control plane, so a tool the image lacks is a tool Ada cannot
+use — it will report "not verified locally" and open a PR without having run
+the checks. `bun` is installed for that reason. There is no way to make the
+image universal, so treat the list as deliberate and reviewed: every addition
+is attack surface in the one container that runs model-authored commands.
+
 > **Two things this got wrong on the first deploy**, both worth knowing if you
 > touch this code. The sandbox cwd handed to `sandboxFromDriver` **must be
 > absolute** — Flue resolves tool paths as `p.startsWith("/") ? p : cwd + "/" + p`,

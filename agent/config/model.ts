@@ -207,7 +207,7 @@ const SANDBOX_PASSTHROUGH = [
   // spawns. Without these, builds run unbounded (→ OOM) with ephemeral caches
   // (→ re-download every run).
   "GOMODCACHE", "GOCACHE", "GOFLAGS", "GOMEMLIMIT", "GOMAXPROCS", "GOPATH", "GOTOOLCHAIN",
-  "npm_config_cache", "PIP_CACHE_DIR",
+  "npm_config_cache", "PIP_CACHE_DIR", "BUN_INSTALL_CACHE_DIR",
 ] as const;
 
 /**

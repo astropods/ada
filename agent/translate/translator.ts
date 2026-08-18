@@ -14,7 +14,7 @@
  * messaging adapter, and any external AG-UI client are unaffected.
  *
  * Mapping summary:
- *   agent_start                     -> RUN_STARTED (+ STATE_SNAPSHOT of session meta)
+ *   agent_start (first of a delivery) -> RUN_STARTED (+ STATE_SNAPSHOT of session meta)
  *   message_start                   -> (opens an assistant message id)
  *   text_delta                      -> TEXT_MESSAGE_START (lazily) + TEXT_MESSAGE_CONTENT
  *   message_end                     -> TEXT_MESSAGE_END for the open text message
@@ -25,8 +25,17 @@
  *   turn                            -> CUSTOM("ada.usage") — tokens + cost for the turn
  *   log                             -> CUSTOM("ada.log")
  *   compaction                      -> CUSTOM("ada.compaction")
- *   agent_end                       -> RUN_FINISHED
- *   submission_settled failed|abort -> RUN_ERROR
+ *   agent_end                       -> closes open blocks only (NOT the run)
+ *   submission_settled              -> RUN_FINISHED, or RUN_ERROR when it failed
+ *
+ * AN AG-UI RUN IS ONE DELIVERY, NOT ONE AGENT SEGMENT. `agent_end` fires at
+ * every segment boundary, and a `useAgentFinish` hook that appends a signal —
+ * which is exactly what the security gates do — starts a fresh
+ * `agent_start`/`agent_end` pair in the SAME delivery. Emitting RUN_FINISHED on
+ * `agent_end` therefore closed the run while the agent was still working: the
+ * Slack adapter posted its reply and then carried on streaming into a thread it
+ * had already finished, and the session was marked settled mid-turn. The
+ * delivery boundary is `submission_settled`, which fires exactly once and last.
  *
  * Ordering note, because it is easy to get wrong: `toolcall_delta` events are
  * a LIVE PREVIEW of arguments while the model is still emitting them, and
@@ -65,6 +74,8 @@ export class Translator {
   private openTextMessageId: string | null = null;
   private openReasoningId: string | null = null;
   private readonly openToolCalls = new Map<string, OpenToolCall>();
+  /** Whether a RUN_STARTED has been emitted for the delivery in flight. */
+  private runOpen = false;
   private counter = 0;
   private readonly opts: Required<Omit<TranslatorOptions, "newRunId">> & {
     newRunId?: () => string;
@@ -138,17 +149,11 @@ export class Translator {
           },
         ];
       case "agent_end":
-        return this.onAgentEnd();
+        // Close whatever this segment left open, but do NOT end the run — the
+        // agent may be sent straight back by a useAgentFinish gate.
+        return this.closeOpenBlocks();
       case "submission_settled":
-        return ev.outcome === "completed"
-          ? []
-          : [
-              {
-                type: EventType.RUN_ERROR,
-                message: ev.error?.message ?? `Ada run ${ev.outcome}`,
-                code: ev.error?.type ?? ev.outcome,
-              },
-            ];
+        return this.onSettled(ev.outcome, ev.error?.message, ev.error?.type);
       default:
         // turn_start / turn_request / turn_messages / operation* / task* /
         // submission_queued|running|recovery / idle: telemetry-only, no AG-UI event.
@@ -162,6 +167,10 @@ export class Translator {
 
   private onAgentStart(ev: FlueEvent): AguiEvent[] {
     this.threadId = ev.instanceId ?? ev.conversationId ?? this.threadId ?? "unknown";
+    // A second agent_start within one delivery is a continuation after a gate
+    // sent the model back, not a new run.
+    if (this.runOpen) return [];
+    this.runOpen = true;
     this.runId = this.nextRunId();
     return [
       { type: EventType.RUN_STARTED, threadId: this.threadId, runId: this.runId },
@@ -319,7 +328,8 @@ export class Translator {
     ];
   }
 
-  private onAgentEnd(): AguiEvent[] {
+  /** Close any message or tool call this segment left open. */
+  private closeOpenBlocks(): AguiEvent[] {
     const out: AguiEvent[] = [...this.closeOpenText(), ...this.onThinkingEnd()];
     // Defensive: close any tool call the runtime previewed but never executed,
     // so the client isn't left with a spinner that never resolves.
@@ -327,12 +337,41 @@ export class Translator {
       out.push({ type: EventType.TOOL_CALL_END, toolCallId });
     }
     this.openToolCalls.clear();
-    out.push({
-      type: EventType.RUN_FINISHED,
-      threadId: this.threadId ?? "unknown",
-      runId: this.runId ?? "run_unknown",
-    });
     return out;
+  }
+
+  /**
+   * End the delivery. Resets run state so the next one starts cleanly — the
+   * same Translator serves every turn of a session.
+   */
+  private onSettled(outcome: string, message?: string, code?: string): AguiEvent[] {
+    const out = this.closeOpenBlocks();
+    if (!this.runOpen) return out; // settled without ever starting (rejected at admission)
+    this.runOpen = false;
+    if (outcome === "completed") {
+      out.push({
+        type: EventType.RUN_FINISHED,
+        threadId: this.threadId ?? "unknown",
+        runId: this.runId ?? "run_unknown",
+      });
+    } else {
+      out.push({
+        type: EventType.RUN_ERROR,
+        message: message ?? `Ada run ${outcome}`,
+        code: code ?? outcome,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Force the delivery closed. The runner calls this if `read()` settles
+   * without a `submission_settled` reaching the observer, so a client is never
+   * left waiting on a run that will never end.
+   */
+  flush(outcome: "completed" | "failed" = "completed", message?: string): AguiEvent[] {
+    if (!this.runOpen) return [];
+    return this.onSettled(outcome, message);
   }
 }
 

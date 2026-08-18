@@ -73,7 +73,7 @@ const WORKSPACE_TTL_MS = Number(process.env.SANDBOX_WORKSPACE_TTL_MS ?? 24 * 60 
 const BASE_ENV_KEYS = [
   "PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TERM", "TZ", "TMPDIR",
   "GOMODCACHE", "GOCACHE", "GOFLAGS", "GOMEMLIMIT", "GOMAXPROCS", "GOPATH", "GOTOOLCHAIN",
-  "npm_config_cache", "PIP_CACHE_DIR",
+  "npm_config_cache", "PIP_CACHE_DIR", "BUN_INSTALL_CACHE_DIR",
 ] as const;
 
 function baseEnv(): NodeJS.ProcessEnv {

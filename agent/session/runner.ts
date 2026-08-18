@@ -143,14 +143,17 @@ export class SessionRunner {
     if (event.response?.usage) addTurnUsage(live.usage, event.response.usage);
   }
 
-  /** Advance registry status and persist the run record. */
+  /**
+   * Advance registry status and persist the run record.
+   *
+   * Keyed on `submission_settled`, NOT `agent_end`. A `useAgentFinish` gate
+   * that sends the model back produces another agent segment in the same
+   * delivery, so settling on `agent_end` marked the session finished — and
+   * saved its run record — while it was still working.
+   */
   private settleStatus(instanceId: string, event: FlueEvent): void {
-    const terminal =
-      event.type === "agent_end" ||
-      (event.type === "submission_settled" && event.outcome !== "completed");
-    if (!terminal) return;
-
-    const isError = event.type !== "agent_end";
+    if (event.type !== "submission_settled") return;
+    const isError = event.outcome !== "completed";
     this.registry.setStatus(instanceId, isError ? "errored" : "finished");
 
     const live = this.sessions.get(instanceId);
@@ -282,17 +285,32 @@ export class SessionRunner {
       try {
         const receipt = await handle.dispatch(opts.prompt);
         await handle.read(receipt, { signal: hooks?.signal });
+        // Belt and braces: if `submission_settled` never reached the observer,
+        // close the AG-UI run here rather than leaving a client waiting on a
+        // run that will never end.
+        this.flushRun(instanceId, "completed");
       } catch (e) {
         // A local read cancellation (supersede) is not a failure: the durable
         // abort above is what stops the work, and the observer already emitted
         // the settlement. Anything else is a real error for the client.
         if (hooks?.signal?.aborted) return;
+        this.flushRun(instanceId, "failed", (e as Error).message);
         this.registry.setStatus(instanceId, "errored");
         throw e;
       } finally {
         hooks?.signal?.removeEventListener("abort", onAbort);
       }
     });
+  }
+
+  /** Emit a terminal AG-UI event if the delivery did not produce one itself. */
+  private flushRun(instanceId: string, outcome: "completed" | "failed", message?: string): void {
+    const live = this.sessions.get(instanceId);
+    if (!live) return;
+    for (const agui of live.translator.flush(outcome, message)) {
+      this.registry.append(instanceId, agui);
+      live.hooks?.onAguiEvent?.(agui);
+    }
   }
 
   /** The writable workspace for a session, reused across turns and self-healing. */

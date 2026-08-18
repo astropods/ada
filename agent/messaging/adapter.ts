@@ -264,6 +264,13 @@ export class AdaMessagingAdapter implements AgentAdapter {
           // The runner already mirrors the full AG-UI stream into the registry
           // for later review; hooks get only the subset Slack renders.
           onAguiEvent: (e) => {
+            // Never write into a thread we have already finished. The run used
+            // to be closed on `agent_end`, which fires per agent segment, so a
+            // gate that sent the model back had Ada posting its reply and then
+            // continuing to stream into the closed thread. The run boundary is
+            // fixed now; this guard makes the failure mode impossible rather
+            // than merely unlikely.
+            if (settled) return;
             switch (e.type) {
               case EventType.TEXT_MESSAGE_CONTENT:
                 hooks.onChunk(e.delta);

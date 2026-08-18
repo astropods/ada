@@ -21,6 +21,19 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends gh \
  && rm -rf /var/lib/apt/lists/*
 
+# --- project toolchain -------------------------------------------------------
+# THIS IS WHERE PROJECT TOOLCHAINS GO. The agent's commands run here, not in the
+# control plane, so a tool this image lacks is a tool the agent cannot use — it
+# will report "not verified locally" and open a PR without running the checks.
+#
+# bun is installed because the repositories Ada works on use it (bun.lock,
+# `bun run typecheck`). Add whatever else your repos need; there is no way to
+# make this image universal, so treat it as a deliberate, reviewed list rather
+# than something to grow reflexively — every addition is attack surface in the
+# one container that runs model-authored commands.
+ARG BUN_VERSION=1.3.9
+RUN npm install -g "bun@${BUN_VERSION}" && bun --version
+
 # git uses gh's credential helper; gh vends whatever GH_TOKEN is in the
 # environment of the command being run. The control plane sends that per
 # request, so no token is ever stored in this image or on its volume.
@@ -37,6 +50,7 @@ ENV NODE_ENV=production \
     GOCACHE=/data/.cache/go/build \
     npm_config_cache=/data/.cache/npm \
     PIP_CACHE_DIR=/data/.cache/pip \
+    BUN_INSTALL_CACHE_DIR=/data/.cache/bun \
     GOMEMLIMIT=600MiB \
     GOMAXPROCS=1
 
