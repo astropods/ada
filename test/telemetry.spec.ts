@@ -195,6 +195,17 @@ test("emits a correctly parented GenAI trace for a real agent turn", async () =>
   );
   expect(metricNames, "Ada's cost histogram survives the swap").toContain("gen_ai.usage.cost_usd");
 
+  // ---- cost on the span, not only in metrics ------------------------------
+  // A trace UI reads span attributes, not metrics, so without this its Cost
+  // column shows "–" even though the tokens are right there. Cost is absent
+  // from the GenAI semconv and from Flue's instrumentation, so it is ours to
+  // add. The faux provider prices at zero, hence presence rather than
+  // magnitude — the guard is against it disappearing.
+  expect(
+    Object.keys(agent!.attributes),
+    "the run span carries a cost attribute",
+  ).toContain("gen_ai.usage.cost_usd");
+
   // ---- no content capture ------------------------------------------------
   // Ada works on private repositories; prompts, completions and tool payloads
   // must never travel to the collector.

@@ -84,6 +84,7 @@ export async function installTelemetry(serviceName = "ada"): Promise<() => Promi
       createHistogram(n: string, o?: { unit?: string }): { record(v: number, a?: Record<string, string>): void };
       createCounter(n: string, o?: { unit?: string }): { add(v: number, a?: Record<string, string>): void };
     };
+    activeSpan(): { setAttribute(k: string, v: number | string): void } | undefined;
   };
   try {
     const runtime = (await import("@flue/runtime")) as unknown as Pick<typeof deps, "instrument" | "observe">;
@@ -93,8 +94,14 @@ export async function installTelemetry(serviceName = "ada"): Promise<() => Promi
     >;
     const api = (await import("@opentelemetry/api")) as unknown as {
       metrics: { getMeter(n: string): typeof deps.meter };
+      trace: { getActiveSpan(): ReturnType<typeof deps.activeSpan> };
     };
-    deps = { ...runtime, ...otelPkg, meter: api.metrics.getMeter(serviceName) };
+    deps = {
+      ...runtime,
+      ...otelPkg,
+      meter: api.metrics.getMeter(serviceName),
+      activeSpan: () => api.trace.getActiveSpan(),
+    };
   } catch (e) {
     console.warn(`[ada] telemetry: not installed (${(e as Error).message})`);
     return async () => {};
@@ -114,6 +121,13 @@ export async function installTelemetry(serviceName = "ada"): Promise<() => Promi
   // cannot know is what a review CONCLUDED, which is the number worth watching:
   // findings by severity tells you whether the reviewer is earning its cost, or
   // whether it has quietly started returning nothing on every change.
+  /**
+   * Running cost per agent operation, so the span attribute is the TOTAL rather
+   * than the last turn's. Keyed on the operation id and dropped when it ends —
+   * a long conversation must not accumulate entries forever.
+   */
+  const costByOperation = new Map<string, number>();
+
   const disposeMetrics = deps.observe((event) => {
     if (event.type === "turn") {
       const cost = (event.response?.usage as CostUsage | undefined)?.cost?.total;
@@ -122,6 +136,23 @@ export async function installTelemetry(serviceName = "ada"): Promise<() => Promi
         "gen_ai.response.model": event.response?.responseModel ?? "unknown",
         "gen_ai.agent.name": event.agentName ?? "unknown",
       });
+
+      // Also put it on the span. Cost is absent from the GenAI semconv and from
+      // Flue's instrumentation, so a trace UI has nothing to show in its Cost
+      // column — it reads span attributes, not metrics. On a `turn` event the
+      // active span is the enclosing `invoke_agent` (the `chat` span has
+      // already been closed by the framework), which is the right place for a
+      // per-run total anyway.
+      const op = event.operationId;
+      if (op) {
+        const total = (costByOperation.get(op) ?? 0) + cost;
+        costByOperation.set(op, total);
+        deps.activeSpan()?.setAttribute(COST_METRIC, Math.round(total * 1e6) / 1e6);
+      }
+      return;
+    }
+    if (event.type === "operation" && event.operationId) {
+      costByOperation.delete(event.operationId);
       return;
     }
     if (event.type === "task" && event.agent === REVIEWER_AGENT) {
