@@ -15,11 +15,67 @@ AG-UI frontend. It's an Astropods/K8s workload.
 > code for you. The Astropods blueprint deploys as
 > **`ada-your-personal-coding-agent`** because a bare `ada` isn't a valid blueprint name.
 
-> Status: **usable, with SCAFFOLD edges.** Multi-turn sessions, per-session
-> sandbox workspaces, GitHub per-user OAuth, the Astro AI Gateway path, and
-> Slack/web messaging are all real. Conversation durability across restarts,
-> registry GC, cookie signing, and token encryption-at-rest are still `TODO`
-> (grep the source, and see Limitations).
+> Status: **usable, with SCAFFOLD edges.** Real: multi-turn conversations
+> durable in Postgres, isolated execution in a secret-less sandbox container,
+> GitHub per-user OAuth, the Astro AI Gateway path, Slack/web messaging,
+> secure-by-default enforcement, and OTel tracing. Still `TODO`: AG-UI event-log
+> GC, cookie signing, and token encryption-at-rest (grep the source, and see
+> Limitations).
+
+## Why Flue, and not the Claude Agent SDK
+
+Ada used to run Claude Code headlessly: a `claude -p` child process whose
+newline-delimited `stream-json` was parsed and re-emitted. That worked. The
+reasons for moving are worth stating, because they are about the **harness**,
+not about the model.
+
+**What we gained, each of which is load-bearing somewhere in this repo:**
+
+- **The toolset is closed by default.** The `claude_code` preset exposed its
+  whole toolset and had to be pruned with a `DEFAULT_DISALLOWED_TOOLS` deny
+  list — and `allowedTools` only auto-*approves*, it does not restrict. Flue
+  mounts exactly what the render declares. That deny list is gone.
+- **The render is dynamic, so capabilities are real.** Asking Ada to turn code
+  review off genuinely unmounts the delegate on the next render
+  (`usePersistentState` + a conditional `useSubagent`), rather than leaving a
+  tool advertised to a model that must be told not to use it.
+- **There are lifecycle seams.** `useAgentFinish` runs at every would-stop
+  point and can send the model back to work. The security gates — "you changed
+  a route and touched no test", "there is a credential in this diff" — have no
+  clean equivalent when your integration point is a child process's stdout.
+- **No unversioned wire contract.** A typed event union replaced `stream-json`,
+  which was pin #1 in this document and forced the `claude` CLI version to be
+  pinned in the image.
+- **The sandbox is an interface.** Restoring out-of-process execution meant
+  implementing nine methods; the agent loop, tools, gates, and reviewer were
+  untouched. The pre-Flue version of that split needed a bespoke HTTP protocol
+  and SSE forwarding of raw stream-json.
+- **The model credential never reaches a child process.** The loop runs
+  in-process, so nothing has to hand a key to a spawned binary.
+- **Durable instances.** Conversation history is framework-owned and keyed by
+  instance id, which deleted a resume-id map and a `--resume` flag.
+- **An ecosystem to lean on.** `@flue/opentelemetry` and `@flue/postgres`
+  removed ~440 lines of hand-written instrumentation and an entire persistence
+  adapter (see the pin list — check the registry before you build).
+
+**What we gave up, which is the honest other half:**
+
+Claude Code's harness is heavily tuned for coding by people with far more
+evaluation data than this repo has: its system prompt, tool descriptions,
+compaction behaviour, and sub-agent patterns are the product of that tuning.
+Flue hands you primitives instead, so **the quality of the coding loop is now
+Ada's problem**. The `ROLE` prompt below is a few lines against something
+iterated on at length. We have measured nothing: there is no benchmark here
+comparing task success before and after, and the architectural wins above say
+nothing about whether Ada writes better code than it did.
+
+The defensible claim is narrow and, we think, correct for this project: **for
+an agent that must be embedded, constrained, observed, and extended, Flue is
+the better fit — and the coding quality that the Claude Code preset used to
+provide for free is now a debt we owe.** The security layers, the reviewer, and
+the repo-conventions injection are the beginning of paying it. If Ada's output
+quality regresses against the old build, that is the first place to look, not
+the framework.
 
 ## The agent
 
@@ -155,10 +211,9 @@ source lives in `agent/`). Local `ast dev` adapters are `[web, slack]`.
 
 ## Tests
 
-End-to-end tests (Playwright) cover the SSE reconnect fix and session delete — no
-model credential needed. A test-only `POST /test/seed` hook builds a replayable
-session from a recorded fixture of Flue events, so the transport/registry
-behaviour is exercised without a real model run.
+End-to-end tests (Playwright), none of which need a model credential or a
+network — model turns run against pi-ai's faux provider, so the real Flue
+runtime, interceptors, and hooks are exercised offline.
 
 ```bash
 npm install
@@ -166,24 +221,39 @@ npx playwright install --with-deps chromium   # one-time browser download
 npm test                                       # or: npm run test:ui
 ```
 
-- `test/server-sse.spec.ts` — the server prefers the `Last-Event-ID` header over a
-  stale `?lastEventId=-1` query (reconnect *resumes*, not full-replays), plus
-  `DELETE /sessions/:id` semantics (204 → 404; events 404 afterward).
-- `test/client-reconnect.spec.ts` — mocks the SSE endpoint to force repeated
-  full-buffer replays and asserts the client renders `✓ finished` exactly once.
-- `test/client-delete.spec.ts` — the ✕ in the session menu issues `DELETE
-  /sessions/:id` and removes the row.
+| Spec | Covers |
+|---|---|
+| `server-sse.spec.ts` | `Last-Event-ID` beats a stale `?lastEventId` query; `DELETE /sessions/:id` semantics |
+| `client-reconnect.spec.ts` | Repeated full-buffer replays render `✓ finished` exactly once |
+| `client-delete.spec.ts` · `client-autoscroll.spec.ts` · `client-followup-delivery.spec.ts` | Built-in AG-UI client behaviour |
+| `security-gates.spec.ts` | Every gate rule, in **both** directions, against real git repos |
+| `reviewer-subagent.spec.ts` | Actually **invokes** the delegate via the `task` tool |
+| `repo-rules.spec.ts` | Convention discovery: casing, nesting, symlinks, truncation |
+| `remote-sandbox.spec.ts` | The isolation boundary — containment and env leakage — over real HTTP |
+| `telemetry.spec.ts` | A real agent turn's trace: names, parenting, durations, no content capture |
+| `persistence.spec.ts` | Backend selection always; a real restart when `ADA_TEST_POSTGRES_HOST` is set |
+
+Two habits worth keeping, both learned the hard way here:
+
+- **Assert both directions.** A gate that stops firing is a control silently
+  removed; one that fires when it shouldn't gets argued past. Every rule asserts
+  the exact set that fires.
+- **Prove the test fails on the bug.** The reviewer delegate shipped broken
+  because 32 tests were green — nothing had ever *invoked* it. Its regression
+  test was confirmed to fail against the original bug before being kept. A
+  regression test that never fails is a slower green tick.
 
 `POST /test/seed` is exposed ONLY when `ADA_TEST_HOOKS=1` (set by
-`playwright.config.ts`'s `webServer`); it's inert in production. CI runs the suite
-on every push to `main` and every PR (`.github/workflows/e2e.yml`).
+`playwright.config.ts`'s `webServer`); it's inert in production. CI runs the
+suite on every push to `main` and every PR (`.github/workflows/e2e.yml`).
 
 ## Architecture
 
-One internal pipeline, three sinks. Flue's event stream is the single source of
-truth; the translator, telemetry, and persistence each subscribe independently,
-so what the client sees can't drift from what's billed. The same pipeline feeds
-both the SSE/AG-UI frontend and the messaging sidecar.
+One internal pipeline. Flue's event stream is the single source of truth: the
+translator and the result store consume it through the session runner, and
+telemetry subscribes globally and independently (see "Cost → money" for why not
+through the runner). The same pipeline feeds both the SSE/AG-UI frontend and the
+messaging sidecar.
 
 ```
  HTTP (POST /sessions) ─┐
@@ -191,12 +261,15 @@ both the SSE/AG-UI frontend and the messaging sidecar.
                                 │  setSessionEnv(id, …)   ← workspace, GH token, repo
                                 │  init(Ada, {id}).dispatch(prompt)
                                 ▼
-                          Flue agent loop  (in-process; sandbox = local())
+                          Flue agent loop  (in-process)
+                                │       └─ sandbox: remote container, or local()
                                 │  observe() — FlueEvent stream
-        ┌───────────────────────┼───────────────────────┐
-        ▼                       ▼                       ▼
-   Translator            Telemetry (OTel          ResultStore
-        │                 spans/metrics)          (usage + cost)
+        ┌───────────────────────┴───────────┐
+        ▼                                   ▼
+   Translator                          ResultStore
+        │                              (usage + cost)
+        │        @flue/opentelemetry ──▶ OTel traces + metrics
+        │        (registered globally, not via the runner)
         ▼
   SessionRegistry (per-session AG-UI log, seq'd)
         │
@@ -208,19 +281,23 @@ both the SSE/AG-UI frontend and the messaging sidecar.
 | `agent/agents/ada.ts` | **The agent.** A `'use agent'` function whose hooks declare model, sandbox, instructions, and tools per render. |
 | `agent/agents/session-env.ts` | Per-instance context (workspace, GH token, repo) held **out of durable state** — see below. |
 | `agent/agents/tools.ts` | Application tools (`checkout_repo`) — work needing a credential or a server-side decision. |
+| `agent/agents/security/*` | Secure-by-default: always-on principles, on-demand skills, enforced diff gates, and the reviewer delegate. |
+| `agent/agents/repo-rules.ts` | Injects the project's own conventions that Flue's workspace discovery missed. |
+| `agent/session/remote-sandbox.ts` | `SandboxDriver` over HTTP to the isolated execution container; selection by injection. |
+| `agent/store/pg-config.ts` | One reading of the Postgres env, shared by Flue's adapter and Ada's Store. |
 | `agent/config/model.ts` | **Isolated swap seam.** Model resolution, the custom Astro AI Gateway pi-ai provider, and the scrubbed sandbox env. |
 | `agent/session/runner.ts` | Drives Flue instances (`init`/`dispatch`/`read`), fans `observe()` events into the registry, telemetry, and results. |
 | `agent/translate/translator.ts` | Pure `FlueEvent` → AG-UI mapping. Stateful per session. |
 | `agent/session/registry.ts` | Per-session AG-UI event log with monotonic seq → lossless reconnect. Decoupled from transport. |
 | `agent/session/workspace.ts` | Per-session writable workspace (the sandbox cwd), reused across turns, TTL-GC'd. |
-| `agent/db.ts` | Flue's durable conversation store (SQLite). Read by both server entries. |
+| `agent/db.ts` | Flue's durable conversation store: Postgres deployed, SQLite locally. Read by both server entries. |
 | `agent/app.ts` | The Hono route map: AG-UI routes, Flue's native routes, auth, setup. |
 | `agent/index.ts` | Standalone Node entry — `start()`s the runtime, then serves `app.ts`. |
 | `agent/messaging/adapter.ts` | `AgentAdapter` for the Astro messaging sidecar (web/Slack); directives + delegation to the runner. |
 | `agent/auth/*` | Per-user GitHub App OAuth, App-Manifest provisioning, signed chat connect links, ALB-identity resolution. |
 | `agent/store/*` | Postgres-backed store (GitHub tokens, App creds, repo bindings, server secret); in-memory fallback. |
 | `agent/transport/sse.ts` | AG-UI SSE framing + `Last-Event-ID` replay. |
-| `agent/telemetry/*` | OTel GenAI-semconv traces + metrics; cost. No-op without `@opentelemetry/api`. |
+| `agent/telemetry/*` | Installs `@flue/opentelemetry` (content capture off) plus Ada's cost metric. |
 
 ### Keeping secrets out of durable state
 
@@ -240,7 +317,7 @@ mid-recovery.
 
 ## Secure by default
 
-Ada is opinionated about how code gets written. The opinions live in three
+Ada is opinionated about how code gets written. The opinions live in five
 layers, and the layering is the design — each does something the others can't.
 
 | Layer | Where | Cost | What it achieves |
@@ -249,6 +326,7 @@ layers, and the layering is the design — each does something the others can't.
 | **Skills** | `security/skills.ts` → `useSkill()` | one catalog line until activated | Informs. Detailed playbooks, loaded only when relevant |
 | **Gates** | `security/gates.ts` → `useAgentFinish()` | per stop-point | **Enforces.** Reads the real diff and sends the model back |
 | **Repo rules** | `repo-rules.ts` → `useAgentStart()` | per turn | The project's own conventions, which override Ada's defaults |
+| **Reviewer** | `security/reviewer.ts` → `useSubagent()` | per substantive change | Independent judgement over content, with fresh context |
 
 **Why not just a bigger system prompt?** Because a twenty-point security
 checklist in the prompt does not make the agent twenty points safer — it makes
@@ -700,8 +778,8 @@ agents.
 
 ## Pin list — unstable / version-dependent, pin before production
 
-### Flue (pin `@flue/runtime`, `@flue/cli`, `@flue/vite`)
-1. **All three are pinned to an exact version (`2.0.3`), not a range.** Flue 2.0
+### Flue (pin `@flue/runtime`, `@flue/cli`, `@flue/vite`, `@flue/opentelemetry`, `@flue/postgres`)
+1. **All are pinned to an exact version (`2.0.3`), not a range.** Flue 2.0
    is a fresh stable release; the hooks API, the `FlueEvent` union, and the
    generated Node entry are all young surfaces. Treat a bump as a
    breaking-change review — especially of `agent/translate/translator.ts`, which
@@ -717,25 +795,35 @@ agents.
    drives live argument previews; `tool_start` remains the source of truth for
    complete arguments. A consumer reading durable history sees only the latter.
 
+5. **The `@flue/*` scope is bigger than `@flue/runtime`.** `@flue/opentelemetry`
+   and `@flue/postgres` are pinned here too, in lockstep at `2.0.3`. Both were
+   initially missed — neither is re-exported from `@flue/runtime`, and the only
+   tracing symbol visible there is the Cloudflare one. Roughly 440 lines of
+   hand-written instrumentation were written and then deleted as a result.
+   **Check the registry for a `@flue/*` sibling before building an
+   integration.** Also published and not currently used: `@flue/github` (webhook
+   ingress, not OAuth — it replaces none of `agent/auth/`), `@flue/slack`,
+   `@flue/react`, `@flue/linear`, `@flue/telegram`.
+
 ### AG-UI (pin `@ag-ui/core`)
-5. **Reasoning events changed:** `THINKING_*` was removed in AG-UI **1.0.0** in
+6. **Reasoning events changed:** `THINKING_*` was removed in AG-UI **1.0.0** in
    favour of `REASONING_*`. We default reasoning OFF; if enabled, pin the core
    version so we emit the right names.
-6. **`RUN_FINISHED.outcome`** is a newer optional field. We omit it for
+7. **`RUN_FINISHED.outcome`** is a newer optional field. We omit it for
    legacy-safety — revisit when we pin ≥ a version where it's expected.
-7. **Validate against the canonical Zod schemas.** Local types in
+8. **Validate against the canonical Zod schemas.** Local types in
    `agent/types/agui.ts` mirror `@ag-ui/core`; add a CI step that parses emitted
    events with the pinned package's schemas so drift fails the build.
 
 ### Gateway (Bifrost → Bedrock)
-8. **`x-bf-vk` header + `bedrock/`-prefixed model ids** are how Bifrost reads the
+9. **`x-bf-vk` header + `bedrock/`-prefixed model ids** are how Bifrost reads the
    virtual key and resolves models; both were probed empirically and can change
    with the gateway. (The `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` workaround is
    gone with the CLI — pi-ai doesn't send Claude Code's first-party-only
    pre-release `anthropic-beta` flags.)
 
 ### Ada-specific extension (document for frontends)
-9. **SSE `id:` line for reconnect.** AG-UI's own SSE encoder emits only
+10. **SSE `id:` line for reconnect.** AG-UI's own SSE encoder emits only
    `data: {json}\n\n` (no `event:`/`id:`). We add `id: <seq>` so the browser's
    `EventSource` sends `Last-Event-ID` and we replay the gap from the registry.
    Valid SSE, ignored by clients that don't use it — but it's *our* extension
@@ -751,9 +839,14 @@ agents.
 
 ## Next steps
 - Registry durability: cap/spool the event log, GC terminated sessions.
-- Harden auth: sign the `bridge_uid` cookie, GC OAuth CSRF state, encrypt tokens
-  at rest.
+- Harden auth: sign the `bridge_uid` cookie and encrypt GitHub tokens at rest.
 - Add a CI typecheck step (`tsc --noEmit` is clean as of the telemetry work) and
   AG-UI schema validation alongside the e2e workflow.
 - Consider a managed sandbox provider (E2B, Daytona, Modal) as an alternative
   to self-hosting the execution container — same one-line `useSandbox()` swap.
+- **Measure the coding loop.** Nothing here compares task success against the
+  old Claude Code build. See "Why Flue" — the harness improved, the prompt
+  tuning that came free with the preset did not, and only a benchmark
+  distinguishes the two.
+- `@flue/github` for webhook ingress, so a PR mention can trigger a run. It is
+  additive, not a replacement for `agent/auth/` — see the pin list.
