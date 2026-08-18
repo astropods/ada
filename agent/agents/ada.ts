@@ -30,8 +30,10 @@ import {
   useAgentStart,
   useInstruction,
   useModel,
+  usePersistentState,
   useSandbox,
   useSkill,
+  useSubagent,
   useTool,
 } from "@flue/runtime";
 import { local } from "@flue/runtime/node";
@@ -43,6 +45,7 @@ import { githubPromptGuidance } from "../github-guidance.ts";
 import { SECURITY_PRINCIPLES } from "./security/principles.ts";
 import { SECURITY_SKILLS } from "./security/skills.ts";
 import { captureBaseline, runSecurityGates } from "./security/gates.ts";
+import { codeReviewer, reviewerDefault, setReviewMode } from "./security/reviewer.ts";
 
 // Register the Astro AI Gateway provider HERE, at agent-module scope, rather
 // than in a server bootstrap. Every entry point loads this module — the Hono
@@ -116,14 +119,32 @@ export function Ada({ id }: AgentProps) {
 
   for (const skill of SECURITY_SKILLS) useSkill(skill);
 
+  /* ---------------- the independent reviewer ----------------
+   *
+   * Durable per-conversation state, seeded from ADA_REVIEWER_ENABLED. Because
+   * the render re-runs each turn, flipping this genuinely changes the agent:
+   * the delegate stops being mounted, and Flue narrates the capability change
+   * to the model. That is the dynamic-agent property the hooks API exists for —
+   * the alternative, a flag consulted inside a static tool, would leave the
+   * reviewer advertised to a model that must then be told not to use it.
+   *
+   * `set_review_mode` stays mounted either way, so a conversation that turned
+   * review off can always turn it back on.
+   */
+  const [reviewEnabled, setReviewEnabled] = usePersistentState("securityReview", reviewerDefault());
+  if (reviewEnabled) useSubagent(codeReviewer(id));
+  useTool(setReviewMode(setReviewEnabled));
+
   // Record the commit the turn starts from, so the gate can diff against it and
   // see work the agent has already committed — not just the working tree.
   useAgentStart(async (ctx) => {
     await captureBaseline(id, ctx);
   });
 
+  // The gate closes over the CURRENT render's flag, so turning review off takes
+  // effect on the next turn without the gate needing to read state itself.
   useAgentFinish(async (ctx) => {
-    await runSecurityGates(id, ctx);
+    await runSecurityGates(id, ctx, { reviewEnabled });
   });
 
   return ROLE;

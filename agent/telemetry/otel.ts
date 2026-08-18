@@ -3,7 +3,7 @@
  *
  * Tracing and the standard GenAI metrics come from `@flue/opentelemetry`, the
  * framework's own instrumentation. This module used to hand-roll that mapping
- * — ~330 lines reimplementing Flue's Cloudflare tracing backend for Node —
+ * — ~440 lines reimplementing Flue's Cloudflare tracing backend for Node —
  * because the official package was missed: it isn't re-exported from
  * `@flue/runtime`, and the only tracing symbol visible there is
  * `createCloudflareTracing`. It is a sibling package, versioned in lockstep.
@@ -30,15 +30,46 @@
 
 import type { FlueEvent } from "@flue/runtime";
 
-/** Emitted alongside the framework's metrics; namespaced so it's clearly ours. */
+/** Emitted alongside the framework's metrics; namespaced so they're clearly ours. */
 const COST_METRIC = "gen_ai.usage.cost_usd";
+const REVIEW_RUNS_METRIC = "ada.review.runs";
+const REVIEW_FINDINGS_METRIC = "ada.review.findings";
+
+/** The subagent whose task results carry review findings. */
+const REVIEWER_AGENT = "code-reviewer";
 
 interface CostUsage {
   cost?: { total: number };
 }
 
+interface ReviewResult {
+  findings?: Array<{ severity?: string; category?: string }>;
+}
+
 /**
- * Register Flue's OpenTelemetry instrumentation, plus Ada's cost metric.
+ * Pull findings out of a reviewer task result.
+ *
+ * The delegate returns structured output, but a `task` result crosses the
+ * boundary as an opaque value and may arrive as the JSON text the model
+ * produced rather than a parsed object — so handle both and never throw. A
+ * telemetry parse failure must not fail the run.
+ */
+function parseReview(result: unknown): ReviewResult | null {
+  if (result && typeof result === "object") return result as ReviewResult;
+  if (typeof result === "string") {
+    try {
+      const parsed = JSON.parse(result) as unknown;
+      if (parsed && typeof parsed === "object") return parsed as ReviewResult;
+    } catch {
+      /* not JSON — nothing to count */
+    }
+  }
+  return null;
+}
+
+/**
+ * Register Flue's OpenTelemetry instrumentation, plus Ada's own metrics
+ * (cost, and code-review outcomes).
  * Returns a dispose function.
  *
  * Degrades to a no-op if the OTel API or the instrumentation package isn't
@@ -49,7 +80,10 @@ export async function installTelemetry(serviceName = "ada"): Promise<() => Promi
     instrument: (i: unknown) => () => Promise<void>;
     observe: (fn: (e: FlueEvent) => void) => () => void;
     createOpenTelemetryInstrumentation: (o: unknown) => unknown;
-    meter: { createHistogram(n: string, o?: { unit?: string }): { record(v: number, a?: Record<string, string>): void } };
+    meter: {
+      createHistogram(n: string, o?: { unit?: string }): { record(v: number, a?: Record<string, string>): void };
+      createCounter(n: string, o?: { unit?: string }): { add(v: number, a?: Record<string, string>): void };
+    };
   };
   try {
     const runtime = (await import("@flue/runtime")) as unknown as Pick<typeof deps, "instrument" | "observe">;
@@ -72,14 +106,34 @@ export async function installTelemetry(serviceName = "ada"): Promise<() => Promi
   const disposeTracing = deps.instrument(deps.createOpenTelemetryInstrumentation({ content: false }));
 
   const costHistogram = deps.meter.createHistogram(COST_METRIC, { unit: "USD" });
-  const disposeCost = deps.observe((event) => {
-    if (event.type !== "turn") return;
-    const cost = (event.response?.usage as CostUsage | undefined)?.cost?.total;
-    if (cost == null) return;
-    costHistogram.record(cost, {
-      "gen_ai.response.model": event.response?.responseModel ?? "unknown",
-      "gen_ai.agent.name": event.agentName ?? "unknown",
-    });
+  const reviewRuns = deps.meter.createCounter(REVIEW_RUNS_METRIC);
+  const reviewFindings = deps.meter.createCounter(REVIEW_FINDINGS_METRIC);
+
+  // The reviewer subagent's SPANS come free — Flue emits `task` operations and
+  // the framework instrumentation traces them as nested `invoke_agent`. What it
+  // cannot know is what a review CONCLUDED, which is the number worth watching:
+  // findings by severity tells you whether the reviewer is earning its cost, or
+  // whether it has quietly started returning nothing on every change.
+  const disposeMetrics = deps.observe((event) => {
+    if (event.type === "turn") {
+      const cost = (event.response?.usage as CostUsage | undefined)?.cost?.total;
+      if (cost == null) return;
+      costHistogram.record(cost, {
+        "gen_ai.response.model": event.response?.responseModel ?? "unknown",
+        "gen_ai.agent.name": event.agentName ?? "unknown",
+      });
+      return;
+    }
+    if (event.type === "task" && event.agent === REVIEWER_AGENT) {
+      reviewRuns.add(1, { "ada.review.outcome": event.isError ? "error" : "ok" });
+      const review = parseReview(event.result);
+      for (const f of review?.findings ?? []) {
+        reviewFindings.add(1, {
+          "ada.review.severity": f.severity ?? "unknown",
+          "ada.review.category": f.category ?? "unknown",
+        });
+      }
+    }
   });
 
   console.log(
@@ -89,7 +143,7 @@ export async function installTelemetry(serviceName = "ada"): Promise<() => Promi
   );
 
   return async () => {
-    disposeCost();
+    disposeMetrics();
     await disposeTracing();
   };
 }

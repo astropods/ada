@@ -29,6 +29,7 @@
  * A gate that cannot be argued with turns into a gate the model games.
  */
 
+import { createHash } from "node:crypto";
 import type { AgentFinishContext, AgentStartContext } from "@flue/runtime";
 
 /* ------------------------------------------------------------ diff model */
@@ -50,6 +51,14 @@ interface Diff {
    */
   repoHasSpec: boolean;
   repoHasTests: boolean;
+  /**
+   * Stable id for THIS set of changes. The review request is budgeted against
+   * it rather than against the session, so a reviewed change isn't re-reviewed
+   * on every stop, but a change that grows afterwards is reviewed again.
+   */
+  fingerprint: string;
+  /** Added + removed lines, for the substantive-change threshold. */
+  changedLines: number;
 }
 
 /** Baseline commit per instance, captured at the start of each delivery. */
@@ -119,6 +128,12 @@ async function readDiff(instanceId: string, ctx: AgentFinishContext): Promise<Di
     removed,
     repoHasSpec: tracked.some(isSpec) || files.some(isSpec),
     repoHasTests: tracked.some(isTest) || files.some(isTest),
+    fingerprint: createHash("sha256")
+      .update(files.slice().sort().join("\n"))
+      .update(`|${added.length}|${removed.length}`)
+      .digest("hex")
+      .slice(0, 16),
+    changedLines: added.length + removed.length,
   };
 }
 
@@ -138,6 +153,22 @@ const isSpec = (p: string) => /(openapi|swagger)[^/]*\.(ya?ml|json)$/i.test(p);
 
 const isDependencyManifest = (p: string) =>
   /(^|\/)(package\.json|requirements[^/]*\.txt|pyproject\.toml|go\.mod|Gemfile|Cargo\.toml)$/i.test(p);
+
+/** Source files, as opposed to docs, fixtures, and generated manifests. */
+const isCode = (p: string) =>
+  /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rb|rs|java|kt|cs|php|swift|scala|sql|sh)$/i.test(p);
+
+/** Minimum changed lines before a review is worth a full model pass. */
+const REVIEW_MIN_LINES = Number(process.env.ADA_REVIEW_MIN_LINES ?? 20);
+
+/**
+ * Whether this change is worth an independent review. A one-line typo fix or a
+ * docs-only edit is not — the reviewer costs a full model pass over the diff,
+ * and firing it on trivia is how a useful control becomes one people disable.
+ */
+function isSubstantive(diff: Diff): boolean {
+  return diff.files.some(isCode) && diff.changedLines >= REVIEW_MIN_LINES;
+}
 
 const isLockfile = (p: string) =>
   /(^|\/)(package-lock\.json|bun\.lock[b]?|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|go\.sum|Gemfile\.lock|Cargo\.lock)$/i.test(p);
@@ -179,7 +210,7 @@ interface Finding {
   body: string;
 }
 
-function scanRules(diff: Diff): Finding[] {
+function scanRules(diff: Diff, reviewEnabled: boolean): Finding[] {
   const found: Finding[] = [];
   const changed = diff.files;
 
@@ -287,6 +318,25 @@ function scanRules(diff: Diff): Finding[] {
     });
   }
 
+  // 7. An independent pass over a substantive change. Budgeted against the
+  //    diff fingerprint, so a reviewed change isn't re-reviewed on every stop
+  //    but a change that grows afterwards gets looked at again.
+  if (reviewEnabled && isSubstantive(diff)) {
+    found.push({
+      rule: `review-required:${diff.fingerprint}`,
+      blocking: false,
+      body:
+        `Before you finish: delegate to the \`code-reviewer\` subagent (via the task tool) to get ` +
+        `an independent read of these changes. It reviews with fresh context and no attachment to ` +
+        `the approach you took, which is the point — you have already convinced yourself.\n\n` +
+        `Fix anything it returns at CRITICAL or HIGH severity before finishing. Report medium and ` +
+        `low findings in your summary (and in the PR description's Security notes, if you open one) ` +
+        `rather than fixing them silently. If you disagree with a finding, say so and why — do not ` +
+        `just ignore it.\n\n` +
+        `If the user has asked to skip review, call \`set_review_mode\` with enabled=false instead.`,
+    });
+  }
+
   return found;
 }
 
@@ -300,7 +350,11 @@ const BLOCKING_BUDGET = 3;
  * the model back with a specific instruction. Returns silently when there is
  * nothing to say — the overwhelmingly common case.
  */
-export async function runSecurityGates(instanceId: string, ctx: AgentFinishContext): Promise<void> {
+export async function runSecurityGates(
+  instanceId: string,
+  ctx: AgentFinishContext,
+  options: { reviewEnabled?: boolean } = {},
+): Promise<void> {
   let diff: Diff | null;
   try {
     diff = await readDiff(instanceId, ctx);
@@ -313,7 +367,7 @@ export async function runSecurityGates(instanceId: string, ctx: AgentFinishConte
   const used = spent.get(instanceId) ?? new Map<string, number>();
   spent.set(instanceId, used);
 
-  for (const finding of scanRules(diff)) {
+  for (const finding of scanRules(diff, options.reviewEnabled ?? false)) {
     const count = used.get(finding.rule) ?? 0;
     const budget = finding.blocking ? BLOCKING_BUDGET : 1;
 

@@ -68,6 +68,24 @@ inputs:
     default: "3"
     description: "Max concurrent agent runs. Lower to 1–2 to ease container memory pressure."
     display-as: short-text
+  # Independent code review. When on, a substantive change triggers a delegate
+  # (the `code-reviewer` subagent) that re-reads the diff with fresh context and
+  # no attachment to the approach taken — critical/high findings are fixed before
+  # the turn finishes, the rest are reported. Costs one extra model pass over the
+  # diff, so it is skipped for docs-only and sub-20-line changes
+  # (ADA_REVIEW_MIN_LINES tunes the threshold).
+  #
+  # This is only the DEFAULT. Either side can flip it mid-conversation — ask Ada
+  # to turn review off and it calls `set_review_mode`, which is durable for that
+  # conversation and actually unmounts the delegate on the next render.
+  ADA_REVIEWER_ENABLED:
+    name: ADA_REVIEWER_ENABLED
+    datatype: string
+    optional: true
+    default: "true"
+    description: "Run an independent code-reviewer pass on substantive changes. Can be toggled per conversation by asking Ada."
+    display-as: select
+    options: ["true", "false"]
   # GitHub App visibility. Default PRIVATE (single-tenant): only the account that
   # created the App can install it — right when one user/org runs their own Ada.
   # Set "true" for MULTI-TENANT: a PUBLIC App any teammate can install on THEIR

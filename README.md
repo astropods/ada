@@ -296,6 +296,41 @@ Three properties worth knowing, all covered by `test/security-gates.spec.ts`:
   apply rather than demanding compliance, because they're heuristics over paths
   and diff text and will sometimes misfire.
 
+### The reviewer (layer four)
+
+Gates are heuristics over paths and diff text; they can tell you a route changed
+with no test touched, but not that the test you added mocks the thing under test
+and asserts nothing. That needs judgement, so a **`code-reviewer` subagent** runs
+on substantive changes before Ada finishes.
+
+Its analytical lenses are ported from
+**[Cruise Line](https://github.com/astropods/cruise-line)**, the PR-review agent
+shipped separately — specifically its four sharpest ones: *test quality* ("bad
+tests are worse than no tests"), *error handling*, *API contract*, and
+*concurrency & data integrity* (missing transactions, TOCTOU, uniqueness enforced
+in app code). What did **not** come across is Cruise Line's output plumbing —
+`::diff{}` render directives, PR line anchors, Mermaid diagrams, an
+approve/request_changes verdict, and `fixPrompt` ("a prompt to paste into Claude
+Code", meaningless when Ada *is* that agent). Ada needs findings it will fix
+itself.
+
+**Why a subagent and not another instruction:** Flue runs a delegate in isolation
+from its parent — fresh context, none of the reasoning that produced the code. An
+agent re-reading its own work in its own context is the weakest possible reviewer;
+it has already convinced itself. That isolation is the whole point.
+
+| | |
+|---|---|
+| **Trigger** | A substantive change: ≥1 code file and ≥20 changed lines (`ADA_REVIEW_MIN_LINES`). Docs-only and one-line fixes are skipped — the reviewer costs a full model pass, and firing it on trivia is how a useful control gets switched off |
+| **Budget** | Keyed on a diff **fingerprint**, not the session. Asked once per change; asked again if the change grows afterwards |
+| **Enforcement** | Critical/high findings send Ada back to fix them. Medium and below are reported in the summary and the PR's Security notes |
+| **Default** | `ADA_REVIEWER_ENABLED` (astropods input, default `true`) |
+| **Runtime toggle** | Ask Ada to turn review off and it calls `set_review_mode` — durable for the conversation, and it genuinely **unmounts the delegate** on the next render rather than just being told to ignore it. `set_review_mode` stays mounted so it can always be turned back on |
+
+That toggle is the dynamic-agent property the hooks API exists for: the flag is
+`usePersistentState`, and the render conditionally calls `useSubagent()`. Flue
+narrates the resource change to the model, so it knows its capabilities shifted.
+
 The Ada-specific one is `secrets-handling`. Ada's tool output is streamed to
 Slack and retained in a replayable event log, and `GH_TOKEN` is in the sandbox
 env — so a casual `env`, `cat .env`, or `curl -v` publishes a live credential to

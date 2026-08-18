@@ -104,6 +104,13 @@ always-on principles, seven security playbooks loaded on demand as Flue skills
 secrets, agent integrity), and enforcement gates that read the real diff at
 every would-stop point and send the model back when a default was missed.
 
+A fourth layer runs on substantive changes: an independent `code-reviewer`
+subagent whose lenses are ported from Cruise Line (test quality, error handling,
+API contract, concurrency). It reviews with fresh context — an agent re-reading
+its own work has already convinced itself — and its critical/high findings send
+Ada back before finishing. Enabled by `ADA_REVIEWER_ENABLED`, and switchable
+mid-conversation by just asking Ada to turn review off.
+
 The gates block on credentials appearing in a diff and on controls being
 weakened to reach green (a skipped test, a `@ts-ignore`, `--no-verify`), and
 advise on endpoints changed without tests, stale API specs, migrations without a

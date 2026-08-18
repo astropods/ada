@@ -61,6 +61,7 @@ function write(dir: string, rel: string, body: string): void {
 async function firedRules(
   seed: (dir: string) => void,
   change: (dir: string) => void,
+  options: { reviewEnabled?: boolean } = {},
 ): Promise<string[]> {
   const dir = mkdtempSync(join(tmpdir(), "ada-gate-"));
   const instanceId = `test_${Math.random().toString(36).slice(2)}`;
@@ -77,7 +78,7 @@ async function firedRules(
     const ctx = fakeContext(dir, appended);
     await captureBaseline(instanceId, ctx as never);
     change(dir);
-    await runSecurityGates(instanceId, ctx as never);
+    await runSecurityGates(instanceId, ctx as never, options);
     return appended.sort();
   } finally {
     clearGateState(instanceId);
@@ -263,6 +264,81 @@ test("a blocking rule escalates, then terminates instead of looping", async () =
       "secret-in-diff",
       "secret-in-diff.unresolved",
     ]);
+  } finally {
+    clearGateState(instanceId);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* ---------------- the independent reviewer ---------------- */
+
+/** Enough real code to clear the substantive-change threshold. */
+const bigCodeChange = (d: string) =>
+  write(
+    d,
+    "src/service.ts",
+    Array.from({ length: 40 }, (_, i) => `export const fn${i} = (x: number) => x + ${i};`).join("\n"),
+  );
+
+test("asks for a review on a substantive code change", async () => {
+  const rules = await firedRules(withTests, bigCodeChange, { reviewEnabled: true });
+  expect(rules.filter((r) => r.startsWith("review-required")).length).toBe(1);
+});
+
+test("does not ask for a review when the reviewer is disabled", async () => {
+  const rules = await firedRules(withTests, bigCodeChange, { reviewEnabled: false });
+  expect(rules.filter((r) => r.startsWith("review-required"))).toEqual([]);
+});
+
+test("does not ask for a review on a trivial change", async () => {
+  // One line of code is not worth a full model pass over the diff.
+  const rules = await firedRules(withTests, (d) => write(d, "src/tiny.ts", "export const a = 1;\n"), {
+    reviewEnabled: true,
+  });
+  expect(rules.filter((r) => r.startsWith("review-required"))).toEqual([]);
+});
+
+test("does not ask for a review on a docs-only change", async () => {
+  const rules = await firedRules(
+    withTests,
+    (d) => write(d, "README.md", Array.from({ length: 60 }, (_, i) => `line ${i}`).join("\n")),
+    { reviewEnabled: true },
+  );
+  expect(rules.filter((r) => r.startsWith("review-required"))).toEqual([]);
+});
+
+test("asks once per change, then again when the change grows", async () => {
+  // The review budget is keyed on a diff fingerprint rather than the session:
+  // re-asking on every stop would loop, but never re-asking would let work
+  // added after the review ship unreviewed.
+  const dir = mkdtempSync(join(tmpdir(), "ada-gate-"));
+  const instanceId = `review_${Math.random().toString(36).slice(2)}`;
+  try {
+    await exec("git", ["init", "-q"], { cwd: dir });
+    await exec("git", ["config", "user.email", "t@example.com"], { cwd: dir });
+    await exec("git", ["config", "user.name", "t"], { cwd: dir });
+    write(dir, "src/seed.ts", "export const x = 1;\n");
+    withTests(dir);
+    await exec("git", ["add", "-A"], { cwd: dir });
+    await exec("git", ["commit", "-qm", "base"], { cwd: dir });
+
+    const appended: string[] = [];
+    const ctx = fakeContext(dir, appended);
+    await captureBaseline(instanceId, ctx as never);
+
+    bigCodeChange(dir);
+    await runSecurityGates(instanceId, ctx as never, { reviewEnabled: true });
+    await runSecurityGates(instanceId, ctx as never, { reviewEnabled: true });
+    const afterFirst = appended.filter((r) => r.startsWith("review-required")).length;
+    expect(afterFirst, "asked once, not on every stop").toBe(1);
+
+    // The agent keeps working after the review — that new code is unreviewed.
+    write(dir, "src/more.ts", Array.from({ length: 40 }, (_, i) => `export const g${i} = ${i};`).join("\n"));
+    await runSecurityGates(instanceId, ctx as never, { reviewEnabled: true });
+    expect(
+      appended.filter((r) => r.startsWith("review-required")).length,
+      "asks again once the change has grown",
+    ).toBe(2);
   } finally {
     clearGateState(instanceId);
     rmSync(dir, { recursive: true, force: true });
