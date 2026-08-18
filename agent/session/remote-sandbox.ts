@@ -141,9 +141,39 @@ class RemoteSandboxDriver implements SandboxDriver {
     await this.call("/rm", { path, ...options });
   }
 
-  /** The instance's workspace as an absolute path inside the sandbox container. */
+  /**
+   * The instance's workspace as an absolute path inside the sandbox container.
+   *
+   * Falls back to asking the shell when the service predates `/workspace`.
+   *
+   * The two containers are deployed together but do NOT necessarily rebuild
+   * together: a redeploy that rebuilt only the control plane left a sandbox
+   * image without this endpoint, and every session died at startup with a bare
+   * `not found`. Version skew between them is a permanent hazard, so the client
+   * degrades instead of failing — `/exec` with no `cwd` already runs in the
+   * workspace root, so `pwd` yields the same path on any version of the
+   * service. The warning is loud because a stale image will bite again
+   * differently.
+   */
   async workspacePath(): Promise<string> {
-    return (await this.call<{ path: string }>("/workspace", {})).path;
+    try {
+      return (await this.call<{ path: string }>("/workspace", {})).path;
+    } catch (e) {
+      if (!/not found/i.test((e as Error).message)) throw e;
+      const probe = await this.exec("pwd");
+      const path = probe.stdout.trim();
+      if (probe.exitCode !== 0 || !path.startsWith("/")) {
+        throw new Error(
+          `sandbox at ${this.opts.baseUrl} has no /workspace endpoint and \`pwd\` did not return an ` +
+            `absolute path (exit ${probe.exitCode}). The sandbox image is likely stale — rebuild it.`,
+        );
+      }
+      console.warn(
+        `[sandbox] ${this.opts.baseUrl} predates the /workspace endpoint — falling back to \`pwd\`. ` +
+          `The sandbox image is out of date relative to the control plane; rebuild it.`,
+      );
+      return path;
+    }
   }
 }
 

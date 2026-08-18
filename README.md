@@ -506,9 +506,13 @@ Two properties make the isolation real, and `test/remote-sandbox.spec.ts`
 asserts both against the service over real HTTP:
 
 - **Workspace containment.** Every path is resolved inside the requesting
-  instance's own directory and rejected if it escapes — resolve-then-compare,
-  not `../` stripping, which encodings and absolute paths defeat. One
-  conversation cannot read another's checkout.
+  instance's own directory and rejected if it escapes. The check is
+  **symlink-aware**: it resolves lexically, then resolves symlinks on the
+  deepest existing part of the path and compares that against the real base.
+  A purely lexical check defeats `../` and absolute paths but not a symlink —
+  the model can `ln -s /etc/passwd link` inside its own workspace and
+  `readFile` will follow it out. That shipped, and is now covered both ways
+  (a symlink leaving the workspace is rejected; one staying inside still works).
 - **Environment.** The service builds each command's env from an allowlist
   rather than inheriting its own, so a variable an operator adds to the
   container never reaches a command the model runs. The user's `GH_TOKEN` is

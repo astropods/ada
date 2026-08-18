@@ -43,8 +43,8 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { execFile } from "node:child_process";
 import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
-import { isAbsolute, join, resolve, sep } from "node:path";
+import { existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const ROOT = resolve(process.env.WORKSPACE_ROOT ?? "/data");
@@ -95,14 +95,40 @@ function workspaceOf(id: string): string {
 /**
  * Resolve a caller-supplied path inside an instance's workspace.
  *
- * THE containment check. Resolve first, compare after — stripping `..` is not
- * sufficient, because encodings and absolute paths defeat it. A path that lands
- * outside the workspace is rejected rather than clamped, so a bug surfaces as
- * an error instead of silently reading the wrong file.
+ * THE containment check, and it must be SYMLINK-AWARE.
+ *
+ * A purely lexical `resolve()` is not enough. It defeats `../` and absolute
+ * paths, but not a symlink: the model can `ln -s /etc/passwd link` inside its
+ * own workspace, and `<base>/link` passes a string comparison while
+ * `fs.readFile` cheerfully follows the link out of the sandbox. The first
+ * version of this shipped with exactly that hole.
+ *
+ * So: resolve lexically, then resolve symlinks on the deepest part of the path
+ * that actually exists, and compare THAT against the real base. Walking up to
+ * the nearest existing ancestor is what lets a write to a not-yet-created file
+ * work while still catching a symlinked parent directory.
+ *
+ * A path that lands outside is rejected rather than clamped, so a bug surfaces
+ * as an error instead of silently touching the wrong file.
  */
 function resolveIn(id: string, path: string): string {
-  const base = workspaceOf(id);
-  const full = isAbsolute(path) ? resolve(path) : resolve(base, path);
+  // The workspace itself always exists (workspaceOf creates it), and is
+  // realpath'd so a symlinked root — /var -> /private/var on macOS, a mounted
+  // /data elsewhere — compares equal to what the OS reports.
+  const base = realpathSync(workspaceOf(id));
+  const lexical = isAbsolute(path) ? resolve(path) : resolve(base, path);
+
+  let probe = lexical;
+  const missing: string[] = [];
+  while (!existsSync(probe)) {
+    const parent = dirname(probe);
+    if (parent === probe) break; // reached the filesystem root
+    missing.unshift(basename(probe));
+    probe = parent;
+  }
+  const real = existsSync(probe) ? realpathSync(probe) : probe;
+  const full = missing.length > 0 ? join(real, ...missing) : real;
+
   if (full !== base && !full.startsWith(base + sep)) {
     throw new HttpError(403, `path escapes the workspace: ${path}`);
   }
@@ -267,7 +293,11 @@ export function createSandboxServer() {
     void (async () => {
       try {
         if (req.method === "GET" && req.url === "/health") {
-          return json(res, 200, { ok: true, root: ROOT });
+          // `capabilities` exists so the control plane can detect an image
+          // older than itself at startup rather than discovering it when a
+          // session fails. The two containers deploy together but do not
+          // always rebuild together.
+          return json(res, 200, { ok: true, root: ROOT, capabilities: Object.keys(handlers) });
         }
         if (req.method !== "POST") throw new HttpError(405, "method not allowed");
         if (TOKEN && req.headers["x-sandbox-token"] !== TOKEN) throw new HttpError(401, "unauthorized");

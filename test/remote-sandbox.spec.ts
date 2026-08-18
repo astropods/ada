@@ -96,6 +96,29 @@ test("isolates one instance's workspace from another's", async () => {
   await expect(b.readFile("../inst-x/secret.txt")).rejects.toThrow(/escapes the workspace/);
 });
 
+test("rejects a symlink that points out of the workspace", async () => {
+  // The containment check used to be purely lexical, which defeats `../` and
+  // absolute paths but NOT a symlink: the model could create one inside its own
+  // workspace and `fs.readFile` would follow it straight out. That shipped.
+  const d = driverFor("inst-symlink");
+  await d.exec("ln -s /etc/passwd escape.txt");
+  await d.exec("ln -s /etc evildir");
+
+  await expect(d.readFile("escape.txt"), "a symlinked file").rejects.toThrow(/escapes the workspace/);
+  await expect(d.readFile("evildir/passwd"), "a symlinked parent directory").rejects.toThrow(
+    /escapes the workspace/,
+  );
+  await expect(d.readdir("evildir")).rejects.toThrow(/escapes the workspace/);
+  // Writing through one must fail too, not just reading.
+  await expect(d.writeFile("evildir/pwned", "x")).rejects.toThrow(/escapes the workspace/);
+
+  // A symlink that stays INSIDE the workspace is still fine — the check
+  // constrains where paths land, it does not ban symlinks.
+  await d.writeFile("real.txt", "inside");
+  await d.exec("ln -s real.txt alias.txt");
+  expect(await d.readFile("alias.txt")).toBe("inside");
+});
+
 test("rejects paths that escape the workspace root", async () => {
   const d = driverFor("inst-esc");
   for (const p of ["../../etc/passwd", "/etc/passwd", "a/../../../etc/passwd"]) {
@@ -215,4 +238,61 @@ test("reports the instance's absolute workspace path", async () => {
   const b = await remoteSandboxDriver({ baseUrl, id: "inst-ws-b" }).workspacePath();
   expect(a.startsWith("/")).toBe(true);
   expect(a, "each instance gets its own directory").not.toBe(b);
+});
+
+test("degrades to `pwd` when the sandbox image predates /workspace", async () => {
+  // Exactly the production failure: the control plane redeployed with the
+  // /workspace endpoint, the sandbox container did not rebuild, and every
+  // session died at startup with a bare `not found`. The two containers deploy
+  // together but do not always rebuild together, so the client must degrade.
+  const { createServer } = await import("node:http");
+  const legacy = createServer((req, res) => {
+    if (req.url === "/workspace") {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "not found" }));
+      return;
+    }
+    // Everything else behaves like the deployed (older) service.
+    const chunks: Buffer[] = [];
+    req.on("data", (c) => chunks.push(c as Buffer));
+    req.on("end", () => {
+      void fetch(`${baseUrl}${req.url}`, {
+        method: req.method,
+        headers: { "Content-Type": "application/json" },
+        body: chunks.length ? Buffer.concat(chunks).toString("utf8") : undefined,
+      })
+        .then(async (upstream) => {
+          const body = await upstream.text();
+          res.writeHead(upstream.status, { "Content-Type": "application/json" });
+          res.end(body);
+        })
+        .catch(() => {
+          res.writeHead(502).end("{}");
+        });
+    });
+  });
+  await new Promise<void>((r) => legacy.listen(0, "127.0.0.1", r));
+  const legacyUrl = `http://127.0.0.1:${(legacy.address() as AddressInfo).port}`;
+
+  try {
+    const { remote } = await import("../agent/session/remote-sandbox.ts");
+    const sandbox = await remote({ baseUrl: legacyUrl }).createSandbox({ id: "inst-legacy" });
+
+    expect(sandbox.cwd.startsWith("/"), "still gets an absolute cwd").toBe(true);
+    expect(sandbox.cwd).not.toBe("/");
+    expect((await sandbox.exec("true")).exitCode, "and the session works").toBe(0);
+    await sandbox.writeFile("ok.txt", "fallback");
+    expect(await sandbox.readFile("ok.txt")).toBe("fallback");
+  } finally {
+    legacy.close();
+  }
+});
+
+test("advertises its capabilities so version skew is visible at startup", async () => {
+  const health = await (await fetch(`${baseUrl}/health`)).json();
+  expect(health.ok).toBe(true);
+  // A control plane can compare this against what it needs, instead of
+  // discovering a stale image when a session fails mid-turn.
+  expect(health.capabilities, "health lists the routes this image serves").toContain("/workspace");
+  expect(health.capabilities).toContain("/exec");
 });
