@@ -523,6 +523,16 @@ loudly at startup.
 `/data` is the sandbox's volume: one directory per conversation (TTL-swept) plus
 build caches, so a repeat build doesn't re-download a toolchain.
 
+> **Two things this got wrong on the first deploy**, both worth knowing if you
+> touch this code. The sandbox cwd handed to `sandboxFromDriver` **must be
+> absolute** — Flue resolves tool paths as `p.startsWith("/") ? p : cwd + "/" + p`,
+> so a relative cwd makes `resolvePath(".")` normalise to `/`, and then every
+> `bash`/`read`/`grep`/`glob` call is rejected as escaping the workspace. The
+> factory therefore asks the container for its own workspace path rather than
+> guessing a layout the control plane cannot see. And `checkout_repo` must
+> clone **where execution happens**: cloning locally in a deployment running the
+> sandbox reported success at a path the agent's own shell could never reach.
+
 ### Tool policy
 
 Under Claude Code, the toolset arrived via the `claude_code` preset and had to be

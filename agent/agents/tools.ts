@@ -16,6 +16,7 @@
 import { defineTool } from "@flue/runtime";
 import * as v from "valibot";
 import { ensureRepo, parseRepoSpec } from "../session/repo.ts";
+import { ensureRepoInSandbox, remoteSandboxDriver } from "../session/remote-sandbox.ts";
 import { getSessionEnv, setCheckoutDir } from "./session-env.ts";
 
 /**
@@ -54,11 +55,29 @@ export function checkoutRepo(instanceId: string) {
         );
       }
       log.info(`Checking out ${spec.owner}/${spec.repo}…`);
-      const result = await ensureRepo(env.cwd, spec, { githubToken: token });
+
+      // Clone WHERE EXECUTION HAPPENS. This tool used to always clone locally,
+      // which was invisible to a deployment running the isolated sandbox: the
+      // clone reported success at a control-plane path the agent's own bash
+      // could never reach, and every subsequent tool call failed. The clone has
+      // to land in the same filesystem the shell runs in.
+      const result = env.remote
+        ? await ensureRepoInSandbox(
+            remoteSandboxDriver({
+              baseUrl: env.remote.baseUrl,
+              token: env.remote.token,
+              id: instanceId,
+              env: env.sandboxEnv,
+            }),
+            spec,
+            { githubToken: token },
+          )
+        : await ensureRepo(env.cwd, spec, { githubToken: token });
+
       log.info(result.cloned ? `Cloned into ${result.dir}` : `Reusing existing checkout at ${result.dir}`);
       // Root the NEXT turn inside the checkout, so Flue's own workspace
       // discovery (AGENTS.md, .agents/skills) sees the repo rather than the
-      // workspace directory it happens to sit in.
+      // directory it happens to sit in.
       setCheckoutDir(instanceId, result.dir);
       return { output: result };
     },

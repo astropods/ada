@@ -24,6 +24,7 @@
  *
  * Endpoints mirror the driver one-to-one:
  *   GET  /health
+ *   POST /workspace   {id}                                     -> {path}   (absolute)
  *   POST /exec        {id, command, cwd?, env?, timeoutMs?}  -> {stdout, stderr, exitCode}
  *   POST /read        {id, path}                             -> {content}        (utf8)
  *   POST /read-buffer {id, path}                             -> {base64}
@@ -147,6 +148,19 @@ async function readBody(req: IncomingMessage): Promise<Body> {
 /* -------------------------------------------------------------- handlers */
 
 const handlers: Record<string, (b: Body) => Promise<unknown>> = {
+  /**
+   * The instance's workspace as an ABSOLUTE path in this container.
+   *
+   * The control plane needs it because Flue resolves every tool path against
+   * the sandbox `cwd`, and treats that cwd as absolute — a relative one
+   * collapses to `/`, which this service then (correctly) rejects as an
+   * escape. It also keeps `pwd` inside a `bash` command agreeing with what the
+   * file tools see, which a chroot-style remapping of `/` would break.
+   */
+  async "/workspace"(b) {
+    return { path: workspaceOf(str(b, "id")) };
+  },
+
   async "/exec"(b) {
     const id = str(b, "id");
     const command = str(b, "command");

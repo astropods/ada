@@ -28,12 +28,15 @@ export interface SessionEnv {
   /** Writable workspace that is the sandbox cwd (repo checkout lives inside). */
   cwd: string;
   /**
-   * Set when execution is delegated to the isolated sandbox container. `cwd`
-   * here is relative to the instance's own workspace INSIDE that container —
-   * the control plane never sees its filesystem layout. Absent means the
-   * in-process `local()` sandbox, keyed on the absolute `cwd` above.
+   * Set when execution is delegated to the isolated sandbox container.
+   *
+   * `subdir` names a directory INSIDE the instance's workspace there (a repo
+   * checkout), or is absent for the workspace root. It is deliberately not a
+   * cwd: the control plane cannot see the container's filesystem layout, so
+   * the absolute path is resolved by asking the container at sandbox creation.
+   * Absent `remote` means the in-process `local()` sandbox, keyed on `cwd`.
    */
-  remote?: { baseUrl: string; token?: string; cwd: string };
+  remote?: { baseUrl: string; token?: string; subdir?: string };
   /** Scrubbed env for the local sandbox, incl. GH_TOKEN when connected. */
   sandboxEnv: Record<string, string | undefined>;
   /** Whether the GitHub App is provisioned on this deployment at all. */
@@ -60,7 +63,16 @@ const contexts = new Map<string, SessionEnv>();
  */
 const checkouts = new Map<string, string>();
 
-/** Record a checkout made mid-turn, so later turns start inside it. */
+/**
+ * Record a checkout made mid-turn, so later turns start inside it.
+ *
+ * NB the stored value means different things per mode, matching what each
+ * consumer needs: an ABSOLUTE control-plane path locally, and a path RELATIVE
+ * to the instance's sandbox workspace when execution is remote (the control
+ * plane cannot see that container's layout). Both come straight from the
+ * `ensureRepo*` that produced them, so they cannot be mixed up in practice —
+ * but read the runner's two call sites together before changing either.
+ */
 export function setCheckoutDir(instanceId: string, dir: string): void {
   checkouts.set(instanceId, dir);
 }

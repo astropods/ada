@@ -85,9 +85,15 @@ export function Ada({ id }: AgentProps) {
   // has connected — their GH_TOKEN, so `bash` → `env` cannot read the
   // container's AWS/database/gateway credentials.
   if (env.remote) {
-    useSandbox(remote({ baseUrl: env.remote.baseUrl, token: env.remote.token, env: env.sandboxEnv, cwd: env.remote.cwd }), {
-      cwd: env.remote.cwd,
-    });
+    // No `cwd` option here: the factory resolves the sandbox's own absolute
+    // workspace path and roots the sandbox there. Passing a second, relative
+    // cwd is what broke every tool with "path escapes the workspace: /".
+    useSandbox(remote({
+      baseUrl: env.remote.baseUrl,
+      token: env.remote.token,
+      env: env.sandboxEnv,
+      subdir: env.remote.subdir,
+    }));
   } else {
     useSandbox(local({ cwd: env.cwd, env: env.sandboxEnv }), { cwd: env.cwd });
   }

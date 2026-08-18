@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -155,4 +155,64 @@ test("selects remote only when the platform injects a sandbox host", () => {
   expect(sandboxHost({})).toBeNull();
   expect(sandboxHost({ KNOWLEDGE_SANDBOX_HOST: "sandbox" })).toBe("http://sandbox:3000");
   expect(sandboxHost({ KNOWLEDGE_SANDBOX_HOST: "sandbox", KNOWLEDGE_SANDBOX_PORT: "9000" })).toBe("http://sandbox:9000");
+});
+
+/* ---------------- the sandbox as Flue actually uses it ---------------- */
+
+/**
+ * Everything above drives the driver directly. These go through
+ * `remote().createSandbox()` — the path `useSandbox()` takes — because a bug
+ * shipped that only existed in that layer.
+ *
+ * The factory passed a RELATIVE cwd ("." or a repo name) to
+ * `sandboxFromDriver`. Flue resolves tool paths as
+ * `p.startsWith("/") ? p : cwd + "/" + p` and normalises the result, so a
+ * relative cwd makes `resolvePath(".")` collapse to `/`. Every `bash`, `read`,
+ * `grep` and `glob` then arrived here as `/` and was rejected — correctly — as
+ * escaping the workspace. A deployed session could not run `true`, let alone
+ * reach its own checkout.
+ */
+
+test("roots the sandbox at an absolute workspace path", async () => {
+  const { remote } = await import("../agent/session/remote-sandbox.ts");
+  const sandbox = await remote({ baseUrl }).createSandbox({ id: "inst-cwd" });
+
+  // The regression guard: a relative cwd normalises to "/" here.
+  expect(sandbox.cwd.startsWith("/"), `cwd must be absolute, got ${sandbox.cwd}`).toBe(true);
+  expect(sandbox.cwd).not.toBe("/");
+
+  // The exact commands the deployed session could not run.
+  const trivial = await sandbox.exec("true");
+  expect(trivial.exitCode, "`true` must run").toBe(0);
+  // `pwd -P` and realpath on both sides: macOS resolves /var -> /private/var,
+  // which would fail a string compare for a reason that does not exist in the
+  // Linux container. The property under test is that the shell and the file
+  // tools agree on the directory, not on its spelling.
+  const pwd = await sandbox.exec("pwd -P");
+  expect(pwd.stdout.trim(), "the shell agrees with the sandbox cwd").toBe(realpathSync(sandbox.cwd));
+
+  // …and relative paths resolve inside the workspace rather than at /.
+  await sandbox.writeFile("a.txt", "content");
+  expect(await sandbox.readFile("a.txt")).toBe("content");
+});
+
+test("roots the sandbox inside a checkout when one is named", async () => {
+  const { remote, remoteSandboxDriver } = await import("../agent/session/remote-sandbox.ts");
+  const driver = remoteSandboxDriver({ baseUrl, id: "inst-sub" });
+  await driver.mkdir("astro", { recursive: true });
+  await driver.writeFile("astro/agents.md", "# rules");
+
+  const sandbox = await remote({ baseUrl, subdir: "astro" }).createSandbox({ id: "inst-sub" });
+  expect(sandbox.cwd.endsWith("/astro")).toBe(true);
+  // A bare filename must resolve inside the checkout — this is what makes
+  // Flue's own AGENTS.md discovery find the project's conventions.
+  expect(await sandbox.readFile("agents.md")).toBe("# rules");
+});
+
+test("reports the instance's absolute workspace path", async () => {
+  const { remoteSandboxDriver } = await import("../agent/session/remote-sandbox.ts");
+  const a = await remoteSandboxDriver({ baseUrl, id: "inst-ws-a" }).workspacePath();
+  const b = await remoteSandboxDriver({ baseUrl, id: "inst-ws-b" }).workspacePath();
+  expect(a.startsWith("/")).toBe(true);
+  expect(a, "each instance gets its own directory").not.toBe(b);
 });

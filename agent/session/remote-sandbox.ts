@@ -140,6 +140,11 @@ class RemoteSandboxDriver implements SandboxDriver {
   async rm(path: string, options: { recursive?: boolean; force?: boolean } = {}): Promise<void> {
     await this.call("/rm", { path, ...options });
   }
+
+  /** The instance's workspace as an absolute path inside the sandbox container. */
+  async workspacePath(): Promise<string> {
+    return (await this.call<{ path: string }>("/workspace", {})).path;
+  }
 }
 
 function stripUndefined(env: Record<string, string | undefined>): Record<string, string> {
@@ -147,22 +152,35 @@ function stripUndefined(env: Record<string, string | undefined>): Record<string,
 }
 
 /** A driver for one instance — also used directly by the runner to clone repos. */
-export function remoteSandboxDriver(opts: RemoteSandboxOptions): SandboxDriver {
+export function remoteSandboxDriver(opts: RemoteSandboxOptions): SandboxDriver & {
+  workspacePath(): Promise<string>;
+} {
   return new RemoteSandboxDriver(opts);
 }
 
 /**
  * A `SandboxFactory` backed by the execution container, for `useSandbox()`.
  *
- * `cwd` is relative to the instance's own workspace inside the container, which
- * is why it defaults to `.` rather than an absolute host path — the control
- * plane never sees the sandbox's filesystem layout.
+ * `subdir` names a directory inside the instance's workspace (a repo checkout);
+ * omit it to sit at the workspace root.
+ *
+ * The cwd handed to `sandboxFromDriver` MUST be absolute. Flue resolves every
+ * tool path against it with `p.startsWith("/") ? p : cwd + "/" + p`, so a
+ * relative cwd makes `resolvePath(".")` normalise to `/` — and then every
+ * `bash`, `read`, `grep`, and `glob` call arrives at the service as `/` and is
+ * rejected as escaping the workspace. That shipped, and it made a session
+ * completely unable to touch its own checkout. Hence the round-trip to ask the
+ * container where the workspace actually is, rather than guessing a layout the
+ * control plane cannot see.
  */
-export function remote(opts: Omit<RemoteSandboxOptions, "id"> & { cwd?: string }): SandboxFactory {
+export function remote(
+  opts: Omit<RemoteSandboxOptions, "id"> & { subdir?: string },
+): SandboxFactory {
   return {
     async createSandbox({ id }): Promise<Sandbox> {
       const driver = remoteSandboxDriver({ ...opts, id });
-      const cwd = opts.cwd ?? ".";
+      const base = await driver.workspacePath();
+      const cwd = opts.subdir ? `${base}/${opts.subdir}` : base;
       // Make sure the working directory exists before the first tool call, so
       // a fresh conversation doesn't fail its first `ls`.
       await driver.mkdir(cwd, { recursive: true });

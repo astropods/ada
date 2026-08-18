@@ -233,12 +233,16 @@ export class SessionRunner {
       // Isolated execution: the checkout lives in the sandbox container, and
       // every path the agent sees is relative to its own workspace there.
       const token = process.env.SANDBOX_TOKEN;
-      let remoteCwd = ".";
+      let subdir: string | undefined;
       if (opts.repo) {
         const driver = remoteSandboxDriver({ baseUrl, id: instanceId, token, env: sandboxEnv({ githubToken }) });
-        remoteCwd = (await ensureRepoInSandbox(driver, opts.repo, { githubToken })).dir;
+        subdir = (await ensureRepoInSandbox(driver, opts.repo, { githubToken })).dir;
+      } else {
+        // A repo the agent cloned itself on an earlier turn, so the next turn
+        // is rooted inside it and Flue's AGENTS.md discovery sees the project.
+        subdir = getCheckoutDir(instanceId);
       }
-      remote = { baseUrl, token, cwd: remoteCwd };
+      remote = { baseUrl, token, subdir };
     } else if (opts.repo) {
       sandboxCwd = (await ensureRepo(cwd, opts.repo, { githubToken })).dir;
     } else {

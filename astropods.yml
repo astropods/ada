@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://astropods.ai/schema/package.json
 spec: package/v1
-name: ada-your-personal-coding-agent
+name: ada-flue
 
 agent:
   build:
@@ -20,12 +20,16 @@ agent:
     # astro-server) — this agent needs NO Slack tokens. frontend + messaging
     # coexist: our UI on its hostname, Slack/web on the sidecar's routes.
     messaging: true
-  # Route model calls through the Astro AI Gateway instead of a personal key.
-  # Injects ASTRO_GATEWAY_URL + ASTRO_GATEWAY_API_KEY (virtual key). config/model.ts
-  # maps these to the gateway's /anthropic endpoint (→ Bedrock). Opt out per-deploy
-  # by setting the optional ANTHROPIC_API_KEY input below — that bypasses the
-  # gateway and calls Anthropic directly.
-  astro_ai_gateway: true
+
+
+# Route model calls through the Astro AI Gateway instead of a personal key.
+# Injects ASTRO_GATEWAY_URL + ASTRO_GATEWAY_API_KEY (virtual key). config/model.ts
+# maps these to the gateway's /anthropic endpoint (→ Bedrock). Opt out per-deploy
+# by setting the optional ANTHROPIC_API_KEY input below — that bypasses the
+# gateway and calls Anthropic directly.
+models:
+  default:
+    provider: gateway
 
 inputs:
   # GitHub App provisioning is web-driven. List the email addresses allowed to
