@@ -53,6 +53,8 @@ import { startWorkspaceGc } from "./session/workspace.ts";
 import { installTelemetry } from "./telemetry/otel.ts";
 import { InMemoryResultStore } from "./persistence/results.ts";
 import { createStore, type Store } from "./store/index.ts";
+import { persistenceMode } from "./db.ts";
+import { describePg } from "./store/pg-config.ts";
 import { authorizeUrl, exchangeCode, listConnectedRepos } from "./auth/github-app.ts";
 import { githubConfigured, getAppCreds, saveAppCreds, loadAppCreds } from "./auth/app-config.ts";
 import {
@@ -117,6 +119,11 @@ function boot(): Promise<void> {
     runner.start();
 
     console.log(`[ada] ${describeAuth()}`);
+    console.log(
+      persistenceMode() === "postgres"
+        ? `[ada] conversations: postgres ${describePg()} — durable across restarts`
+        : "[ada] conversations: sqlite — NOT durable across a restart unless WORKSPACE_ROOT is a volume",
+    );
     console.log(
       `[ada] github: ${
         githubConfigured()

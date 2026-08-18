@@ -6,6 +6,7 @@
  */
 
 import type { GithubTokenRecord, Store } from "./store.ts";
+import { pgConfig } from "./pg-config.ts";
 
 export class PostgresStore implements Store {
   private readonly env: NodeJS.ProcessEnv;
@@ -21,14 +22,10 @@ export class PostgresStore implements Store {
     const pg = (await import("pg")).default as unknown as {
       Pool: new (cfg: Record<string, unknown>) => PostgresStore["pool"];
     };
-    const e = this.env;
-    this.pool = new pg.Pool({
-      host: e.POSTGRES_HOST ?? e.KNOWLEDGE_DB_HOST,
-      port: Number(e.POSTGRES_PORT ?? e.KNOWLEDGE_DB_PORT ?? 5432),
-      user: e.POSTGRES_USER,
-      password: e.POSTGRES_PASSWORD,
-      database: e.POSTGRES_DB ?? e.POSTGRES_USER,
-    });
+    // Same settings as Flue's persistence adapter (agent/db.ts), read once in
+    // pg-config.ts so a deployment cannot end up with one connected and the
+    // other silently on a fallback.
+    this.pool = new pg.Pool(pgConfig(this.env) as unknown as Record<string, unknown>);
     await this.q(`CREATE TABLE IF NOT EXISTS github_tokens (
       user_key text PRIMARY KEY,
       access_token text NOT NULL,

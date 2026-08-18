@@ -553,6 +553,43 @@ deployment on explicit config. For a non-loopback dev origin, set
 > repair it — the URLs live on the GitHub App. Either edit them in the App's
 > settings on GitHub, or delete the App and run setup again.
 
+## Durable conversations
+
+Flue keys an instance's message history, submission log, and settled replies off
+the instance id, which is what makes a follow-up turn work at all — it replaced
+the old `claudeSessionIds` map and the `--resume` flag it fed.
+
+`agent/db.ts` picks the backend:
+
+| | |
+|---|---|
+| **Deployed** | **Postgres**, via `@flue/postgres` — conversations survive a restart or redeploy |
+| **Local** | SQLite under `WORKSPACE_ROOT` (or `ADA_DB_PATH`), so `flue run` and `node agent/index.ts` need no database |
+
+The adapter owns its schema: seven `flue_`-prefixed tables created and
+version-checked by `migrate()`, which the runtime calls at startup. Nothing in
+this repo writes DDL for it. They share the platform Postgres with Ada's own
+`github_tokens` and `kv` tables — the prefixes don't collide, and both read
+their connection settings from `agent/store/pg-config.ts` so a deployment can't
+end up with one connected and the other silently on a fallback.
+
+The driver is ours on purpose: `@flue/postgres` takes a runner rather than
+bundling a client, so pooling, TLS, and timeouts stay under this project's
+control. The runner's `transaction` runs on a single pooled connection, because
+the adapter's fence algorithm depends on row locks that don't hold across
+connections.
+
+> **Startup tells you which you got.** `[ada] conversations: postgres … —
+> durable across restarts`, or an explicit warning that SQLite is not. Choosing
+> SQLite when a database was injected is silent data loss, so it is asserted in
+> `test/persistence.spec.ts` and logged at boot.
+
+The restart itself is tested against a real Postgres — a mocked driver would
+only prove the mock works. That test is opt-in (`ADA_TEST_POSTGRES_HOST`) with
+the docker one-liner in the file; it dispatches a turn, throws the runtime and
+adapter away, starts fresh, and asserts the earlier turn is replayed to the
+model.
+
 ## Model routing & auth
 
 All of "which model, which credentials, what does a token cost" lives in
@@ -706,21 +743,13 @@ agents.
 
 ## Limitations
 
-- **Conversation history does not survive a restart or redeploy.** Flue's
-  conversation database (`agent/db.ts`, SQLite) and the sandbox workspaces live
-  on the container filesystem. An Astropods `volume:` can only attach to a
-  knowledge *container*, and the out-of-process sandbox that used to provide one
-  is gone — so a resumed Slack thread re-clones its repo and starts a fresh
-  conversation. GitHub tokens and repo bindings are unaffected (Postgres). The
-  durable fix is a Postgres-backed Flue `PersistenceAdapter`
-  (`defineSqlConversationStreamStore` in `@flue/runtime/adapter`).
+- Running locally without a database, conversations live in SQLite under
+  `WORKSPACE_ROOT` and do not survive a restart. Deployed, they are in Postgres
+  and do (see "Durable conversations").
 - The AG-UI event log is in memory with no GC yet. (The OAuth CSRF state is no
   longer among these — it is a signed, self-contained token now.)
 
 ## Next steps
-- **Postgres `PersistenceAdapter`** so conversations survive a restart — the
-  single biggest gap, and the one that also restores "resume a Slack thread days
-  later".
 - Registry durability: cap/spool the event log, GC terminated sessions.
 - Harden auth: sign the `bridge_uid` cookie, GC OAuth CSRF state, encrypt tokens
   at rest.

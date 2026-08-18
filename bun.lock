@@ -9,6 +9,7 @@
         "@earendil-works/pi-ai": "0.83.0",
         "@flue/cli": "2.0.3",
         "@flue/opentelemetry": "2.0.3",
+        "@flue/postgres": "2.0.3",
         "@flue/runtime": "2.0.3",
         "@flue/vite": "2.0.3",
         "@hono/node-server": "^2.1.1",
@@ -202,6 +203,8 @@
     "@flue/cli": ["@flue/cli@2.0.3", "", { "dependencies": { "@flue/runtime": "2.0.3", "@flue/vite": "2.0.3", "@vercel/detect-agent": "^1.2.3", "cac": "^7.0.0", "minisearch": "^7.2.0", "picocolors": "^1.1.1", "prompts": "^2.4.2", "ulidx": "^2.4.1", "vite": "^8.1.2" }, "bin": { "flue": "bin/flue.mjs" } }, "sha512-cRyj3xbDKZE5hC38jnLypf04k4rXSLBDgwl5V8SNpmaZyv40LJh+yYXBG22gd+nL63nF7hSeTs3XpMLz+2qxpw=="],
 
     "@flue/opentelemetry": ["@flue/opentelemetry@2.0.3", "", { "peerDependencies": { "@flue/runtime": "^2.0.3", "@opentelemetry/api": "^1.9.0" } }, "sha512-3PUKt9e6yOOdOGpcYwMTlgufSQ/6RT7bnNZdCMu9ZVJNHNp6in2dPlqggq2zy+DsbF1UZvhyyHlrX8uu+EDdBQ=="],
+
+    "@flue/postgres": ["@flue/postgres@2.0.3", "", { "dependencies": { "@flue/runtime": "2.0.3" } }, "sha512-0Wt4DZMb9jRdp7+TbBtfZMlqRFy74tTacbTlWHt6OWCBEYo+MwVRxbiAcVnJlfBWMVhGAgvogkK4O1l8cJ5HjQ=="],
 
     "@flue/runtime": ["@flue/runtime@2.0.3", "", { "dependencies": { "@earendil-works/pi-agent-core": "^0.83.0", "@earendil-works/pi-ai": "^0.83.0", "@hono/node-server": "^2.0.3", "@modelcontextprotocol/client": "2.0.0", "@valibot/to-json-schema": "^1.3.0", "hono": "^4.8.3", "js-yaml": "^5.2.1", "ulidx": "^2.4.1", "valibot": "^1.1.0" } }, "sha512-RfWyZG9x2hlDb1264XTESX42tzzG3AA8er3XjaTIxIMh28pTD91zKd9Jh6PFXKeTkZegLsGiJKDxmiCddlyeug=="],
 

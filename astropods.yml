@@ -101,10 +101,17 @@ inputs:
     options: ["false", "true"]
 
 knowledge:
-  # Durable store for per-user GitHub OAuth tokens (access + refresh + expiry)
-  # and other per-interaction state. Platform-managed Postgres injects
-  # POSTGRES_HOST/PORT/USER/PASSWORD/DB. (If provider-mode injection misbehaves,
-  # fall back to container mode — see the migrate-to-astropods notes.)
+  # Platform-managed Postgres, injecting POSTGRES_HOST/PORT/USER/PASSWORD/DB.
+  # Two consumers share it:
+  #   - Ada's own Store: per-user GitHub OAuth tokens, App credentials, repo
+  #     bindings, the HMAC signing secret (`github_tokens`, `kv`).
+  #   - Flue's conversation persistence via @flue/postgres (`flue_*`), which is
+  #     what makes a conversation survive a restart or redeploy. It owns its
+  #     schema; agent/db.ts only supplies the driver.
+  # The prefixes do not collide and both read agent/store/pg-config.ts, so the
+  # two cannot end up pointed at different databases.
+  # (If provider-mode injection misbehaves, fall back to container mode — see
+  # the migrate-to-astropods notes.)
   ada-db:
     provider: postgres
   # Isolated execution sandbox — where the model's commands actually run.

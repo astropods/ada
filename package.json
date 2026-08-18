@@ -21,6 +21,7 @@
     "@earendil-works/pi-ai": "0.83.0",
     "@flue/cli": "2.0.3",
     "@flue/opentelemetry": "2.0.3",
+    "@flue/postgres": "2.0.3",
     "@flue/runtime": "2.0.3",
     "@flue/vite": "2.0.3",
     "@hono/node-server": "^2.1.1",

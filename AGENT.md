@@ -4,7 +4,7 @@ tags: [ada, flue, ag-ui, sse, slack, github, coding-agent]
 capabilities:
   - "Runs a Flue 2.0 agent loop in-process — no CLI child, no stream-json contract"
   - "Secure by default: always-on principles, on-demand security playbooks, and enforced diff gates"
-  - "Holds multi-turn conversations; Flue keeps the history durably per instance id"
+  - "Holds multi-turn conversations, durable in Postgres across restarts and redeploys"
   - "Runs the model's commands in a separate, secret-less sandbox container"
   - "Isolates each session in its own writable workspace"
   - "Scrubs the sandbox env so tools can't read host secrets (AWS/DB/gateway)"
@@ -134,10 +134,8 @@ never loop.
   sandbox that used to provide one is gone; the durable fix is a
   Postgres-backed Flue `PersistenceAdapter`. GitHub tokens and repo bindings
   are unaffected (those are in Postgres).
-- Conversation history still lives in SQLite on the control-plane container,
-  so it does not survive a restart even though repo checkouts now do (they are
-  on the sandbox volume). The durable fix remains a Postgres-backed Flue
-  `PersistenceAdapter`.
+- Locally, with no database, conversations are in SQLite and do not survive a
+  restart. Deployed they are in Postgres and do.
 - The AG-UI event log is in memory with no GC yet. (The OAuth CSRF state is no
   longer among these — it is a signed, self-contained token now.)
 - One turn runs at a time per session — an overlapping follow-up gets `409 busy`.
