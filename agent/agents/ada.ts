@@ -42,6 +42,7 @@ import { getSessionEnv } from "./session-env.ts";
 import { checkoutRepo } from "./tools.ts";
 import { registerProviders } from "../config/model.ts";
 import { githubPromptGuidance } from "../github-guidance.ts";
+import { injectRepoRules } from "./repo-rules.ts";
 import { SECURITY_PRINCIPLES } from "./security/principles.ts";
 import { SECURITY_SKILLS } from "./security/skills.ts";
 import { captureBaseline, runSecurityGates } from "./security/gates.ts";
@@ -139,6 +140,11 @@ export function Ada({ id }: AgentProps) {
   // see work the agent has already committed — not just the working tree.
   useAgentStart(async (ctx) => {
     await captureBaseline(id, ctx);
+    // Put the repository's own conventions in front of the model before it
+    // plans. Flue reads AGENTS.md/CLAUDE.md from the sandbox cwd itself; this
+    // covers what that misses — a checkout in a subdirectory, and filenames
+    // whose casing differs from the two literals it looks for.
+    await injectRepoRules(ctx);
   });
 
   // The gate closes over the CURRENT render's flag, so turning review off takes

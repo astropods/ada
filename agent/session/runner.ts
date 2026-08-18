@@ -23,7 +23,7 @@
 import { randomUUID } from "node:crypto";
 import { init, observe, type FlueEvent } from "@flue/runtime";
 import { Ada } from "../agents/ada.ts";
-import { clearSessionEnv, setSessionEnv } from "../agents/session-env.ts";
+import { clearSessionEnv, getCheckoutDir, setSessionEnv } from "../agents/session-env.ts";
 import { clearGateState } from "../agents/security/gates.ts";
 import { Translator } from "../translate/translator.ts";
 import { SessionRegistry, type SessionMeta } from "./registry.ts";
@@ -212,9 +212,17 @@ export class SessionRunner {
 
     // Clone the bound repo (if any) before the model sees the workspace, so the
     // checkout is simply "already there" rather than a first-turn tool call.
+    // Root the sandbox at the repo whenever we know one: bound up front with
+    // `work on`, or cloned by the agent on an earlier turn. Rooting at the
+    // workspace instead leaves the repo one level down, where Flue's workspace
+    // discovery does not look — which is how a session ends up never seeing the
+    // project's AGENTS.md.
     let sandboxCwd = cwd;
     if (opts.repo) {
       sandboxCwd = (await ensureRepo(cwd, opts.repo, { githubToken })).dir;
+    } else {
+      const checkout = getCheckoutDir(instanceId);
+      if (checkout) sandboxCwd = ensureWorkspace(checkout);
     }
 
     setSessionEnv(instanceId, {

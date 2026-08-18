@@ -248,6 +248,7 @@ layers, and the layering is the design — each does something the others can't.
 | **Principles** | `security/principles.ts` → `useInstruction()` | every turn | Suggests. Five rules that apply to nearly every change |
 | **Skills** | `security/skills.ts` → `useSkill()` | one catalog line until activated | Informs. Detailed playbooks, loaded only when relevant |
 | **Gates** | `security/gates.ts` → `useAgentFinish()` | per stop-point | **Enforces.** Reads the real diff and sends the model back |
+| **Repo rules** | `repo-rules.ts` → `useAgentStart()` | per turn | The project's own conventions, which override Ada's defaults |
 
 **Why not just a bigger system prompt?** Because a twenty-point security
 checklist in the prompt does not make the agent twenty points safer — it makes
@@ -296,7 +297,35 @@ Three properties worth knowing, all covered by `test/security-gates.spec.ts`:
   apply rather than demanding compliance, because they're heuristics over paths
   and diff text and will sometimes misfire.
 
-### The reviewer (layer four)
+### Repository conventions
+
+Ada reads the project's own rules before it plans. Flue does some of this
+itself — `readAgentsMd` pulls `AGENTS.md` and `CLAUDE.md` from the sandbox cwd
+into the system prompt — but two assumptions in that broke against a real repo,
+and Ada opened a PR with no changelog because it had never seen the rule
+requiring one:
+
+- **The working directory.** Flue reads from the sandbox cwd. Ada only rooted
+  that at the checkout when a thread was bound with `work on owner/repo`; when
+  the model cloned the repo itself, cwd stayed at the workspace root with the
+  checkout one level below, where discovery does not look. Fixed on both ends:
+  `checkout_repo` now records the directory so the next turn is rooted inside
+  it, **and** the rules are found regardless of depth.
+- **The filename.** The lookup is two exact, case-sensitive literals. The repo
+  in question ships lowercase `agents.md` and only survived because `CLAUDE.md`
+  happens to be a symlink to it. Watch for this locally: macOS is
+  case-insensitive, so a lowercase rules file resolves on a laptop and vanishes
+  in the Linux container.
+
+`agents/repo-rules.ts` runs at `useAgentStart`, searches the cwd and any git
+checkout one level below it, matches `AGENTS.md`/`AGENT.md`/`CLAUDE.md`/
+`CONVENTIONS.md` case-insensitively, and injects what Flue would have missed as
+a signal stating that repo rules **override** Ada's defaults. It skips anything
+already in the system prompt, dedupes a symlinked duplicate *within* a directory
+(not across them — that silently dropped a sibling repo sharing a preamble), and
+says so explicitly rather than truncating a long rulebook in silence.
+
+### The reviewer (layer five)
 
 Gates are heuristics over paths and diff text; they can tell you a route changed
 with no test touched, but not that the test you added mocks the thing under test

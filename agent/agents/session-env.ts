@@ -41,6 +41,28 @@ export interface SessionEnv {
 
 const contexts = new Map<string, SessionEnv>();
 
+/**
+ * Repo directories cloned DURING a turn, by instance.
+ *
+ * The sandbox cwd is fixed when a submission starts, so a repo the model clones
+ * mid-turn cannot re-root the turn that cloned it. Recording it here lets the
+ * runner root the NEXT turn at the checkout, which is what makes Flue's own
+ * AGENTS.md/skills discovery work for repos that were not bound up front with
+ * `work on`. Process-local and best-effort: losing it just means the next turn
+ * starts at the workspace root again.
+ */
+const checkouts = new Map<string, string>();
+
+/** Record a checkout made mid-turn, so later turns start inside it. */
+export function setCheckoutDir(instanceId: string, dir: string): void {
+  checkouts.set(instanceId, dir);
+}
+
+/** The most recent mid-turn checkout for an instance, if any. */
+export function getCheckoutDir(instanceId: string): string | undefined {
+  return checkouts.get(instanceId);
+}
+
 /** Publish the context an instance's next render will read. Call before dispatch. */
 export function setSessionEnv(instanceId: string, env: SessionEnv): void {
   contexts.set(instanceId, env);
@@ -61,6 +83,7 @@ export function getSessionEnv(instanceId: string): SessionEnv {
 
 export function clearSessionEnv(instanceId: string): void {
   contexts.delete(instanceId);
+  checkouts.delete(instanceId);
 }
 
 /** Recovery-path context: no token, no repo, cwd is the process cwd. */

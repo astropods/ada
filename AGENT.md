@@ -104,7 +104,13 @@ always-on principles, seven security playbooks loaded on demand as Flue skills
 secrets, agent integrity), and enforcement gates that read the real diff at
 every would-stop point and send the model back when a default was missed.
 
-A fourth layer runs on substantive changes: an independent `code-reviewer`
+Before planning, Ada also reads the repository's own conventions
+(`AGENTS.md`/`AGENT.md`/`CLAUDE.md`/`CONVENTIONS.md`, matched case-insensitively
+in the working directory or a checkout one level below it) and treats them as
+overriding its own defaults — so project rules like "every PR needs a changelog
+file" are followed rather than discovered by CI.
+
+A further layer runs on substantive changes: an independent `code-reviewer`
 subagent whose lenses are ported from Cruise Line (test quality, error handling,
 API contract, concurrency). It reviews with fresh context — an agent re-reading
 its own work has already convinced itself — and its critical/high findings send

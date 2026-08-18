@@ -16,7 +16,7 @@
 import { defineTool } from "@flue/runtime";
 import * as v from "valibot";
 import { ensureRepo, parseRepoSpec } from "../session/repo.ts";
-import { getSessionEnv } from "./session-env.ts";
+import { getSessionEnv, setCheckoutDir } from "./session-env.ts";
 
 /**
  * Clone (or reuse) a GitHub repository into the session's workspace, using the
@@ -56,6 +56,10 @@ export function checkoutRepo(instanceId: string) {
       log.info(`Checking out ${spec.owner}/${spec.repo}…`);
       const result = await ensureRepo(env.cwd, spec, { githubToken: token });
       log.info(result.cloned ? `Cloned into ${result.dir}` : `Reusing existing checkout at ${result.dir}`);
+      // Root the NEXT turn inside the checkout, so Flue's own workspace
+      // discovery (AGENTS.md, .agents/skills) sees the repo rather than the
+      // workspace directory it happens to sit in.
+      setCheckoutDir(instanceId, result.dir);
       return { output: result };
     },
   });
