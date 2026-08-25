@@ -13,8 +13,6 @@
  * the single basis, direct or gateway.
  */
 
-import { appendFile } from "node:fs/promises";
-
 export interface RunUsage {
   inputTokens: number;
   outputTokens: number;
@@ -96,12 +94,3 @@ export class InMemoryResultStore implements ResultStore {
   }
 }
 
-export class JsonlFileResultStore implements ResultStore {
-  private readonly path: string;
-  constructor(path: string) {
-    this.path = path;
-  }
-  async save(record: RunRecord): Promise<void> {
-    await appendFile(this.path, JSON.stringify(record) + "\n", "utf8");
-  }
-}

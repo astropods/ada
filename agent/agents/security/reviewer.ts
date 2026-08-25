@@ -117,22 +117,34 @@ Severity is a promise to the reader, so mean it:
 - \`low\` — minor improvement.
 
 If the changes are sound, say so and return no findings. An empty review is a
-valid and useful result — do not invent findings to look thorough.`;
+valid and useful result — do not invent findings to look thorough.
 
-export const FINDING_SCHEMA = v.object({
-  findings: v.array(
-    v.object({
-      title: v.pipe(v.string(), v.description("Specific, not generic. 'Race in session cleanup timer', not 'potential issue'.")),
-      severity: v.picklist(["critical", "high", "medium", "low"]),
-      category: v.picklist(["correctness", "security", "maintainability", "performance", "tests"]),
-      file: v.pipe(v.string(), v.description("Repo-relative path the finding is in.")),
-      line: v.pipe(v.optional(v.number()), v.description("1-indexed line in the current version of the file.")),
-      detail: v.pipe(v.string(), v.description("What breaks, and under what concrete input or state.")),
-      suggestion: v.pipe(v.optional(v.string()), v.description("What the fix looks like. Worth more than a paragraph of explanation.")),
-    }),
-  ),
-  summary: v.pipe(v.string(), v.description("One or two sentences on the overall state of the change.")),
-});
+## Machine-readable summary
+
+Write your review for a human first. Then END your reply with a fenced \`json\`
+block, so the outcome can be counted without parsing prose:
+
+\`\`\`json
+{"findings":[{"severity":"high","category":"tests","title":"Ownership test asserts nothing"}]}
+\`\`\`
+
+Use \`{"findings":[]}\` when you found nothing. One entry per finding, severity
+and category exactly as named above. This block is telemetry, not the review —
+never let it replace the explanation.`;
+
+/**
+ * The shape of the JSON tail the brief asks for, mirrored in telemetry/otel.ts.
+ *
+ * Deliberately NOT a valibot schema. `defineSubagent` takes no output schema —
+ * a delegate's contract is its task result as text — so a schema here would be
+ * validation that never runs. An earlier version shipped exactly that, and the
+ * `ada.review.findings` metric silently counted nothing as a result.
+ */
+export interface ReviewFinding {
+  severity: "critical" | "high" | "medium" | "low";
+  category: "correctness" | "security" | "maintainability" | "performance" | "tests";
+  title: string;
+}
 
 /**
  * The delegate's agent function.

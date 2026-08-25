@@ -49,20 +49,31 @@ interface ReviewResult {
 /**
  * Pull findings out of a reviewer task result.
  *
- * The delegate returns structured output, but a `task` result crosses the
- * boundary as an opaque value and may arrive as the JSON text the model
- * produced rather than a parsed object — so handle both and never throw. A
- * telemetry parse failure must not fail the run.
+ * A delegate's contract is its task result as TEXT — `defineSubagent` takes no
+ * output schema — so the reviewer writes prose for a human and ends with a
+ * fenced `json` block for counting (see the brief in security/reviewer.ts). An
+ * earlier version parsed the whole result as JSON, which prose never satisfies,
+ * so this metric silently counted nothing.
+ *
+ * Tolerant by design: a model that omits or malforms the block costs us a data
+ * point, never a run.
+ *
+ * Exported for tests: it is the one piece of parsing here that can silently
+ * stop working, which is exactly what happened to its predecessor.
  */
-function parseReview(result: unknown): ReviewResult | null {
-  if (result && typeof result === "object") return result as ReviewResult;
-  if (typeof result === "string") {
-    try {
-      const parsed = JSON.parse(result) as unknown;
-      if (parsed && typeof parsed === "object") return parsed as ReviewResult;
-    } catch {
-      /* not JSON — nothing to count */
-    }
+export function parseReview(result: unknown): ReviewResult | null {
+  if (result && typeof result === "object" && "findings" in result) return result as ReviewResult;
+  if (typeof result !== "string") return null;
+
+  // Last fenced json block, so a block quoted earlier in the prose loses to the
+  // real summary at the end.
+  const blocks = [...result.matchAll(/```json\s*([\s\S]*?)```/g)];
+  const candidate = blocks.length > 0 ? blocks[blocks.length - 1][1] : result;
+  try {
+    const parsed = JSON.parse(candidate.trim()) as unknown;
+    if (parsed && typeof parsed === "object") return parsed as ReviewResult;
+  } catch {
+    /* no usable block — nothing to count */
   }
   return null;
 }
