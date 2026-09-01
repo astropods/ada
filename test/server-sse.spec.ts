@@ -64,4 +64,26 @@ test("POST /test/seed returns a finished, replayable session", async ({ request 
   const seed = await res.json();
   expect(seed.sessionId).toMatch(/^sess_seed_/);
   expect(seed.lastSeq).toBe(23); // the recorded fixture yields 23 AG-UI events
+
+  /**
+   * FINISHED means the AG-UI run is CLOSED, not just that the fixture ran out.
+   *
+   * The count alone used to be the whole assertion, and it drifted to 22
+   * without anyone being able to tell whether the translator had regressed or
+   * the recording was incomplete. It was the recording: the fixture ended at
+   * `agent_end` with no `submission_settled`, and `agent_end` deliberately does
+   * NOT end the run (a useAgentFinish gate may send the model straight back).
+   * So the seeded run stayed open and a client replaying it would wait forever
+   * for a terminal event.
+   *
+   * Asserting the terminal event is what makes the number meaningful, so this
+   * pins the property and lets the count stay as a cheap tripwire.
+   */
+  const replay = await collectSse(`/sessions/${seed.sessionId}/events`, {});
+  expect(replay, "the run must be closed, not merely out of events").toContain("RUN_FINISHED");
+  expect(replay).not.toContain("RUN_ERROR");
+  // …and it must be LAST: a terminal event mid-stream would mean the run closed
+  // early and the rest of the turn streamed into a run the client had ended.
+  const types = [...replay.matchAll(/"type":"(RUN_\w+)"/g)].map((m) => m[1]);
+  expect(types).toEqual(["RUN_STARTED", "RUN_FINISHED"]);
 });

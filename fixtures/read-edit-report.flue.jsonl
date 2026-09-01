@@ -18,3 +18,4 @@
 {"v":3,"eventIndex":17,"timestamp":"2026-01-01T00:00:01.700Z","instanceId":"fixture","type":"text_delta","text":"Done — retries is now 5."}
 {"v":3,"eventIndex":18,"timestamp":"2026-01-01T00:00:01.800Z","instanceId":"fixture","type":"message_end","turnId":"turn_3","message":{"id":"msg_3","role":"assistant"}}
 {"v":3,"eventIndex":19,"timestamp":"2026-01-01T00:00:01.900Z","instanceId":"fixture","type":"agent_end","messages":[]}
+{"v": 3, "eventIndex": 20, "timestamp": "2026-01-01T00:00:02.000Z", "instanceId": "fixture", "submissionId": "sub_fixture", "type": "submission_settled", "outcome": "completed"}
