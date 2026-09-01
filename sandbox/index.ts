@@ -41,9 +41,9 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -57,8 +57,67 @@ const ROOT = resolve(process.env.WORKSPACE_ROOT ?? "/data");
 const TOKEN = process.env.SANDBOX_TOKEN ?? "";
 /** Hard ceiling on a single command, independent of what the caller asks for. */
 const MAX_TIMEOUT_MS = Number(process.env.SANDBOX_MAX_TIMEOUT_MS ?? 15 * 60 * 1000);
-/** Cap on captured output, so one runaway command can't exhaust memory. */
+/** Cap on a single request body, so a 200MB JSON write can't exhaust memory. */
 const MAX_BUFFER = Number(process.env.SANDBOX_MAX_BUFFER ?? 16 * 1024 * 1024);
+/**
+ * Output retained per stream, per command — a HEAD and a TAIL window, with the
+ * middle discarded as it streams past.
+ *
+ * This container runs builds inside a fixed, small memory budget, and captured
+ * output used to be the largest avoidable consumer in it. The previous version
+ * asked `execFile` for up to 16MB per stream with the default utf8 encoding,
+ * which is a much bigger number than it looks: Node decodes each chunk to a
+ * UTF-16 string (2x), joins them (2x again), then `JSON.stringify` escapes the
+ * result and `res.end` re-encodes it. Measured, ONE command emitting 16MB of
+ * stdout cost +152MB RSS here — and 16MB was the per-stream figure, so stdout
+ * plus stderr doubled it.
+ *
+ * None of it survived the trip. Flue's `bash` tool truncates to the LAST 2000
+ * lines or 50KB before the model ever sees it, so ~320x of what we buffered,
+ * serialised and sent was discarded on arrival.
+ *
+ * Both windows are therefore kept far above what any caller can consume, and
+ * both ENDS are kept because the two consumers disagree about which one they
+ * want: `bash` keeps the tail (`truncateTail`), while `grep` takes the FIRST
+ * 100 matching lines. Keeping only one end would silently change which matches
+ * a search reports.
+ */
+const MAX_HEAD_BYTES = Number(process.env.SANDBOX_MAX_HEAD_BYTES ?? 256 * 1024);
+const MAX_TAIL_BYTES = Number(process.env.SANDBOX_MAX_TAIL_BYTES ?? 256 * 1024);
+/**
+ * Largest file `/read` and `/read-buffer` will load.
+ *
+ * A read is amplified on the way out — bytes, then base64 (1.33x), then a
+ * UTF-16 JS string (2x that), then the JSON body. Source files are nowhere near
+ * this; build artefacts and vendored bundles are, and one of them was enough to
+ * take the container down.
+ *
+ * Read PER CALL rather than frozen at module load, unlike the caps above. This
+ * is the one limit an operator may need to move without rebuilding the image —
+ * the container's memory budget is fixed and not ours to raise, so the knob that
+ * trades capability against it should be reachable at runtime.
+ */
+const maxReadFileBytes = (): number =>
+  Number(process.env.SANDBOX_MAX_READ_FILE_BYTES ?? 16 * 1024 * 1024);
+/**
+ * Commands allowed to run at once.
+ *
+ * The control plane already bounds concurrent RUNS, but one run issues many
+ * tool calls and a reviewer delegate issues its own, so nothing bounded how
+ * many compilers were resident here simultaneously. With a CPU quota of a
+ * tenth of a core, extra parallelism buys no wall-clock anyway — it only
+ * multiplies peak memory. Excess commands queue instead of competing.
+ *
+ * THE TRADE-OFF, because it is not free: this is below MAX_CONCURRENT_RUNS
+ * (default 3), so a long build in one conversation can make another
+ * conversation's `bash` wait for a slot. That is deliberate — on a fixed 1GiB
+ * you can afford one or two real builds, and queuing is a better failure than
+ * an OOM kill that takes every conversation down together. But if turns look
+ * like they are hanging rather than working, this is the number to raise (to
+ * MAX_CONCURRENT_RUNS, so no run can be starved by another) before anything
+ * else here. Only `/exec` is gated; file operations are never queued.
+ */
+const MAX_CONCURRENT_EXEC = Number(process.env.SANDBOX_MAX_CONCURRENT_EXEC ?? 2);
 /** Idle workspaces are reclaimed after this long. */
 const WORKSPACE_TTL_MS = Number(process.env.SANDBOX_WORKSPACE_TTL_MS ?? 24 * 60 * 60 * 1000);
 
@@ -74,6 +133,17 @@ const BASE_ENV_KEYS = [
   "PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TERM", "TZ", "TMPDIR",
   "GOMODCACHE", "GOCACHE", "GOFLAGS", "GOMEMLIMIT", "GOMAXPROCS", "GOPATH", "GOTOOLCHAIN",
   "npm_config_cache", "PIP_CACHE_DIR", "BUN_INSTALL_CACHE_DIR",
+  // Worker-pool and heap caps for the NON-Go toolchain. The image sets these
+  // (see sandbox/Dockerfile); they only reach the compilers and test runners
+  // the model spawns if they are forwarded here. `nproc` and `os.cpus()` both
+  // report the HOST core count inside a CPU-quota'd container — measured, 12
+  // cores visible under a 0.1-core quota — so a test runner or bundler that
+  // sizes its pool from either forks a dozen workers that cannot run, and each
+  // one costs ~45MB of resident Node before it does any work. That is the
+  // memory limit, spent on parallelism the quota forbids.
+  "NODE_OPTIONS", "UV_THREADPOOL_SIZE", "MAKEFLAGS", "JOBS", "npm_config_jobs",
+  "CARGO_BUILD_JOBS", "VITEST_MAX_THREADS", "VITEST_MIN_THREADS", "VITEST_MAX_FORKS",
+  "NX_PARALLEL", "TURBO_CONCURRENCY", "PYTHONDONTWRITEBYTECODE",
 ] as const;
 
 function baseEnv(): NodeJS.ProcessEnv {
@@ -135,6 +205,84 @@ function resolveIn(id: string, path: string): string {
   return full;
 }
 
+/* ------------------------------------------------- bounded output capture */
+
+/**
+ * Accumulates a child's output into a bounded HEAD window and a bounded TAIL
+ * window, discarding the middle as it streams past.
+ *
+ * Chunks are kept as Buffers and decoded ONCE at the end. Decoding per chunk
+ * (what `execFile` does when given an encoding) doubles the cost immediately by
+ * going to UTF-16 and then doubles it again on the join.
+ *
+ * A cut can land mid-codepoint, so each window is decoded independently and a
+ * split multi-byte character degrades to U+FFFD at the seam. That only happens
+ * in output already being elided, next to a marker saying so.
+ */
+class BoundedCapture {
+  private readonly head: Buffer[] = [];
+  private headBytes = 0;
+  private readonly tail: Buffer[] = [];
+  private tailBytes = 0;
+  private elided = 0;
+
+  push(chunk: Buffer): void {
+    let rest = chunk;
+    if (this.headBytes < MAX_HEAD_BYTES) {
+      const take = Math.min(rest.length, MAX_HEAD_BYTES - this.headBytes);
+      this.head.push(rest.subarray(0, take));
+      this.headBytes += take;
+      rest = rest.subarray(take);
+      if (rest.length === 0) return;
+    }
+    this.tail.push(rest);
+    this.tailBytes += rest.length;
+    // Drop whole chunks off the front while doing so still leaves a full tail
+    // window. Bounded by MAX_TAIL_BYTES + one chunk, never by total output.
+    while (this.tail.length > 1 && this.tailBytes - this.tail[0].length >= MAX_TAIL_BYTES) {
+      const dropped = this.tail.shift() as Buffer;
+      this.tailBytes -= dropped.length;
+      this.elided += dropped.length;
+    }
+  }
+
+  text(): string {
+    const head = Buffer.concat(this.head).toString("utf8");
+    if (this.tail.length === 0) return head;
+    const tail = Buffer.concat(this.tail).toString("utf8");
+    if (this.elided === 0) return head + tail;
+    return `${head}\n[sandbox] ${this.elided} bytes of output elided here to stay inside the sandbox memory budget\n${tail}`;
+  }
+}
+
+/**
+ * FIFO counting semaphore, bounding how many commands run at once.
+ *
+ * Deliberately a local copy rather than an import: this service shares no
+ * source with the control plane and has no dependencies, which is what keeps
+ * the process running model-authored commands small enough to reason about.
+ */
+class Slots {
+  private available: number;
+  private readonly waiters: Array<() => void> = [];
+  constructor(permits: number) {
+    this.available = Math.max(1, permits);
+  }
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.available > 0) this.available -= 1;
+    else await new Promise<void>((r) => this.waiters.push(r));
+    try {
+      return await fn();
+    } finally {
+      const next = this.waiters.shift();
+      if (next) next();
+      else this.available += 1;
+    }
+  }
+}
+
+const execSlots = new Slots(MAX_CONCURRENT_EXEC);
+
 /* -------------------------------------------------------------- plumbing */
 
 class HttpError extends Error {
@@ -173,6 +321,36 @@ async function readBody(req: IncomingMessage): Promise<Body> {
 
 /* -------------------------------------------------------------- handlers */
 
+/** What `/exec` answers with — Flue's `ShellResult`, without importing it. */
+interface ShellLike {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}
+
+/**
+ * Refuse a read too large to hold in this container's budget.
+ *
+ * Rejecting beats being OOM-killed mid-session, and it beats truncating
+ * silently: the model EDITS these files, and a partial read it believes is
+ * whole is how a truncated file gets written back. The message names the way
+ * out, because the model is the one who has to act on it.
+ *
+ * A missing file falls through to `readFile`, so ENOENT stays ENOENT rather
+ * than becoming a confusing size error.
+ */
+async function refuseOversizedRead(full: string): Promise<void> {
+  const limit = maxReadFileBytes();
+  const s = await stat(full).catch(() => null);
+  if (s?.isFile() && s.size > limit) {
+    throw new HttpError(
+      413,
+      `file is ${s.size} bytes, above the sandbox read limit of ${limit}; ` +
+        `read part of it with \`bash\` (sed -n, head, tail) instead`,
+    );
+  }
+}
+
 const handlers: Record<string, (b: Body) => Promise<unknown>> = {
   /**
    * The instance's workspace as an ABSOLUTE path in this container.
@@ -194,32 +372,79 @@ const handlers: Record<string, (b: Body) => Promise<unknown>> = {
     const cwd = b.cwd ? resolveIn(id, str(b, "cwd")) : base;
     const env = { ...baseEnv(), ...((b.env as Record<string, string> | undefined) ?? {}) };
     const timeout = Math.min(Number(b.timeoutMs ?? MAX_TIMEOUT_MS) || MAX_TIMEOUT_MS, MAX_TIMEOUT_MS);
-    return new Promise((resolvePromise) => {
-      execFile(
-        "/bin/sh",
-        ["-c", command],
-        { cwd, env, timeout, maxBuffer: MAX_BUFFER, killSignal: "SIGKILL" },
-        (err, stdout, stderr) => {
-          // A non-zero exit is a RESULT, not a transport failure — the model
-          // needs to see the stderr of a failed build, not a 500.
-          const e = err as (Error & { code?: number | string; killed?: boolean }) | null;
-          resolvePromise({
-            stdout: String(stdout ?? ""),
-            stderr: String(stderr ?? "") + (e?.killed ? `\n[sandbox] command timed out after ${timeout}ms` : ""),
-            exitCode: e ? (typeof e.code === "number" ? e.code : 1) : 0,
-          });
-        },
-      );
-    });
+
+    return execSlots.run(
+      () =>
+        new Promise((settle) => {
+          // `detached` puts the command in its OWN PROCESS GROUP, which is what
+          // makes the timeout able to kill the whole tree.
+          //
+          // This was a memory leak, not a tidiness point. `execFile`'s timeout
+          // signals the direct child — `/bin/sh` — and leaves its descendants
+          // orphaned and running. A `bun install` or `tsc` that timed out kept
+          // its memory for as long as it felt like, in the container least able
+          // to spare it, and the next command started on top of it.
+          const child = spawn("/bin/sh", ["-c", command], { cwd, env, detached: true });
+          const stdout = new BoundedCapture();
+          const stderr = new BoundedCapture();
+          let timedOut = false;
+          let settled = false;
+
+          const killTree = (): void => {
+            try {
+              // Negative pid = the whole process group.
+              if (child.pid) process.kill(-child.pid, "SIGKILL");
+            } catch {
+              child.kill("SIGKILL"); // group already gone
+            }
+          };
+          const timer = setTimeout(() => {
+            timedOut = true;
+            killTree();
+          }, timeout);
+
+          child.stdout?.on("data", (c: Buffer) => stdout.push(c));
+          child.stderr?.on("data", (c: Buffer) => stderr.push(c));
+
+          const done = (out: ShellLike): void => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            settle(out);
+          };
+
+          // Spawn itself failed (no /bin/sh, cwd vanished) — report it as the
+          // command's own failure rather than a transport error.
+          child.on("error", (e: Error) =>
+            done({ stdout: stdout.text(), stderr: `[sandbox] ${e.message}`, exitCode: 1 }),
+          );
+          // `close` rather than `exit`: it fires once the pipes are drained, so
+          // no output is dropped on the way out.
+          child.on("close", (code: number | null) =>
+            done({
+              // A non-zero exit is a RESULT, not a transport failure — the model
+              // needs to see the stderr of a failed build, not a 500. A signal
+              // kill reports 1, as the previous execFile path did.
+              stdout: stdout.text(),
+              stderr:
+                stderr.text() + (timedOut ? `\n[sandbox] command timed out after ${timeout}ms` : ""),
+              exitCode: typeof code === "number" ? code : 1,
+            }),
+          );
+        }),
+    );
   },
 
   async "/read"(b) {
-    return { content: await readFile(resolveIn(str(b, "id"), str(b, "path")), "utf8") };
+    const full = resolveIn(str(b, "id"), str(b, "path"));
+    await refuseOversizedRead(full);
+    return { content: await readFile(full, "utf8") };
   },
 
   async "/read-buffer"(b) {
-    const buf = await readFile(resolveIn(str(b, "id"), str(b, "path")));
-    return { base64: buf.toString("base64") };
+    const full = resolveIn(str(b, "id"), str(b, "path"));
+    await refuseOversizedRead(full);
+    return { base64: (await readFile(full)).toString("base64") };
   },
 
   async "/write"(b) {
@@ -270,16 +495,23 @@ const handlers: Record<string, (b: Body) => Promise<unknown>> = {
 
 /* ---------------------------------------------------------------- server */
 
-/** Reclaim idle instance workspaces so long-lived deployments don't fill /data. */
-function sweep(): void {
+/**
+ * Reclaim idle instance workspaces so long-lived deployments don't fill /data.
+ *
+ * Asynchronous on purpose. The synchronous version blocked the event loop for
+ * as long as it took to delete a monorepo checkout tree, and with a CPU quota
+ * of a tenth of a core that is long enough to stall every in-flight command and
+ * make the service look hung.
+ */
+async function sweep(): Promise<void> {
   if (!existsSync(ROOT)) return;
   const cutoff = Date.now() - WORKSPACE_TTL_MS;
   let removed = 0;
-  for (const name of readdirSync(ROOT)) {
+  for (const name of await readdir(ROOT)) {
     const full = join(ROOT, name);
     try {
-      if (statSync(full).mtimeMs >= cutoff) continue;
-      rmSync(full, { recursive: true, force: true });
+      if ((await stat(full)).mtimeMs >= cutoff) continue;
+      await rm(full, { recursive: true, force: true });
       removed += 1;
     } catch {
       /* concurrent delete or permission race — skip */
@@ -330,6 +562,9 @@ if (process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/^.*[/\\
         "That is only safe because the platform does not route to a knowledge container externally.",
     );
   }
-  setInterval(sweep, 60 * 60 * 1000).unref();
+  // Also once at boot: a container that restarts more often than the interval
+  // otherwise never sweeps, and inherits every checkout it ever made.
+  void sweep();
+  setInterval(() => void sweep(), 60 * 60 * 1000).unref();
   createSandboxServer().listen(PORT, () => console.log(`[sandbox] listening on ${PORT}, root ${ROOT}`));
 }

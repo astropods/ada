@@ -208,6 +208,18 @@ const SANDBOX_PASSTHROUGH = [
   // (→ re-download every run).
   "GOMODCACHE", "GOCACHE", "GOFLAGS", "GOMEMLIMIT", "GOMAXPROCS", "GOPATH", "GOTOOLCHAIN",
   "npm_config_cache", "PIP_CACHE_DIR", "BUN_INSTALL_CACHE_DIR",
+  // Worker-pool caps, for the same reason as GOMAXPROCS and for the FALLBACK
+  // path specifically: with no sandbox container deployed, builds run in THIS
+  // process's container, where nothing else bounds them. A tool sizing its pool
+  // from `nproc`/`os.cpus()` reads the host's core count, not the quota.
+  //
+  // NODE_OPTIONS is deliberately NOT forwarded. A per-request env value
+  // overrides the sandbox image's own (`{...baseEnv(), ...request.env}`), so
+  // forwarding a heap cap chosen for the CONTROL PLANE would silently replace
+  // the one the sandbox image chose for the commands it runs.
+  "UV_THREADPOOL_SIZE", "MAKEFLAGS", "JOBS", "npm_config_jobs",
+  "CARGO_BUILD_JOBS", "VITEST_MAX_THREADS", "VITEST_MIN_THREADS", "VITEST_MAX_FORKS",
+  "NX_PARALLEL", "TURBO_CONCURRENCY", "PYTHONDONTWRITEBYTECODE",
 ] as const;
 
 /**

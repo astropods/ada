@@ -70,11 +70,53 @@ ENV NODE_ENV=production \
     PIP_CACHE_DIR=/data/.cache/pip \
     BUN_INSTALL_CACHE_DIR=/data/.cache/bun \
     GOMEMLIMIT=600MiB \
-    GOMAXPROCS=1
+    GOMAXPROCS=1 \
+    NODE_OPTIONS=--max-old-space-size=384 \
+    UV_THREADPOOL_SIZE=2 \
+    MAKEFLAGS=-j1 \
+    JOBS=1 \
+    npm_config_jobs=1 \
+    CARGO_BUILD_JOBS=1 \
+    VITEST_MAX_THREADS=1 \
+    VITEST_MIN_THREADS=1 \
+    VITEST_MAX_FORKS=1 \
+    NX_PARALLEL=1 \
+    TURBO_CONCURRENCY=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# --- why the single-worker tuning above -------------------------------------
+# A CPU quota is INVISIBLE to the usual ways a tool decides how parallel to be.
+# Measured inside `--cpus=0.1 --memory=1g` on node:24-slim:
+#
+#   /sys/fs/cgroup/cpu.max  ->  10000 100000   (a tenth of a core)
+#   nproc                   ->  12             (the HOST's cores)
+#   getconf _NPROCESSORS_ONLN -> 12
+#   os.cpus().length        ->  12
+#   os.availableParallelism() -> 1             (the only quota-aware one)
+#
+# So a test runner or bundler sizing its pool from `nproc` or `os.cpus()` forks
+# a dozen workers that the quota will never let run concurrently. Each idle Node
+# worker is ~45MB resident before it does any work, so the fan-out alone can
+# spend the entire memory limit on parallelism the CPU quota forbids — which is
+# how this container hit both its limits at once while writing code.
+#
+# GOMAXPROCS/GOMEMLIMIT already covered the Go toolchain (and so esbuild, which
+# is Go). These are the equivalents for everything else. They are forwarded to
+# spawned commands by BASE_ENV_KEYS in sandbox/index.ts — setting them here and
+# not there would tune only this service, which is not where builds run.
+#
+# NODE_OPTIONS caps a spawned Node's heap. It also applies to the service
+# itself, which is why the CMD passes its own, lower `--max-old-space-size`:
+# command-line flags are applied after NODE_OPTIONS and win.
 
 # No dependencies: the service is node: built-ins only. Nothing to install, and
 # nothing in node_modules for a compromised command to tamper with.
 COPY sandbox/index.ts ./sandbox/index.ts
 
 EXPOSE 3000
-CMD ["node", "sandbox/index.ts"]
+# The service is a thin HTTP shell around spawn() and the filesystem; it needs a
+# small fraction of the container. Left alone, Node sizes its heap from the
+# cgroup limit — measured at 560MB of a 1GiB container — and a heap it is
+# ENTITLED to grow into is memory the builds cannot have. Capping it here keeps
+# the rest of the budget for the commands this container exists to run.
+CMD ["node", "--max-old-space-size=96", "sandbox/index.ts"]

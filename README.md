@@ -554,6 +554,82 @@ attack surface exactly where it matters most.
 > clone **where execution happens**: cloning locally in a deployment running the
 > sandbox reported success at a path the agent's own shell could never reach.
 
+#### Staying inside the container's memory budget
+
+The sandbox is a **small, fixed** container — measured at a 1GiB memory limit and
+a CPU quota of a tenth of a core — and the platform does not let it be resized.
+Every build the agent runs has to fit in that, so the service treats memory as a
+hard budget rather than an afterthought.
+
+**A CPU quota is invisible to the usual ways a tool picks its parallelism.**
+Measured inside `--cpus=0.1 --memory=1g` on `node:24-slim`:
+
+| what a tool asks | what it gets |
+|---|---|
+| `/sys/fs/cgroup/cpu.max` | `10000 100000` — a tenth of a core |
+| `nproc`, `getconf _NPROCESSORS_ONLN` | **12** (the *host's* cores) |
+| `os.cpus().length` | **12** |
+| `os.availableParallelism()` | 1 — the only quota-aware one |
+
+So a test runner or bundler sizing its pool from `nproc` or `os.cpus()` forks a
+dozen workers the quota will never run concurrently, and an idle Node worker is
+~45MB resident before it does any work. The fan-out alone can spend the whole
+memory limit on parallelism the CPU quota forbids. `GOMAXPROCS`/`GOMEMLIMIT`
+already covered the Go toolchain (and so esbuild, which is Go); `sandbox/Dockerfile`
+sets the equivalents for everything else (`MAKEFLAGS`, `npm_config_jobs`,
+`VITEST_MAX_THREADS`, `NX_PARALLEL`, `TURBO_CONCURRENCY`, `CARGO_BUILD_JOBS`,
+`UV_THREADPOOL_SIZE`, `NODE_OPTIONS`), and `BASE_ENV_KEYS` in `sandbox/index.ts`
+forwards them — setting them in the image without forwarding them would tune only
+the service, which is not where builds run.
+
+**Captured output is bounded at both ends.** Retaining more than the caller can
+consume is pure cost, and the caller's limit is set by Flue: `bash` truncates to
+the last 2000 lines or 50KB. The previous version asked `execFile` for 16MB *per
+stream* with the default utf8 encoding, which is worse than it looks — Node
+decodes each chunk to UTF-16 (2×), joins them (2× again), then `JSON.stringify`
+escapes it and `res.end` re-encodes. One 16MB command cost **+152MB RSS**, and
+~320× of what was buffered and sent was discarded on arrival. The service now
+keeps a bounded **head** and **tail** window and elides the middle in-band.
+
+Both ends, because the consumers disagree about which one they want: `bash` keeps
+the tail (`truncateTail`), while `grep` takes the **first** 100 matching lines.
+Keeping only one end would silently change which matches a search reports — so
+the tests assert the two derived views byte-for-byte against the output as if
+nothing had been elided. Measured after: the same command costs **+21MB**, and
+four concurrent 20MB commands peak at **56MiB of the 1GiB limit**.
+
+A side benefit: `execFile`'s `maxBuffer` *killed* the child when exceeded, so a
+verbose but perfectly successful build came back as a failure with partial
+output. Bounding the capture ourselves decouples "how much we keep" from
+"whether the command may finish".
+
+**A timeout kills the whole process tree.** This was a leak, not a tidiness
+point. `execFile`'s timeout signals the direct child — `/bin/sh` — and leaves its
+descendants orphaned and *running*; a `bun install` or `tsc` that timed out kept
+its memory for as long as it liked, and the next command started on top of it.
+Commands now run `detached` in their own process group so the timeout can reap
+the group. (Verified against the old implementation, where the grandchild
+survived.)
+
+**Other bounds**, all overridable by env without a rebuild:
+
+| knob | default | why |
+|---|---|---|
+| `SANDBOX_MAX_HEAD_BYTES` / `SANDBOX_MAX_TAIL_BYTES` | 256KB each | ≫ the 50KB any caller can consume |
+| `SANDBOX_MAX_CONCURRENT_EXEC` | 2 | bounds *commands*, where `MAX_CONCURRENT_RUNS` bounds *runs* — one run issues many tool calls, and a reviewer delegate issues its own. Under a fractional CPU quota extra parallelism buys no wall-clock, only peak memory. |
+| `SANDBOX_MAX_READ_FILE_BYTES` | 16MB | a read is amplified on the way out (bytes → base64 → UTF-16 → JSON). Oversized reads are **refused with a message naming the way out**, not truncated: the model *edits* these files, and a partial read it believes is whole is how a truncated file gets written back. |
+
+The service's own heap is capped on the `CMD` line (`--max-old-space-size=96`).
+Left alone, Node sizes its heap from the cgroup limit — measured at 560MB of a
+1GiB container — and a heap it is *entitled* to grow into is memory the builds
+cannot have. It idles at ~38MiB. The workspace TTL sweep is also asynchronous;
+the synchronous version blocked the event loop for as long as it took to delete
+a monorepo tree, which at a tenth of a core is long enough to look hung.
+
+Finally, clones pass `-c pack.threads=1`. That is a memory control: `git
+index-pack` runs one delta-resolution thread per detected CPU (capped at 3) and
+its own docs note the delta-window memory is *multiplied* by the thread count.
+
 ### Tool policy
 
 Under Claude Code, the toolset arrived via the `claude_code` preset and had to be

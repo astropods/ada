@@ -15,7 +15,7 @@
 
 import { defineTool } from "@flue/runtime";
 import * as v from "valibot";
-import { parseRepoSpec } from "../session/repo.ts";
+import { cloneCommand, parseRepoSpec } from "../session/repo.ts";
 import { getSessionEnv, setCheckoutDir } from "./session-env.ts";
 import { readRepoRules, renderRules, sandboxExec } from "./repo-rules.ts";
 
@@ -71,10 +71,10 @@ export function checkoutRepo(instanceId: string) {
         log.info(`Cloning ${spec.owner}/${spec.repo}…`);
         // owner/repo have been through parseRepoSpec, whose pattern excludes
         // every shell metacharacter — they are safe to interpolate here.
-        const result = await sandbox.exec(
-          `git clone --depth=1 https://github.com/${spec.owner}/${spec.repo}.git ${dir}`,
-          { env: { GH_TOKEN: token, GITHUB_TOKEN: token }, timeoutMs: 10 * 60 * 1000 },
-        );
+        const result = await sandbox.exec(cloneCommand(spec, dir), {
+          env: { GH_TOKEN: token, GITHUB_TOKEN: token },
+          timeoutMs: 10 * 60 * 1000,
+        });
         if (result.exitCode !== 0) {
           throw new Error(`clone failed: ${(result.stderr || result.stdout).trim().slice(0, 300)}`);
         }

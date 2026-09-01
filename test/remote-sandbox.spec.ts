@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { remoteSandboxDriver, ensureRepoInSandbox, sandboxHost, sandboxEnabled } from "../agent/session/remote-sandbox.ts";
+import { cloneCommand } from "../agent/session/repo.ts";
 
 /**
  * The isolated execution sandbox, exercised over real HTTP.
@@ -171,6 +172,155 @@ test("refuses a repo spec that was not validated", async () => {
   await expect(
     ensureRepoInSandbox(d, { owner: "x; rm -rf /", repo: "y" }),
   ).rejects.toThrow(/unvalidated repo spec/);
+});
+
+/* ---------------- staying inside the container's memory budget ---------------- */
+
+/**
+ * The sandbox runs builds inside a fixed, small container — measured at a 1GiB
+ * memory limit and a CPU quota of a tenth of a core — and it cannot be resized.
+ * Two things here used to spend that budget carelessly, and both are asserted
+ * rather than assumed, because a regression shows up as an OOM kill in
+ * production rather than as a failing test.
+ *
+ * The first is captured output. Anything retained beyond what the caller can
+ * actually consume is pure cost, and the caller's limit is set by Flue: `bash`
+ * truncates to the LAST 2000 lines or 50KB, while `grep` takes the FIRST 100
+ * matching lines. So the service keeps a bounded window at BOTH ENDS and elides
+ * the middle — and the tests below pin the invariant that matters, which is not
+ * "output is small" but "the model sees exactly what it saw before".
+ */
+
+/** Flue's own downstream policy, mirrored so the assertions test the real thing. */
+const MAX_READ_LINES = 2000;
+const MAX_READ_BYTES = 51200;
+function truncateTail(text: string, maxLines: number, maxBytes: number): string {
+  const lines = text.split("\n");
+  if (lines.length <= maxLines && text.length <= maxBytes) return text;
+  let out = lines.slice(-maxLines).join("\n");
+  if (out.length > maxBytes) out = out.slice(-maxBytes);
+  return out;
+}
+/** What Flue's `bash` tool would show the model for a given result. */
+const bashView = (r: { stdout: string; stderr: string }): string =>
+  truncateTail((r.stdout + (r.stderr ? `\n${r.stderr}` : "")).trim(), MAX_READ_LINES, MAX_READ_BYTES);
+/** What Flue's `grep` tool would show the model — the HEAD, not the tail. */
+const grepView = (r: { stdout: string }): string => r.stdout.trim().split("\n").slice(0, 100).join("\n");
+
+const LINE = "x".repeat(50);
+const manyLines = (n: number) => Array.from({ length: n }, (_, i) => `${i + 1} ${LINE}`);
+/** ~10MB of stdout, well past any window, generated without a helper file. */
+const emitLines = (n: number) =>
+  `awk 'BEGIN{for(i=1;i<=${n};i++) printf "%d %s\\n", i, "${LINE}"}'`;
+
+test("bounds captured output without changing what the model sees", async () => {
+  const d = driverFor("inst-bigout");
+  const n = 200_000;
+  const r = await d.exec(emitLines(n));
+  const unbounded = manyLines(n).join("\n");
+
+  // The two views the framework actually derives, byte-for-byte against the
+  // output as if nothing had been elided at all.
+  expect(bashView(r), "bash sees the true tail").toBe(truncateTail(unbounded, MAX_READ_LINES, MAX_READ_BYTES));
+  expect(grepView(r), "grep sees the true head").toBe(manyLines(100).join("\n"));
+
+  // Both ends are kept precisely because those two disagree about which end
+  // they want; keeping one would silently change which matches a search finds.
+  expect(r.stdout.startsWith("1 ")).toBe(true);
+  expect(r.stdout.trimEnd().endsWith(`${n} ${LINE}`)).toBe(true);
+
+  // What was dropped is stated in-band. Silent truncation is the failure mode
+  // worth avoiding — the model would reason about output it never received.
+  expect(r.stdout).toMatch(/\[sandbox\] \d+ bytes of output elided/);
+  // And the payload is a fraction of the ~10MB produced.
+  expect(r.stdout.length).toBeLessThan(1_500_000);
+});
+
+test("small output is passed through untouched", async () => {
+  // The overwhelming majority of commands are far under the window, and must
+  // not be reshaped, re-encoded, or annotated in any way.
+  const d = driverFor("inst-smallout");
+  const r = await d.exec("printf 'a\\nb\\nc\\n'");
+  expect(r.stdout).toBe("a\nb\nc\n");
+  expect(r.stderr).toBe("");
+  expect(r.exitCode).toBe(0);
+});
+
+test("a command that outruns the window completes instead of being killed", async () => {
+  // `execFile`'s maxBuffer KILLS the child when it is exceeded, so a verbose
+  // but perfectly successful build used to come back as a failure with partial
+  // output. Bounding the capture ourselves decouples "how much we keep" from
+  // "whether the command is allowed to finish".
+  const d = driverFor("inst-overrun");
+  const r = await d.exec(`${emitLines(400_000)}; echo sentinel-done`);
+  expect(r.exitCode, "the command must be allowed to succeed").toBe(0);
+  expect(r.stdout.trimEnd().endsWith("sentinel-done"), "its final line must survive").toBe(true);
+});
+
+test("a timeout kills the whole process tree, not just the shell", async () => {
+  /**
+   * This was a memory leak, not a tidiness point.
+   *
+   * The timeout signalled the direct child — `/bin/sh` — and left its
+   * descendants orphaned and RUNNING. A `bun install` or `tsc` that timed out
+   * kept its memory for as long as it liked, in the container least able to
+   * spare it, and the next command started on top of it. Verified against the
+   * old implementation: the grandchild survived.
+   */
+  const d = driverFor("inst-orphan");
+  const marker = "orphan-marker.txt";
+  const base = await d.exec("pwd");
+  const abs = `${base.stdout.trim()}/${marker}`;
+
+  // A grandchild that outlives the shell, then writes proof it was still alive.
+  await d.exec(`( sh -c 'sleep 1; echo leaked > "${abs}"' ) & sleep 5`, { timeoutMs: 400 });
+  await new Promise((r) => setTimeout(r, 2500));
+
+  expect(await d.exists(marker), "an orphaned grandchild kept running after the timeout").toBe(false);
+});
+
+test("refuses to load a file too large to hold, and says how to read it", async () => {
+  // A read is amplified on the way out (bytes -> base64 -> UTF-16 -> JSON), so
+  // one vendored bundle can take the container down. Rejecting beats being
+  // OOM-killed, and beats truncating silently: the model EDITS these files, and
+  // a partial read it believes is whole is how a truncated file is written back.
+  const d = driverFor("inst-bigfile");
+  await d.writeFile("small.txt", "x".repeat(100));
+  await d.writeFile("big.bin", "y".repeat(4096));
+
+  // The limit is read per call, so it can be lowered here rather than needing a
+  // 16MB fixture (which would itself be the memory spike under test).
+  process.env.SANDBOX_MAX_READ_FILE_BYTES = "1024";
+  try {
+    expect(await d.readFile("small.txt"), "an ordinary file still reads").toHaveLength(100);
+
+    await expect(d.readFile("big.bin")).rejects.toThrow(/above the sandbox read limit/);
+    await expect(d.readFileBuffer("big.bin")).rejects.toThrow(/above the sandbox read limit/);
+    // The error has to tell the model what to do instead.
+    await expect(d.readFile("big.bin")).rejects.toThrow(/sed -n, head, tail/);
+
+    // A missing file must still report as missing, not as oversized.
+    await expect(d.readFile("nope.txt")).rejects.toThrow(/ENOENT/);
+  } finally {
+    delete process.env.SANDBOX_MAX_READ_FILE_BYTES;
+  }
+  // With the cap restored, the same file reads fine — the limit is the only
+  // thing that refused it.
+  expect(await d.readFile("big.bin")).toHaveLength(4096);
+});
+
+test("caps the clone's delta threads, which is a memory control", () => {
+  // `git index-pack` runs one delta-resolution thread per detected CPU (capped
+  // at 3) and its own docs note the delta-window memory is multiplied by the
+  // thread count. In a CPU-quota'd container that detection reads the HOST's
+  // cores, so it spends multiples of that window on parallelism a tenth of a
+  // core will never deliver.
+  const cmd = cloneCommand({ owner: "astropods", repo: "ada" }, "ada");
+  expect(cmd).toContain("-c pack.threads=1");
+  expect(cmd).toContain("--depth=1");
+  expect(cmd).toContain("https://github.com/astropods/ada.git");
+  // The thread cap has to precede the subcommand or git ignores it.
+  expect(cmd.indexOf("-c pack.threads=1")).toBeLessThan(cmd.indexOf("clone"));
 });
 
 test("selects remote only when the platform injects a sandbox host", () => {

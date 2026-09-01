@@ -63,8 +63,16 @@ inputs:
     display-as: short-text
   # Max concurrent agent runs. A run holds a sandbox and spawns real build/test
   # commands in it (CPU+memory); both browser and messaging turns route through
-  # this limiter, so LOWERING it (e.g. 1–2) is the main lever to reduce memory
-  # pressure when the container can't be sized up. Default 3.
+  # this limiter, so LOWERING it (e.g. 1–2) eases memory pressure when the
+  # container can't be sized up. Default 3.
+  #
+  # It is not the only lever, and no longer the first one to reach for. This
+  # bounds RUNS, but one run issues many tool calls and a reviewer delegate
+  # issues its own, so the sandbox container has its own limits that act closer
+  # to where the memory is actually spent — SANDBOX_MAX_CONCURRENT_EXEC bounds
+  # simultaneous commands, the head/tail capture windows bound retained output,
+  # and the worker-pool caps in sandbox/Dockerfile stop a build fanning out to
+  # the host's core count under a fractional CPU quota. See sandbox/index.ts.
   MAX_CONCURRENT_RUNS:
     name: MAX_CONCURRENT_RUNS
     datatype: number

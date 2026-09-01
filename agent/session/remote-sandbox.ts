@@ -20,6 +20,7 @@
 
 import { sandboxFromDriver } from "@flue/runtime";
 import type { FileStat, Sandbox, SandboxDriver, SandboxFactory, ShellResult } from "@flue/runtime";
+import { cloneCommand } from "./repo.ts";
 
 /** Where the platform injects the sandbox container's address. */
 export function sandboxHost(env: NodeJS.ProcessEnv = process.env): string | null {
@@ -249,10 +250,7 @@ export async function ensureRepoInSandbox(
   const env: Record<string, string> = opts.githubToken
     ? { GH_TOKEN: opts.githubToken, GITHUB_TOKEN: opts.githubToken }
     : {};
-  const result = await driver.exec(
-    `git clone --depth=1 https://github.com/${spec.owner}/${spec.repo}.git ${dir}`,
-    { env, timeoutMs: 10 * 60 * 1000 },
-  );
+  const result = await driver.exec(cloneCommand(spec, dir), { env, timeoutMs: 10 * 60 * 1000 });
   if (result.exitCode !== 0) {
     throw new Error(`clone failed: ${(result.stderr || result.stdout).trim().slice(0, 300)}`);
   }
