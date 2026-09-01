@@ -1,5 +1,9 @@
 import { test, expect } from "@playwright/test";
-import { persistenceMode, postgresAdapter } from "../agent/db.ts";
+import { mkdtempSync, writeFileSync, existsSync, rmSync, utimesSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, dirname, sep } from "node:path";
+import { persistenceMode, postgresAdapter, sqlitePath } from "../agent/db.ts";
+import { sweepWorkspaces } from "../agent/session/workspace.ts";
 import { pgConfig, postgresConfigured, describePg } from "../agent/store/pg-config.ts";
 
 /**
@@ -35,6 +39,79 @@ test("uses Postgres when the platform injects one, SQLite otherwise", () => {
   // The platform has injected both spellings depending on how the store is
   // declared; missing the second would silently downgrade to SQLite.
   expect(persistenceMode({ KNOWLEDGE_DB_HOST: "db" })).toBe("postgres");
+});
+
+test("keeps the local database out of the swept workspace namespace", () => {
+  /**
+   * The local SQLite database used to sit at `${WORKSPACE_ROOT}/ada-flue.db`,
+   * and the per-session workspace GC reclaims entries under WORKSPACE_ROOT that
+   * begin with `ada-` and are older than its TTL. `ada-flue.db` begins with
+   * `ada-`. So a deployment idle past the TTL deleted its own conversation
+   * history — the exact durability this module exists to provide, removed by
+   * another module's housekeeping.
+   */
+  const root = mkdtempSync(join(tmpdir(), "ada-dbpath-"));
+  try {
+    const path = sqlitePath({ WORKSPACE_ROOT: root });
+    const relative = path.slice(root.length + 1);
+    const firstSegment = relative.split(sep)[0];
+
+    expect(firstSegment, "must not sit in the swept `ada-` namespace").not.toMatch(/^ada-/);
+    expect(relative, "should live in its own subdirectory").toBe(join("db", "ada-flue.db"));
+    expect(existsSync(dirname(path)), "the directory is created eagerly").toBe(true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("keeps using a database already at the old location", () => {
+  // Preferring the new path unconditionally would orphan an existing
+  // deployment's history — still on disk, but with an empty database started
+  // beside it. That is the same data loss, arriving on upgrade instead of on
+  // idle.
+  const root = mkdtempSync(join(tmpdir(), "ada-dblegacy-"));
+  try {
+    const legacy = join(root, "ada-flue.db");
+    writeFileSync(legacy, "existing history");
+    expect(sqlitePath({ WORKSPACE_ROOT: root })).toBe(legacy);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an explicit ADA_DB_PATH still wins", () => {
+  expect(sqlitePath({ ADA_DB_PATH: "/tmp/explicit.db", WORKSPACE_ROOT: "/tmp/ignored" })).toBe(
+    "/tmp/explicit.db",
+  );
+});
+
+test("the workspace GC reclaims stale workspaces but never the database", () => {
+  // The end-to-end property, asserted against the real sweep rather than by
+  // reading the prefix logic: both halves of the fix have to hold together.
+  const root = mkdtempSync(join(tmpdir(), "ada-gc-"));
+  try {
+    // A database at the LEGACY path — the case the sweep guard has to cover,
+    // since that is where an existing deployment's data actually is.
+    const dbFiles = ["ada-flue.db", "ada-flue.db-wal", "ada-flue.db-shm", "ada-flue.db-journal"];
+    for (const f of dbFiles) writeFileSync(join(root, f), "conversation history");
+    const stale = mkdtempSync(join(root, "ada-"));
+    writeFileSync(join(stale, "checkout.txt"), "a repo checkout");
+
+    // Age everything past the cutoff.
+    const old = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    for (const f of dbFiles) utimesSync(join(root, f), old, old);
+    utimesSync(stale, old, old);
+
+    const removed = sweepWorkspaces(24 * 60 * 60 * 1000, Date.now(), root);
+
+    expect(removed, "only the workspace directory is reclaimed").toBe(1);
+    expect(existsSync(stale), "the stale workspace is still collected").toBe(false);
+    for (const f of dbFiles) {
+      expect(existsSync(join(root, f)), `${f} must survive the sweep`).toBe(true);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("reads one connection config for both Flue and Ada's own store", () => {

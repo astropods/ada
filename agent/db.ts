@@ -28,7 +28,7 @@
  * if you want local conversations to survive a restart.
  */
 
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sqlite } from "@flue/runtime/node";
@@ -106,11 +106,34 @@ export function postgresAdapter(): PersistenceAdapter {
   });
 }
 
-function sqlitePath(): string {
-  if (process.env.ADA_DB_PATH) return process.env.ADA_DB_PATH;
-  const root = process.env.WORKSPACE_ROOT || tmpdir();
+/**
+ * Where the local SQLite conversation database lives.
+ *
+ * In a `db/` SUBDIRECTORY of WORKSPACE_ROOT, not at its root, because that root
+ * is also the per-session workspace namespace swept by
+ * `session/workspace.ts sweepWorkspaces()`. That sweep reclaims entries
+ * beginning with `ada-` and older than its TTL — which matched `ada-flue.db`
+ * and its `-wal`/`-shm`/`-journal` siblings exactly. A deployment idle past the
+ * TTL deleted its own conversation history. `db/` does not begin with `ada-`,
+ * so it is outside the swept namespace entirely; the sweep is separately fixed
+ * to touch only directories, and either fix alone closes the hole.
+ *
+ * A database ALREADY at the old location keeps being used. Preferring the new
+ * path unconditionally would leave an existing deployment's history on disk but
+ * orphaned, starting an empty database beside it — silent data loss of the same
+ * kind, arriving on upgrade instead of on idle. Moving it is not attempted:
+ * relocating a live SQLite file plus its WAL is a worse risk than one extra
+ * branch here, and the sweep fix protects it where it is.
+ */
+export function sqlitePath(env: NodeJS.ProcessEnv = process.env): string {
+  if (env.ADA_DB_PATH) return env.ADA_DB_PATH;
+  const root = env.WORKSPACE_ROOT || tmpdir();
   mkdirSync(root, { recursive: true });
-  return join(root, "ada-flue.db");
+  const legacy = join(root, "ada-flue.db");
+  if (existsSync(legacy)) return legacy;
+  const dir = join(root, "db");
+  mkdirSync(dir, { recursive: true });
+  return join(dir, "ada-flue.db");
 }
 
 /** Which backend this process will use. Exported for startup logging and tests. */
