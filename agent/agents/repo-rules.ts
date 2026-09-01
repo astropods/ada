@@ -27,6 +27,7 @@
  */
 
 import type { AgentStartContext } from "@flue/runtime";
+import { shellQuote } from "./shell.ts";
 
 /** Run a shell command in the agent's sandbox and return stdout ("" on failure). */
 export type Exec = (command: string) => Promise<string>;
@@ -103,8 +104,8 @@ export async function readRepoRules(sh: Exec): Promise<RulesFile[]> {
     const seen = new Set<string>();
     // `-iname` is the whole point: Flue's lookup is case-sensitive, and
     // lowercase `agents.md` is common.
-    const names = RULE_FILES.map((n) => `-iname ${JSON.stringify(n)}`).join(" -o ");
-    const found = (await sh(`find ${JSON.stringify(dir)} -maxdepth 1 \\( ${names} \\) 2>/dev/null`))
+    const names = RULE_FILES.map((n) => `-iname ${shellQuote(n)}`).join(" -o ");
+    const found = (await sh(`find ${shellQuote(dir)} -maxdepth 1 \\( ${names} \\) 2>/dev/null`))
       .split("\n")
       .map((l) => l.trim())
       .filter(Boolean);
@@ -117,7 +118,7 @@ export async function readRepoRules(sh: Exec): Promise<RulesFile[]> {
       // distinguishable from one that merely happens to be exactly that long.
       // Without this the truncation is silent, which is the worst outcome: the
       // model reads half a rulebook and believes it read all of it.
-      const raw = await sh(`head -c ${MAX_RULES_BYTES + 1} -- ${JSON.stringify(path)}`);
+      const raw = await sh(`head -c ${MAX_RULES_BYTES + 1} -- ${shellQuote(path)}`);
       const truncated = raw.length > MAX_RULES_BYTES;
       const body = (truncated ? raw.slice(0, MAX_RULES_BYTES) : raw).trim();
       if (!body) continue;

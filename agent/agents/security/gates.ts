@@ -31,6 +31,7 @@
 
 import { createHash } from "node:crypto";
 import type { AgentFinishContext, AgentStartContext } from "@flue/runtime";
+import { shellQuote } from "../shell.ts";
 
 /* ------------------------------------------------------------ diff model */
 
@@ -117,7 +118,7 @@ async function readDiff(instanceId: string, ctx: AgentFinishContext): Promise<Di
   // the content rules — read the new ones so a freshly-written `.env` or a
   // pasted key is still caught.
   for (const f of untracked.split("\n").map((s) => s.trim()).filter(Boolean).slice(0, 40)) {
-    const body = await sh(ctx, `head -c 20000 -- ${JSON.stringify(f)}`);
+    const body = await sh(ctx, `head -c 20000 -- ${shellQuote(f)}`);
     if (body) added.push(...body.split("\n"));
   }
 

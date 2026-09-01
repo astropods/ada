@@ -100,6 +100,25 @@ test("flags a credential added in a new file", async () => {
   expect(rules).toEqual(["secret-in-diff"]);
 });
 
+test("scans a new file whose NAME is shell-hostile", async () => {
+  /**
+   * An untracked file has no diff hunk, so the gate reads its contents with
+   * `head -c ... -- <path>` to catch a freshly-written `.env` or a pasted key.
+   * That path is a shell word, and the model chooses the filename.
+   *
+   * The quoting used to be `JSON.stringify`, which emits a DOUBLE-quoted word —
+   * and `sh` still expands `$` and backticks inside those. So `head` was handed
+   * the expansion's result, read nothing, and the gate saw an empty file: the
+   * credential was never scanned and the rule never fired. A security control
+   * that silently sees nothing is worse than an absent one, because it reports
+   * success.
+   */
+  const rules = await firedRules(noSeed, (d) =>
+    write(d, "src/$(echo pwned)-`id`.ts", `export const T = "ghp_${"A".repeat(36)}";\n`),
+  );
+  expect(rules, "the credential must still be found").toEqual(["secret-in-diff"]);
+});
+
 test("flags a private key block", async () => {
   const rules = await firedRules(noSeed, (d) =>
     write(d, "key.pem", "-----BEGIN RSA PRIVATE KEY-----\nabc\n"),
