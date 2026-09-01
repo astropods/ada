@@ -159,13 +159,52 @@ readable over the other.
 | `GET  /api/whoami` | Resolved identity + admin + GitHub connection state |
 | `GET  /auth/github/login` · `/callback` · `/status` | Per-user GitHub App OAuth |
 | `GET  /api/setup/github/start` · `/callback` · `/api/setup/status` | Web-driven GitHub App provisioning |
-| `ALL  /agents/ada/:id` | Flue's native agent routes (`@flue/sdk`) |
+| `ALL  /agents/ada/:id` | Flue's native agent routes (`@flue/sdk`) — admin-gated |
 
 Only one turn runs at a time per session — an overlapping `POST .../messages`
 returns `409 busy`. (Flue serializes concurrent deliveries to one instance
 anyway; the 409 is kept because the AG-UI client relies on it to keep its own
 turn state coherent.) When a deployment gates access, an unauthorized request
 gets a themed `401` instead of the app shell.
+
+### Who may touch which session
+
+Being **authorized** and being the **owner** are different questions, and
+conflating them was a real hole. `allowed` (the grants table) says whether
+someone may use Ada at all; it says nothing about whose conversations they may
+reach. A session id was the only thing between one authorized user and another's
+repo checkout, GitHub identity, and private-repo content.
+
+Every `/sessions/:id` route — read, drive, delete — now goes through one
+predicate, `maySession()`:
+
+| Session | Who may touch it |
+|---|---|
+| `kind: "slack"` | admins only (a chat conversation is someone else's by construction) |
+| `kind: "browser"` with a recorded owner | that owner, or an admin |
+| no recorded owner | admins only — treated as nobody's, not everybody's |
+| unknown id | passes, so the route answers **404** rather than 403 |
+
+That last row is deliberate: "no such session" has to stay distinguishable from
+"not yours", or a user's own tooling cannot tell a stale id from a permissions
+problem. The check also runs **before** the existence and `409 busy` tests, so
+probing ids cannot reveal which exist or which are mid-turn.
+
+`/agents/ada/*` is **admin-gated as a whole**. It was previously mounted with no
+gate at all, which made it an unauthenticated route to the same durable
+instances the AG-UI path protects. It is gated by admin rather than by
+per-session ownership on purpose: the registry that would answer "who owns this
+instance?" is **in-memory** while Flue's instances are **durable**, so after a
+restart a live Slack conversation is absent from the registry and an ownership
+check would read as "unknown, allow".
+
+"Admin" means `ADMIN_EMAILS` matched against the ALB-verified email — and when
+**no** admin list is configured, any authorized user passes. That is the
+documented single-tenant/dev posture (the same one `/conversations` has), not an
+oversight: **set `ADMIN_EMAILS` in any deployment with more than one user.**
+Ownership is only as strong as the identity behind it; in a deployment that is
+the ALB-verified platform id, while locally it falls back to the unsigned
+`bridge_uid` cookie (see the `TODO` on `ensureUid`).
 
 ## Run on the Astro platform (container, cloud)
 
@@ -199,6 +238,9 @@ Key facts:
 - **`ADMIN_EMAILS`** (optional input) → comma-separated admin emails allowed to
   provision the GitHub App from the web UI (matched against the ALB-verified
   identity). Unset ⇒ any signed-in user may do the *initial* setup, then it locks.
+  It also governs cross-user session access (see "Who may touch which session"),
+  so **set it in any multi-user deployment**: unset means every authorized user
+  can read, drive and delete every other user's conversations.
 - **`GITHUB_APP_PUBLIC`** (optional input, default `false`) → provision the GitHub
   App **private** (single-tenant). Set `true` for **multi-tenant** so any
   teammate can install it on their own repos and connect via chat.
@@ -224,6 +266,8 @@ npm test                                       # or: npm run test:ui
 | Spec | Covers |
 |---|---|
 | `server-sse.spec.ts` | `Last-Event-ID` beats a stale `?lastEventId` query; `DELETE /sessions/:id` semantics |
+| `session-authz.spec.ts` | Whose session an authorized user may read/drive/delete; `/agents/ada/*` is gated; 404-vs-403 |
+| `shell-quote.spec.ts` | POSIX quoting survives the real shell; the `JSON.stringify` bug it replaces |
 | `client-reconnect.spec.ts` | Repeated full-buffer replays render `✓ finished` exactly once |
 | `client-delete.spec.ts` · `client-autoscroll.spec.ts` · `client-followup-delivery.spec.ts` | Built-in AG-UI client behaviour |
 | `security-gates.spec.ts` | Every gate rule, in **both** directions, against real git repos |

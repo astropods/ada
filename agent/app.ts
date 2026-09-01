@@ -239,6 +239,34 @@ function mayViewOthers(id: Identity): boolean {
 }
 
 /**
+ * Whether `id` may address the session `sessionId` — read it, drive it, delete
+ * it. `id.allowed` says the caller may use Ada at all; this says WHOSE
+ * conversations they may touch.
+ *
+ * Being authorized is not the same as being the owner. Session ids are the
+ * only thing standing between one authorized user and another's conversation,
+ * and a session carries a repo checkout, that user's GitHub identity, and their
+ * private-repo content.
+ *
+ * An UNKNOWN session passes, so the caller answers 404 rather than 403. That
+ * keeps "no such session" distinguishable from "not yours" for a user's own
+ * tooling, and matches what /events already did.
+ *
+ * A session with no recorded owner falls back to the admin gate. Those come
+ * from paths that predate the meta rather than from a known user, so treating
+ * them as nobody's (deniable to non-admins) is the safe reading.
+ */
+function maySession(sessionId: string, id: Identity): boolean {
+  if (!id.allowed) return false;
+  if (!registry.has(sessionId)) return true; // let the caller 404
+  // Slack/web conversations belong to other users by construction.
+  if (registry.kind(sessionId) === "slack") return mayViewOthers(id);
+  const owner = registry.owner(sessionId);
+  if (!owner) return mayViewOthers(id);
+  return owner === id.userKey || mayViewOthers(id);
+}
+
+/**
  * The public base URL for THIS request — what we register with GitHub and hand
  * to the browser. Derived from the request so a local run on a non-default port
  * works; explicit config still wins. See auth/base-url.ts.
@@ -259,8 +287,35 @@ app.use("*", async (c, next) => {
 
 /* ---------------- Flue's native agent routes ---------------- */
 
-// `@flue/sdk` clients and Flue tooling talk to /agents/ada/:id. Ada's own
-// AG-UI routes below address the same durable instances.
+/**
+ * `@flue/sdk` clients and Flue tooling talk to /agents/ada/:id. Ada's own
+ * AG-UI routes below address the same durable instances.
+ *
+ * THAT is why this needs a gate. The router was mounted bare while every
+ * /sessions/* route resolved an identity and checked it, so the native path was
+ * an unauthenticated way to reach exactly the same conversations the AG-UI path
+ * gates — read them, drive them, and act as their owner's GitHub identity.
+ *
+ * Restricted to `mayViewOthers` (an admin, or any authorized user when no admin
+ * list is configured) rather than to per-session ownership, deliberately. The
+ * session registry that would answer "who owns this instance?" is IN-MEMORY
+ * while Flue's instances are DURABLE, so after a restart a live Slack
+ * conversation is absent from the registry and an ownership check would read as
+ * "unknown, allow". An admin gate does not depend on that. It is also the
+ * conservative direction: it can only ever grant less than the AG-UI routes.
+ *
+ * Neither the built-in client nor the test suite uses this router, so the gate
+ * costs nothing today; local dev and no-admin-list deployments still pass, the
+ * same posture as /conversations.
+ */
+const gateNativeRouter = async (c: Ctx, next: () => Promise<void>): Promise<Response | void> => {
+  const id = await resolveIdentity(c);
+  if (!id.allowed) return c.text("forbidden", 403);
+  if (!mayViewOthers(id)) return c.text("forbidden", 403);
+  await next();
+};
+app.use("/agents/ada", gateNativeRouter);
+app.use("/agents/ada/*", gateNativeRouter);
 app.route("/agents/ada", createAgentRouter(Ada));
 
 /* ---------------- static client ---------------- */
@@ -307,14 +362,26 @@ app.post("/sessions", async (c) => {
 
 app.post("/sessions/:id/messages", async (c) => {
   const sessionId = c.req.param("id");
+  // AUTHORIZATION FIRST, before anything that reveals the session's state.
+  // Driving another user's conversation is at least as serious as reading it:
+  // the turn runs in their workspace, against their checkout, as their GitHub
+  // identity. Same gate as /events and DELETE.
+  //
+  // The order matters beyond the check itself — this used to sit below the
+  // existence and busy tests, so a non-owner probing ids still learned which
+  // ones existed and which were mid-turn. `maySession` passes UNKNOWN sessions
+  // through precisely so the 404 below still answers for them, which is what
+  // lets the gate move up here without changing any status a legitimate caller
+  // sees.
+  const id = await resolveIdentity(c);
+  if (!id.allowed) return c.text("forbidden", 403);
+  if (!maySession(sessionId, id)) return c.text("forbidden", 403);
   if (!runner.has(sessionId)) return c.text("unknown session", 404);
   const body = await c.req.json<{ prompt?: string }>().catch(() => ({}) as { prompt?: string });
   if (!body.prompt) return c.text("prompt required", 400);
   // Flue serializes concurrent deliveries to one instance, but the AG-UI client
   // relies on 409 to keep its own turn state coherent — so keep refusing here.
   if (runner.busy(sessionId)) return c.text("session busy", 409);
-  const id = await resolveIdentity(c);
-  if (!id.allowed) return c.text("forbidden", 403);
   try {
     await runner.continueSession(sessionId, {
       prompt: body.prompt,
@@ -329,9 +396,14 @@ app.post("/sessions/:id/messages", async (c) => {
 });
 
 app.delete("/sessions/:id", async (c) => {
+  const sessionId = c.req.param("id");
   const id = await resolveIdentity(c);
   if (!id.allowed) return c.text("forbidden", 403);
-  const existed = await runner.delete(c.req.param("id"));
+  // `allowed` alone let any authorized user destroy any session — its Flue
+  // state and its workspace — by id. Deleting is the least recoverable thing
+  // this API does, so it takes the same ownership gate as reading.
+  if (!maySession(sessionId, id)) return c.text("forbidden", 403);
+  const existed = await runner.delete(sessionId);
   return c.body(null, existed ? 204 : 404);
 });
 
@@ -340,10 +412,12 @@ app.get("/sessions/:id/events", async (c) => {
   if (!registry.has(sessionId)) return c.text("unknown session", 404);
 
   // Slack/web conversations belong to other users — gate their replay to
-  // admins. Browser sessions are the viewer's own, so they stay open.
-  if (registry.kind(sessionId) === "slack" && !mayViewOthers(await resolveIdentity(c))) {
-    return c.text("forbidden", 403);
-  }
+  // admins. Browser sessions were assumed to be "the viewer's own", which holds
+  // for the viewer's OWN session and not for anyone else's: the id is the only
+  // thing separating them. maySession keeps the Slack rule exactly as it was
+  // and adds the ownership check for browser sessions, so this can only refuse
+  // more than before, never less.
+  if (!maySession(sessionId, await resolveIdentity(c))) return c.text("forbidden", 403);
 
   // Prefer the browser's Last-Event-ID header over the URL query param. On an
   // automatic EventSource reconnect the URL is unchanged (it may still carry
@@ -419,8 +493,15 @@ app.get("/sessions/:id/events", async (c) => {
  * but it drives the same translator and yields the same 23 AG-UI events, so the
  * assertions in test/server-sse.spec.ts are unchanged.
  */
-app.post("/test/seed", (c) => {
+app.post("/test/seed", async (c) => {
   if (process.env.ADA_TEST_HOOKS !== "1") return c.text("not found", 404);
+  // An optional `{kind, userId}` stamps the session's ownership metadata. The
+  // authorization rules on /sessions/* are all functions of that metadata, and
+  // the only other way to create an owned session is to run a real turn against
+  // a real model — so without this they could not be asserted end to end.
+  const meta = await c.req
+    .json<{ kind?: "browser" | "slack"; userId?: string }>()
+    .catch(() => ({}) as { kind?: "browser" | "slack"; userId?: string });
   try {
     const fixture = join(
       dirname(fileURLToPath(import.meta.url)),
@@ -440,6 +521,7 @@ app.post("/test/seed", (c) => {
       }
     }
     registry.setStatus(sessionId, "finished");
+    if (meta.kind || meta.userId) registry.setMeta(sessionId, meta);
     return c.json({ sessionId, lastSeq }, 201);
   } catch (e) {
     return c.text(`seed failed: ${(e as Error).message}`, 500);

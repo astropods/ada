@@ -67,7 +67,10 @@ External clients can drive the same pipeline over HTTP:
 
 Flue's own routes are mounted alongside at **`/agents/ada/:id`** for `@flue/sdk`
 clients. Both address the same durable instances, so a session started over one
-is readable over the other.
+is readable over the other — which is why `/agents/ada/*` is admin-gated rather
+than open, and why every `/sessions/:id` route checks session OWNERSHIP and not
+just whether the caller is authorized. See "Who may touch which session" in the
+README; set `ADMIN_EMAILS` in any multi-user deployment.
 
 Three ways to run it:
 

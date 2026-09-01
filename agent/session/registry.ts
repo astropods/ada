@@ -101,6 +101,16 @@ export class SessionRegistry {
   }
 
   /**
+   * The identity that owns a session, or undefined if unknown/unrecorded.
+   *
+   * Narrower than exposing `meta` wholesale: this is the field authorization
+   * decisions read, and naming it makes those call sites obvious.
+   */
+  owner(sessionId: string): string | undefined {
+    return this.sessions.get(sessionId)?.meta.userId;
+  }
+
+  /**
    * Drop a session and its event log. Any still-open SSE connection stops
    * receiving new events (its subscription is detached); the client sees the
    * stream go quiet. Returns false if the session was already gone.
