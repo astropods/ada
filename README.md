@@ -148,6 +148,23 @@ clients speak. `/agents/ada/*` is Flue's native router for `@flue/sdk` clients.
 Both address the **same durable instances**, so a session started over one is
 readable over the other.
 
+**Only one of them starts turns.** `POST /agents/ada/:id` — Flue's prompt
+dispatch — is refused with a 405. It renders the agent without going through
+`SessionRunner`, and the per-session context that selects the sandbox is
+published by the runner immediately before it dispatches. A render that skips
+the runner found nothing and fell back to executing in the **control-plane
+container at `process.cwd()`**: the model's shell and file tools on Ada's own
+source tree, with no per-conversation workspace and none of the sandbox
+isolation, even with a sandbox container deployed.
+
+Refusing rather than wiring the setup into that path is deliberate. Publishing a
+context there would fix the isolation and still leave native dispatch bypassing
+the concurrency limiter, the translator and its registry mirroring (so no AG-UI
+stream, no SSE, no conversation-review record) and the run records — a second,
+half-instrumented way to run a turn, which is the kind of divergence that
+produced the bug. One supported path, and it is the one that sets up isolation.
+Reads, aborts and attachment fetches over the native router are untouched.
+
 | Route | Purpose |
 |---|---|
 | `GET  /` | Built-in AG-UI test client (`public/index.html`) |
@@ -159,7 +176,8 @@ readable over the other.
 | `GET  /api/whoami` | Resolved identity + admin + GitHub connection state |
 | `GET  /auth/github/login` · `/callback` · `/status` | Per-user GitHub App OAuth |
 | `GET  /api/setup/github/start` · `/callback` · `/api/setup/status` | Web-driven GitHub App provisioning |
-| `ALL  /agents/ada/:id` | Flue's native agent routes (`@flue/sdk`) — admin-gated |
+| `GET  /agents/ada/:id` · `/abort` · `/attachments/:aid` | Flue's native agent routes (`@flue/sdk`) — admin-gated, **read/abort only** |
+| `POST /agents/ada/:id` | **405** — native prompt dispatch is refused; use `POST /sessions` |
 
 Only one turn runs at a time per session — an overlapping `POST .../messages`
 returns `409 busy`. (Flue serializes concurrent deliveries to one instance
@@ -267,6 +285,9 @@ npm test                                       # or: npm run test:ui
 |---|---|
 | `server-sse.spec.ts` | `Last-Event-ID` beats a stale `?lastEventId` query; `DELETE /sessions/:id` semantics |
 | `session-authz.spec.ts` | Whose session an authorized user may read/drive/delete; `/agents/ada/*` is gated; 404-vs-403 |
+| `native-router.spec.ts` | Native prompt dispatch is refused; a context-less render still selects the sandbox |
+| `background-turn.spec.ts` | `POST /sessions` returns before the turn settles; a pre-dispatch failure still reports |
+| `chat-brevity.spec.ts` | Slack gets the brevity instruction, the browser does not, and it survives follow-ups |
 | `shell-quote.spec.ts` | POSIX quoting survives the real shell; the `JSON.stringify` bug it replaces |
 | `client-reconnect.spec.ts` | Repeated full-buffer replays render `✓ finished` exactly once |
 | `client-delete.spec.ts` · `client-autoscroll.spec.ts` · `client-followup-delivery.spec.ts` | Built-in AG-UI client behaviour |

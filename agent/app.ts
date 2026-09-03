@@ -316,6 +316,48 @@ const gateNativeRouter = async (c: Ctx, next: () => Promise<void>): Promise<Resp
 };
 app.use("/agents/ada", gateNativeRouter);
 app.use("/agents/ada/*", gateNativeRouter);
+
+/**
+ * The native router may READ a conversation. It may not START a turn.
+ *
+ * `POST /agents/ada/:id` is Flue's prompt dispatch, and it renders the agent
+ * WITHOUT going through SessionRunner. `session-env.ts` is process-local and
+ * published by the runner immediately before it dispatches, so a render that
+ * skips the runner finds nothing and falls back to `fallbackEnv()` — which,
+ * before this, meant `local({ cwd: process.cwd() })`. A turn dispatched here
+ * ran the model's shell and file tools in the CONTROL PLANE container, on its
+ * own source tree, with no per-conversation workspace and none of the sandbox
+ * isolation — even with a sandbox container deployed.
+ *
+ * Chose to REFUSE rather than to wire the setup into this path. Publishing a
+ * session env here would fix the isolation and still leave native dispatch
+ * bypassing the concurrency limiter, the translator and its registry mirroring
+ * (so no AG-UI stream, no SSE, no conversation-review record) and the run
+ * records. That is a second, half-instrumented way to run a turn — which is the
+ * kind of divergence that produced this bug in the first place. One supported
+ * path, and it is the one that sets up isolation.
+ *
+ * Everything the router is documented for still works: reading the same durable
+ * instances (`GET|HEAD /:id`), aborting (`POST /:id/abort`) and attachment reads
+ * are all untouched. Only prompt dispatch is refused, and nothing in this repo
+ * used it. Registered BEFORE `app.route` so it wins for this exact method and
+ * path; `:id` matches a single segment, so `/:id/abort` is unaffected.
+ */
+app.post("/agents/ada/:id", (c) =>
+  c.json(
+    {
+      error: "native prompt dispatch is not supported",
+      detail:
+        "Starting a turn here would run the agent's tools in the control-plane " +
+        "container with no sandbox isolation, because this path does not go through " +
+        "the session runner. Use POST /sessions to start a conversation, or " +
+        "POST /sessions/:id/messages to continue one; both stream over " +
+        "GET /sessions/:id/events. Reading a conversation through " +
+        "GET /agents/ada/:id still works.",
+    },
+    405,
+  ),
+);
 app.route("/agents/ada", createAgentRouter(Ada));
 
 /* ---------------- static client ---------------- */

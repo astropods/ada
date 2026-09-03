@@ -80,6 +80,12 @@ than open, and why every `/sessions/:id` route checks session OWNERSHIP and not
 just whether the caller is authorized. See "Who may touch which session" in the
 README; set `ADMIN_EMAILS` in any multi-user deployment.
 
+The native router is **read/abort only**: `POST /agents/ada/:id` (prompt
+dispatch) returns 405. It renders the agent without `SessionRunner`, so the
+per-session context that selects the sandbox was never published and the turn
+executed in the control-plane container at `process.cwd()` instead. Start turns
+with `POST /sessions`.
+
 Three ways to run it:
 
 ```bash

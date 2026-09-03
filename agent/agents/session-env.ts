@@ -19,7 +19,8 @@
  * `claudeSessionIds` resume mapping.
  */
 
-import { resolveModel } from "../config/model.ts";
+import { resolveModel, sandboxEnv } from "../config/model.ts";
+import { sandboxHost } from "../session/remote-sandbox.ts";
 import type { RepoSpec } from "../session/repo.ts";
 
 export interface SessionEnv {
@@ -112,12 +113,39 @@ export function clearSessionEnv(instanceId: string): void {
   checkouts.delete(instanceId);
 }
 
-/** Recovery-path context: no token, no repo, cwd is the process cwd. */
+/**
+ * Recovery-path context: no token, no repo — but still ISOLATED where isolation
+ * exists.
+ *
+ * This used to return `cwd: process.cwd()` with no `remote`, which makes
+ * `ada.ts` mount `local()` — the model's shell and file tools operating on the
+ * CONTROL PLANE container, on its own source tree, with no per-conversation
+ * workspace. That was reachable two ways: Flue's native `POST /agents/ada/:id`
+ * (now refused in app.ts, since it bypasses the runner entirely) and the reason
+ * this function exists at all — a recovery render, which runs before any of our
+ * handlers touch the instance and therefore before the runner publishes
+ * anything. Closing only the first door would have left the second.
+ *
+ * So when the platform deployed a sandbox, the fallback selects it. Scoping is
+ * automatic and does not need the instance id here: `useSandbox(remote(...))`
+ * builds the driver per instance, and the factory asks the container for that
+ * instance's own absolute workspace path. A render with no published context is
+ * now degraded in CAPABILITY — no GitHub token, no repo binding — rather than
+ * in containment.
+ *
+ * With no sandbox deployed there is no isolation to select, and `process.cwd()`
+ * is the intended posture for `node agent/index.ts` and `flue run` on a
+ * developer's machine. `sandboxEnv()` rather than `{}` so the scrubbed
+ * allowlist (proxy/TLS, cache paths, the worker-pool caps) still reaches
+ * commands; it carries no credential, because none is resolved on this path.
+ */
 function fallbackEnv(): SessionEnv {
+  const baseUrl = sandboxHost();
   return {
     modelRef: resolveModel().ref,
     cwd: process.cwd(),
-    sandboxEnv: {},
+    remote: baseUrl ? { baseUrl, token: process.env.SANDBOX_TOKEN } : undefined,
+    sandboxEnv: sandboxEnv(),
     githubConfigured: false,
     githubConnected: false,
   };
