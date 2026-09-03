@@ -1,7 +1,7 @@
 import { test, expect } from "@playwright/test";
 import { mkdtempSync, rmSync, existsSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { remoteSandboxDriver, ensureRepoInSandbox, sandboxHost, sandboxEnabled } from "../agent/session/remote-sandbox.ts";
 import { cloneCommand } from "../agent/session/repo.ts";
@@ -445,4 +445,179 @@ test("advertises its capabilities so version skew is visible at startup", async 
   // discovering a stale image when a session fails mid-turn.
   expect(health.capabilities, "health lists the routes this image serves").toContain("/workspace");
   expect(health.capabilities).toContain("/exec");
+});
+
+/* ---------------- confinement of the SHELL between conversations ---------------- */
+
+/**
+ * `resolveIn` contains the FILE endpoints. It cannot contain `/exec`.
+ *
+ * A path argument can be checked; a shell command cannot, because it is a
+ * program rather than an argument, and `cat /data/<other-instance>/secret` is a
+ * perfectly valid one. So the shell used to be a hole straight through the
+ * containment the rest of the service enforces: one conversation could read
+ * another's checkout, and list the workspace root to find it. The isolation the
+ * file endpoints assert above was real; the isolation the module's own comments
+ * claimed for `bash` was not.
+ *
+ * The fix stops relying on a check and lets the kernel do it — a uid per
+ * instance, workspaces chmod 0700, commands spawned as that uid — which needs
+ * the service to be root. Two tests, because neither alone is enough:
+ *
+ *   - The ALWAYS-ON one asserts the service's REPORT MATCHES REALITY, in
+ *     whichever mode it is in. That is the specific failure being corrected:
+ *     not "the shell is unconfined" but "the shell is unconfined while the code
+ *     says otherwise". It cannot pass while /health lies in either direction.
+ *   - The OPT-IN one asserts the real denial against the shipped image, as
+ *     root, in a container. It needs Docker, so it is opt-in rather than
+ *     silently skipped — a conditional that hides a genuine breakage is worse
+ *     than no test (same reasoning as the Postgres case in persistence.spec.ts).
+ *
+ *       ADA_TEST_CONFINEMENT=1 npx playwright test test/remote-sandbox.spec.ts
+ */
+
+test("reports its confinement mode honestly, whichever mode it is in", async () => {
+  const health = await (await fetch(`${baseUrl}/health`)).json();
+  expect(["per-instance-uid", "none"], "health must state a known mode").toContain(
+    health.confinement,
+  );
+
+  // Instance A stores something only it should see.
+  const a = driverFor("inst-confine-a");
+  await a.writeFile("secret.txt", "A's private repo content");
+  const wsA = await a.workspacePath();
+
+  // The file endpoints refuse regardless of mode — that is `resolveIn`, and it
+  // is not what is under test here.
+  const b = driverFor("inst-confine-b");
+  await expect(b.readFile(`${wsA}/secret.txt`)).rejects.toThrow(/escapes the workspace/);
+
+  // The shell is what the mode describes, so hold the mode to it.
+  const viaShell = await b.exec(`cat ${wsA}/secret.txt`);
+  if (health.confinement === "per-instance-uid") {
+    expect(viaShell.exitCode, "confined: the kernel must refuse it").not.toBe(0);
+    expect(viaShell.stdout).not.toContain("private repo content");
+  } else {
+    // Unconfined (this suite does not run as root). Asserted, not glossed: the
+    // guarantee genuinely is weaker here, and /health has to be saying so.
+    expect(viaShell.stdout, "unconfined: the shell can cross, as /health admits").toContain(
+      "private repo content",
+    );
+  }
+});
+
+const CONFINEMENT = process.env.ADA_TEST_CONFINEMENT === "1";
+
+test.describe("the shipped image, running as root", () => {
+  test.skip(!CONFINEMENT, "set ADA_TEST_CONFINEMENT=1 to run (needs Docker; see the note above)");
+  test.describe.configure({ timeout: 300_000 });
+
+  const TAG = "ada-sandbox:confinement-test";
+  const NAME = "ada-sandbox-confinement-test";
+  let url: string;
+
+  test.beforeAll(async () => {
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const { fileURLToPath } = await import("node:url");
+    const run = promisify(execFile);
+    const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+    await run("docker", ["build", "-q", "-f", "sandbox/Dockerfile", "-t", TAG, "."], {
+      cwd: repoRoot,
+      maxBuffer: 1e8,
+    });
+    await run("docker", ["rm", "-f", NAME]).catch(() => {});
+    const { stdout } = await run("docker", [
+      "run", "-d", "--name", NAME, "-p", "0:3000", TAG,
+    ]);
+    const { stdout: port } = await run("docker", [
+      "port", stdout.trim().slice(0, 12), "3000/tcp",
+    ]);
+    url = `http://127.0.0.1:${port.trim().split(":").pop()}`;
+
+    const deadline = Date.now() + 60_000;
+    for (;;) {
+      try {
+        await fetch(`${url}/health`, { signal: AbortSignal.timeout(1000) });
+        return;
+      } catch {
+        if (Date.now() > deadline) throw new Error("sandbox container did not start");
+        await new Promise((r) => setTimeout(r, 250));
+      }
+    }
+  });
+
+  test.afterAll(async () => {
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    await promisify(execFile)("docker", ["rm", "-f", NAME]).catch(() => {});
+  });
+
+  const call = async (path: string, body: unknown): Promise<Record<string, string>> => {
+    const res = await fetch(`${url}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return (await res.json()) as Record<string, string>;
+  };
+
+  test("a shell in one conversation cannot read another's workspace", async () => {
+    expect(
+      ((await (await fetch(`${url}/health`)).json()) as { confinement: string }).confinement,
+      "the image must run as root and confine",
+    ).toBe("per-instance-uid");
+
+    await call("/write", { id: "victim", path: "secret.txt", content: "private repo content" });
+    const wsVictim = (await call("/workspace", { id: "victim" })).path;
+
+    // THE assertion: by ABSOLUTE path, from another instance's shell.
+    const read = await call("/exec", { id: "attacker", command: `cat ${wsVictim}/secret.txt` });
+    expect(read.stdout).not.toContain("private repo content");
+    expect(read.exitCode).not.toBe(0);
+    expect(read.stderr).toMatch(/permission denied/i);
+
+    // Enumerating siblings is refused too — that is the step before reading one.
+    const list = await call("/exec", { id: "attacker", command: "ls /data" });
+    expect(list.stdout).not.toContain("victim");
+    expect(list.stderr).toMatch(/permission denied/i);
+
+    // Each conversation gets its own uid, which is what the kernel enforces on.
+    const idA = (await call("/exec", { id: "victim", command: "id -u" })).stdout.trim();
+    const idB = (await call("/exec", { id: "attacker", command: "id -u" })).stdout.trim();
+    expect(idA).not.toBe(idB);
+
+    // And confinement must not cost a conversation access to its OWN workspace.
+    const own = await call("/exec", {
+      id: "victim",
+      command: "cat secret.txt && echo ok > mine.txt && cat mine.txt",
+    });
+    expect(own.exitCode).toBe(0);
+    expect(own.stdout).toContain("private repo content");
+    expect(own.stdout).toContain("ok");
+  });
+
+  test("the toolchain still works after dropping privileges", async () => {
+    // The risk of a synthetic uid is tools that call getpwuid() and fail. Real
+    // work has to keep working, or the isolation is bought with a broken agent.
+    const git = await call("/exec", {
+      id: "tool",
+      command:
+        "git init -q r && cd r && git config user.email t@t.t && git config user.name t && " +
+        "echo hi > a.txt && git add -A && git commit -qm init && git log --oneline -1",
+    });
+    expect(git.exitCode, `git failed: ${git.stderr}`).toBe(0);
+
+    const writable = await call("/exec", {
+      id: "tool",
+      command: 'test -w "$HOME" && test -w "$npm_config_cache" && test -w "$TMPDIR" && echo yes',
+    });
+    expect(writable.stdout.trim(), "HOME and caches must be writable by the confined uid").toBe("yes");
+
+    // Caches are per-instance: a shared mutable cache would be a channel
+    // between conversations that survived the uid split.
+    const cache = await call("/exec", { id: "tool", command: 'echo "$npm_config_cache"' });
+    expect(cache.stdout.trim()).toContain("/data/tool/");
+  });
 });

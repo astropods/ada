@@ -32,8 +32,16 @@ AG-UI frontend. Flue's event stream is translated into
 Server-Sent Events, so any AG-UI-compatible frontend can render a run — a plain
 chat UI or a richer dashboard — without backend changes.
 
-Each session gets its own writable sandbox workspace as its working directory,
-and the sandbox env is scrubbed: Flue's `local()` allowlist plus the proxy/TLS
+Each session gets its own writable sandbox workspace as its working directory.
+When the sandbox container is deployed, that workspace is also isolated FROM
+OTHER SESSIONS two ways: path resolution rejects a file operation that escapes
+it, and shell commands run under a per-instance uid against a 0700 directory, so
+one conversation cannot read another's checkout by naming an absolute path
+either. Command confinement needs the sandbox service to run as root and is
+reported by its `/health`; the network is not isolated. The in-process `local()`
+fallback has neither — it is for local runs, not a multi-tenant boundary.
+
+The sandbox env is scrubbed: Flue's `local()` allowlist plus the proxy/TLS
 and build-cache vars, and the user's GitHub token. So a command the model runs —
 `bash` → `env` — can't read the container's host secrets (AWS, database, gateway
 keys). The model credential is no longer forwarded at all, because no child

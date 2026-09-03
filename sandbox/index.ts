@@ -5,9 +5,28 @@
  * NONE of the control plane's secrets: no database credentials, no GitHub App
  * client secret, no HMAC signing key, no other user's data. It receives, per
  * request, only what one operation needs — and a GitHub token only for the
- * duration of the command that uses it. So a rogue `bash` the model runs
- * reaches at most one conversation's checkout, in a process that has nothing
- * else worth stealing.
+ * duration of the command that uses it. So a rogue `bash` the model runs finds
+ * a process with nothing worth stealing in it.
+ *
+ * Reaching no FURTHER than its own conversation is a SEPARATE guarantee with a
+ * separate mechanism, and this comment used to claim it without one. Two
+ * different things enforce it:
+ *
+ *   - FILE endpoints are contained by `resolveIn`: every caller-supplied path is
+ *     resolved inside that instance's directory and rejected otherwise. That is
+ *     a check on an argument.
+ *   - COMMANDS cannot be contained that way, because a command is a program and
+ *     has no argument to check — `cat /data/<other-instance>/secret` is a valid
+ *     one. They are confined by the kernel instead: a uid per instance,
+ *     workspaces chmod 0700, spawned as that uid. See "command confinement".
+ *
+ * Command confinement requires this service to run as root (it does in this
+ * image — there is no USER line). Where it cannot, /health reports
+ * `confinement: "none"` and startup warns, rather than quietly serving a weaker
+ * guarantee. The file endpoints stay contained either way.
+ *
+ * NOT covered: the network. Commands share a network namespace, so this is
+ * filesystem isolation between conversations, not a general-purpose sandbox.
  *
  * ── What changed in the Flue rewrite ─────────────────────────────────────
  *
@@ -36,14 +55,26 @@
  *   POST /rm          {id, path, recursive?, force?}         -> {ok}
  *
  * `id` is the Flue agent instance id. Every path is resolved inside that
- * instance's own directory under WORKSPACE_ROOT and REJECTED if it escapes —
- * one conversation cannot read another's checkout even by asking nicely.
+ * instance's own directory under WORKSPACE_ROOT and REJECTED if it escapes, and
+ * commands run under that instance's own uid — so one conversation cannot read
+ * another's checkout by asking nicely OR by spelling an absolute path at a
+ * shell.
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
 import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  lchownSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -118,6 +149,14 @@ const maxReadFileBytes = (): number =>
  * else here. Only `/exec` is gated; file operations are never queued.
  */
 const MAX_CONCURRENT_EXEC = Number(process.env.SANDBOX_MAX_CONCURRENT_EXEC ?? 2);
+/**
+ * First uid handed to a conversation's commands. Above the system range and
+ * above the uids a base image is likely to use, so a sandbox uid never collides
+ * with a real account in the container.
+ */
+const UID_BASE = Number(process.env.SANDBOX_UID_BASE ?? 100000);
+/** Records the uid assigned to an instance, so it survives a service restart. */
+const UID_MARKER = ".sandbox-uid";
 /** Idle workspaces are reclaimed after this long. */
 const WORKSPACE_TTL_MS = Number(process.env.SANDBOX_WORKSPACE_TTL_MS ?? 24 * 60 * 60 * 1000);
 
@@ -152,6 +191,203 @@ function baseEnv(): NodeJS.ProcessEnv {
   return out;
 }
 
+/**
+ * Redirect everything a confined command needs to write into its OWN workspace.
+ *
+ * Two things force this. A dropped-privilege command cannot write the paths the
+ * image bakes in — HOME is root's, and the caches under `${WORKSPACE_ROOT}/.cache`
+ * are root-owned — so without this, confinement would simply break `git`, `bun`
+ * and every package manager.
+ *
+ * The second reason is the better one: a mutable cache SHARED between
+ * conversations is itself a channel between them. One conversation poisoning a
+ * module cache that another then builds against is exactly the crossing this
+ * confinement exists to prevent, and it would have survived the uid split. So
+ * per-instance caches are part of the isolation, not a workaround for it.
+ *
+ * The cost is honest and worth stating: a toolchain or module cache is no longer
+ * shared across conversations, so the first build in each pays a download that
+ * it previously might not have. Within a conversation — the repeated case, since
+ * an instance directory outlives its turns — caching is unchanged.
+ *
+ * USER/LOGNAME are set because a synthetic uid has no /etc/passwd entry, and
+ * tools that want a user name generally consult the environment before
+ * getpwuid(). Returns nothing at all when unconfined, so that path keeps the
+ * image's shared caches exactly as before.
+ */
+function confinedEnv(id: string, dir: string): NodeJS.ProcessEnv {
+  if (!confineCommands) return {};
+  const cache = join(dir, ".cache");
+  const tmp = join(dir, ".tmp");
+  const paths = {
+    HOME: dir,
+    TMPDIR: tmp,
+    GOMODCACHE: join(cache, "go", "mod"),
+    GOCACHE: join(cache, "go", "build"),
+    npm_config_cache: join(cache, "npm"),
+    PIP_CACHE_DIR: join(cache, "pip"),
+    BUN_INSTALL_CACHE_DIR: join(cache, "bun"),
+  };
+  const uid = uidFor(id, dir);
+  // Once per instance, not once per command. npm, bun and Go all create their
+  // own cache directory, so this is insurance for a tool that expects its
+  // configured cache path to already exist rather than something they need.
+  if (!scaffolded.has(id)) {
+    scaffolded.add(id);
+    for (const d of [tmp, ...Object.values(paths).filter((v) => v !== dir && v !== tmp)]) {
+      try {
+        mkdirSync(d, { recursive: true });
+        chownTree(d, uid);
+      } catch {
+        /* a command reports a write failure far more usefully than we can */
+      }
+    }
+  }
+  return { ...paths, USER: `sandbox-${uid}`, LOGNAME: `sandbox-${uid}` };
+}
+
+/* -------------------------------------------------- command confinement */
+
+/**
+ * OS-level isolation for the SHELL, which `resolveIn` cannot provide.
+ *
+ * `resolveIn` below confines the FILE endpoints: every path a caller names is
+ * resolved inside its own instance directory and rejected if it escapes. That
+ * is a check on an argument, and a shell command has no argument to check. It
+ * is a program, and `cat /data/<other-instance>/secret` is a perfectly valid
+ * one. So `/exec` used to be a hole straight through the containment the rest of
+ * this file enforces: one conversation could read another's checkout, and list
+ * every sibling instance to find it.
+ *
+ * The fix is to stop relying on a check and let the kernel do it. Each instance
+ * is assigned its own unprivileged uid; its directory is chowned to that uid and
+ * chmod 0700; and its commands are spawned AS that uid. A shell in conversation
+ * B is then refused by the filesystem when it reaches for A's directory —
+ * whatever path it spells, however it spells it, and including through a
+ * symlink, because the permission is enforced on the inode rather than on the
+ * string.
+ *
+ * WHAT THIS REQUIRES, and what happens without it: dropping privileges needs the
+ * service to be root (it is, in this image — there is no USER line). If it is
+ * not, confinement is IMPOSSIBLE rather than merely skipped, so the service says
+ * so loudly at startup and reports it in /health instead of quietly serving a
+ * weaker guarantee than its documentation claims. That silent-weaker-guarantee
+ * is exactly the failure being corrected here.
+ *
+ * WHAT IT DOES NOT COVER: the network. Commands still share a network namespace,
+ * so this is filesystem isolation between conversations, not a full sandbox.
+ */
+let confineCommands = false;
+/** Instance id -> its uid. Populated from disk on demand and at startup. */
+const instanceUids = new Map<string, number>();
+let nextUid = UID_BASE;
+let confinementWarned = false;
+/** Instances whose HOME/cache scaffold has been created, so it happens once. */
+const scaffolded = new Set<string>();
+
+/** Whether this process can drop privileges at all. */
+function canConfine(): boolean {
+  return typeof process.getuid === "function" && process.getuid() === 0;
+}
+
+/**
+ * Seed uid bookkeeping from the volume, so a restart keeps every instance on the
+ * uid that already owns its files. Without this a restart would hand out uids
+ * from the base again and a conversation would be locked out of its own
+ * workspace.
+ */
+function loadUidAssignments(): void {
+  if (!existsSync(ROOT)) return;
+  for (const name of readdirSync(ROOT)) {
+    const marker = join(ROOT, name, UID_MARKER);
+    if (!existsSync(marker)) continue;
+    const uid = Number(readFileSync(marker, "utf8").trim());
+    if (!Number.isInteger(uid) || uid < UID_BASE) continue;
+    instanceUids.set(name, uid);
+    if (uid >= nextUid) nextUid = uid + 1;
+  }
+}
+
+/**
+ * The uid for an instance, allocating one on first use.
+ *
+ * Allocation is a monotonic counter rather than a hash of the instance id. A
+ * hash is stateless and tempting, but two ids colliding would silently give two
+ * conversations the same uid — that is, no isolation between them, with nothing
+ * to indicate it. A counter seeded from what is already on disk cannot collide.
+ */
+function uidFor(id: string, dir: string): number {
+  const cached = instanceUids.get(id);
+  if (cached != null) return cached;
+  const marker = join(dir, UID_MARKER);
+  if (existsSync(marker)) {
+    const existing = Number(readFileSync(marker, "utf8").trim());
+    if (Number.isInteger(existing) && existing >= UID_BASE) {
+      instanceUids.set(id, existing);
+      if (existing >= nextUid) nextUid = existing + 1;
+      return existing;
+    }
+  }
+  const uid = nextUid++;
+  writeFileSync(marker, `${uid}\n`, { mode: 0o644 });
+  instanceUids.set(id, uid);
+  return uid;
+}
+
+/**
+ * Give every existing entry to `uid`.
+ *
+ * `lchownSync`, NEVER `chownSync`. chown follows symlinks, and this runs as root
+ * over a directory tree whose contents the model wrote. A workspace containing a
+ * symlink to /etc/shadow would hand that file to the sandbox uid — turning
+ * confinement into a privilege escalation. lchown changes the link itself.
+ */
+function chownTree(path: string, uid: number): void {
+  lchownSync(path, uid, uid);
+  let entries: ReturnType<typeof readdirSync>;
+  try {
+    entries = readdirSync(path, { withFileTypes: true });
+  } catch {
+    return; // not a directory, or vanished mid-walk
+  }
+  for (const entry of entries) {
+    const full = join(path, entry.name);
+    if (entry.isSymbolicLink()) lchownSync(full, uid, uid);
+    else if (entry.isDirectory()) chownTree(full, uid);
+    else lchownSync(full, uid, uid);
+  }
+}
+
+/**
+ * Make `dir` reachable by its instance's uid and by nobody else's.
+ *
+ * Idempotent and cheap on the common path: it compares the current owner and
+ * mode first, so the recursive walk happens once per workspace — on creation, or
+ * once when a deployment upgrades into a version that confines (where the tree
+ * already exists and is owned by root).
+ */
+function confineWorkspace(id: string, dir: string): void {
+  if (!confineCommands) return;
+  const uid = uidFor(id, dir);
+  try {
+    const st = statSync(dir);
+    if (st.uid === uid && (st.mode & 0o777) === 0o700) return;
+    chownTree(dir, uid);
+    chmodSync(dir, 0o700);
+    // The marker stays root-owned and readable so the mapping survives even if
+    // the instance's own commands scribble over their directory.
+    lchownSync(join(dir, UID_MARKER), 0, 0);
+  } catch (e) {
+    if (!confinementWarned) {
+      confinementWarned = true;
+      console.warn(
+        `[sandbox] could not confine ${dir}: ${(e as Error).message} — commands for different ` +
+          "conversations may be able to read each other's files",
+      );
+    }
+  }
+}
+
 /* ---------------------------------------------------------- path safety */
 
 /** The directory belonging to one agent instance. Created on first use. */
@@ -159,6 +395,7 @@ function workspaceOf(id: string): string {
   if (!/^[A-Za-z0-9._-]{1,128}$/.test(id)) throw new HttpError(400, "invalid instance id");
   const dir = join(ROOT, id);
   mkdirSync(dir, { recursive: true });
+  confineWorkspace(id, dir);
   return dir;
 }
 
@@ -370,8 +607,17 @@ const handlers: Record<string, (b: Body) => Promise<unknown>> = {
     const command = str(b, "command");
     const base = workspaceOf(id);
     const cwd = b.cwd ? resolveIn(id, str(b, "cwd")) : base;
-    const env = { ...baseEnv(), ...((b.env as Record<string, string> | undefined) ?? {}) };
+    // Confinement env goes on LAST, after the caller's. A caller has no business
+    // redirecting a confined command's HOME or caches back onto shared paths,
+    // and letting the request win would make the isolation defeatable by the
+    // very thing it isolates.
+    const env = {
+      ...baseEnv(),
+      ...((b.env as Record<string, string> | undefined) ?? {}),
+      ...confinedEnv(id, base),
+    };
     const timeout = Math.min(Number(b.timeoutMs ?? MAX_TIMEOUT_MS) || MAX_TIMEOUT_MS, MAX_TIMEOUT_MS);
+    const uid = confineCommands ? uidFor(id, base) : undefined;
 
     return execSlots.run(
       () =>
@@ -384,7 +630,16 @@ const handlers: Record<string, (b: Body) => Promise<unknown>> = {
           // orphaned and running. A `bun install` or `tsc` that timed out kept
           // its memory for as long as it felt like, in the container least able
           // to spare it, and the next command started on top of it.
-          const child = spawn("/bin/sh", ["-c", command], { cwd, env, detached: true });
+          const child = spawn("/bin/sh", ["-c", command], {
+            cwd,
+            env,
+            detached: true,
+            // THE isolation boundary for shell commands. With a per-instance uid
+            // and a 0700 workspace, the kernel refuses another conversation's
+            // directory however the path is spelled — which a string check on an
+            // argument can never do for a program.
+            ...(uid != null ? { uid, gid: uid } : {}),
+          });
           const stdout = new BoundedCapture();
           const stderr = new BoundedCapture();
           let timedOut = false;
@@ -485,6 +740,9 @@ const handlers: Record<string, (b: Body) => Promise<unknown>> = {
   },
 
   async "/rm"(b) {
+    // A caller removing part of its workspace may have removed the scaffold, so
+    // let the next command recreate it rather than assuming it survives.
+    scaffolded.delete(str(b, "id"));
     await rm(resolveIn(str(b, "id"), str(b, "path")), {
       recursive: Boolean(b.recursive),
       force: Boolean(b.force),
@@ -520,6 +778,30 @@ async function sweep(): Promise<void> {
   if (removed > 0) console.log(`[sandbox] reclaimed ${removed} idle workspace(s)`);
 }
 
+/**
+ * Turn confinement on if this process can, and prepare the volume for it.
+ *
+ * Exported so a test can enable it explicitly; called by the entrypoint below.
+ * Returns whether commands will be confined.
+ */
+export function initConfinement(): boolean {
+  confineCommands = canConfine();
+  if (!confineCommands) return false;
+  mkdirSync(ROOT, { recursive: true });
+  loadUidAssignments();
+  try {
+    // 0711: traversable but NOT listable. Instance directories are already
+    // unreadable to each other, but a readable root let one conversation
+    // ENUMERATE every other instance id — the reconnaissance step before
+    // reading one. Execute-without-read denies the listing while still letting
+    // each command reach its own directory through the path.
+    chmodSync(ROOT, 0o711);
+  } catch (e) {
+    console.warn(`[sandbox] could not restrict ${ROOT}: ${(e as Error).message}`);
+  }
+  return true;
+}
+
 export function createSandboxServer() {
   return createServer((req, res) => {
     void (async () => {
@@ -529,7 +811,16 @@ export function createSandboxServer() {
           // older than itself at startup rather than discovering it when a
           // session fails. The two containers deploy together but do not
           // always rebuild together.
-          return json(res, 200, { ok: true, root: ROOT, capabilities: Object.keys(handlers) });
+          // `confinement` is reported so an operator can SEE whether commands are
+          // isolated from each other, rather than inferring it from the docs.
+          // The previous version of this file claimed the isolation it did not
+          // have; a claim that cannot be checked is how that survived.
+          return json(res, 200, {
+            ok: true,
+            root: ROOT,
+            capabilities: Object.keys(handlers),
+            confinement: confineCommands ? "per-instance-uid" : "none",
+          });
         }
         if (req.method !== "POST") throw new HttpError(405, "method not allowed");
         if (TOKEN && req.headers["x-sandbox-token"] !== TOKEN) throw new HttpError(401, "unauthorized");
@@ -556,6 +847,20 @@ function json(res: ServerResponse, status: number, body: unknown): void {
 // factory and bind an ephemeral port.
 if (process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/^.*[/\\]/, ""))) {
   mkdirSync(ROOT, { recursive: true });
+  if (initConfinement()) {
+    console.log(
+      `[sandbox] commands are confined: one unprivileged uid per instance (from ${UID_BASE}), ` +
+        "workspaces chmod 0700",
+    );
+  } else {
+    // Loud, because the documented guarantee does not hold in this mode and the
+    // difference is invisible from the outside otherwise.
+    console.warn(
+      "[sandbox] NOT running as root, so commands CANNOT be confined: a shell in one " +
+        "conversation can read another conversation's workspace by absolute path. The file " +
+        "endpoints are still contained. Run this service as root to isolate commands.",
+    );
+  }
   if (!TOKEN) {
     console.warn(
       "[sandbox] SANDBOX_TOKEN is not set — this service trusts its network. " +

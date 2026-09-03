@@ -16,6 +16,19 @@
  * `knowledge.sandbox` container is deployed. Present means remote, absent means
  * `local()` in-process — so `node agent/index.ts` and `flue run` keep working
  * with no configuration, and a deployment gets isolation without a code change.
+ *
+ * WHAT "isolation" MEANS HERE, precisely, because it is two guarantees and not
+ * one. Paths sent to the file endpoints are resolved inside the requesting
+ * instance's own directory and rejected if they escape. Shell commands are
+ * confined separately, by the kernel — a uid per instance and a 0700 workspace
+ * — because path resolution cannot cover them: it checks an ARGUMENT, and a
+ * command is a PROGRAM, so `cat /data/<other-instance>/secret` has nothing to
+ * check. The command half needs the sandbox service to run as root; its
+ * /health reports whether it does. Neither half isolates the network.
+ *
+ * The in-process `local()` fallback has NEITHER: it runs in the control plane
+ * as the control plane, which is fine for `flue run` on your own machine and is
+ * not a multi-tenant boundary.
  */
 
 import { sandboxFromDriver } from "@flue/runtime";
