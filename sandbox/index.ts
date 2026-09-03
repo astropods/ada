@@ -63,6 +63,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
+import { constants } from "node:fs";
 import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import {
   chmodSync,
@@ -438,6 +439,26 @@ function resolveIn(id: string, path: string): string {
 const MAX_SYMLINK_HOPS = 40;
 
 /**
+ * Open flags that make the KERNEL re-check the containment decision.
+ *
+ * `resolveIn` returns a path with every symlink already resolved, so the final
+ * component of what we open is never legitimately a link. Saying so to the
+ * kernel with O_NOFOLLOW costs nothing and converts a class of bug from an
+ * ESCAPE into an `ELOOP` error: if the resolver is ever wrong again — and it has
+ * been wrong twice — the write does not happen.
+ *
+ * It also closes the final-component race. Between resolving a path and opening
+ * it, a command running concurrently in the same workspace can replace that
+ * component with a symlink; O_NOFOLLOW means the open fails rather than
+ * following it. (An intermediate component can still be swapped. Closing that
+ * needs `openat2`/`RESOLVE_BENEATH`, which Node does not expose — noted in the
+ * README rather than left as an unstated assumption.)
+ */
+const READ_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW;
+const WRITE_FLAGS =
+  constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW;
+
+/**
  * `realpath` for a path whose tail may not exist yet.
  *
  * `realpathSync` cannot be used directly: writing a NEW file is legitimate, and
@@ -751,20 +772,24 @@ const handlers: Record<string, (b: Body) => Promise<unknown>> = {
   async "/read"(b) {
     const full = resolveIn(str(b, "id"), str(b, "path"));
     await refuseOversizedRead(full);
-    return { content: await readFile(full, "utf8") };
+    return { content: await readFile(full, { encoding: "utf8", flag: READ_FLAGS }) };
   },
 
   async "/read-buffer"(b) {
     const full = resolveIn(str(b, "id"), str(b, "path"));
     await refuseOversizedRead(full);
-    return { base64: (await readFile(full)).toString("base64") };
+    return { base64: (await readFile(full, { flag: READ_FLAGS })).toString("base64") };
   },
 
   async "/write"(b) {
     const full = resolveIn(str(b, "id"), str(b, "path"));
     await mkdir(join(full, ".."), { recursive: true }); // the FlueFs.writeFile guarantee
     const base64 = b.base64;
-    await writeFile(full, typeof base64 === "string" ? Buffer.from(base64, "base64") : str(b, "content", false));
+    await writeFile(
+      full,
+      typeof base64 === "string" ? Buffer.from(base64, "base64") : str(b, "content", false),
+      { flag: WRITE_FLAGS },
+    );
     return { ok: true };
   },
 

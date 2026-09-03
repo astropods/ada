@@ -519,8 +519,64 @@ How it behaves under load:
 
 The model's commands run in a **separate container** that holds none of the
 control plane's secrets — no database credentials, no GitHub App client secret,
-no HMAC signing key, no model credential. A rogue `bash` therefore reaches at
-most one conversation's checkout, in a process with nothing else worth taking.
+no HMAC signing key, no model credential. A rogue `bash` therefore runs in a
+process with nothing worth taking in it.
+
+Reaching no **further than its own conversation** is a separate guarantee, and it
+takes two different mechanisms, because a path and a program are not the same
+kind of thing:
+
+| | contained by | how |
+|---|---|---|
+| File endpoints (`/read`, `/write`, …) | path resolution | every caller-supplied path is resolved inside that instance's directory and rejected if it escapes |
+| Shell commands (`/exec`) | the kernel | one unprivileged uid per instance, workspace `chmod 0700`, commands spawned as that uid |
+
+The second row exists because the first cannot cover it. Path resolution checks
+an *argument*; a shell command is a *program*, and `cat /data/<other>/secret` is
+a perfectly valid one. That gap was real — the file endpoints refused a
+cross-instance read while the shell performed it — and the fix is to stop
+checking strings and let the filesystem enforce it on the inode.
+
+Confining commands means dropping privileges, so it needs the service to run as
+root (it does in this image — no `USER` line). Where it can't, `/health` reports
+`confinement: "none"` and startup warns loudly, rather than quietly serving a
+weaker guarantee than the docs promise; the file endpoints stay contained
+regardless. A test asserts the report *matches reality* in whichever mode it is
+in, because "unconfined while claiming otherwise" is the failure worth guarding.
+
+**Path containment, and what it is trusted to do.** Paths are resolved
+symlink-by-symlink with `lstat`/`readlink`, so a *dangling* link is still seen as
+a link. That resolver has been wrong twice — once for a symlink to an existing
+target, once for a dangling one, and the second let a root-privileged `/write`
+create a file anywhere in the container — so it is no longer trusted alone:
+
+- The actual open uses **`O_NOFOLLOW`**. The resolved path never legitimately
+  ends in a symlink, so telling the kernel that turns a future resolver bug into
+  an `ELOOP` error instead of a write outside the workspace. It also closes the
+  final-component race, where a concurrent command swaps that component for a
+  symlink between resolve and open.
+- A **property test** generates symlink shapes — inside/outside,
+  absolute/relative, dangling/existing, chained, via traversal — and asserts the
+  *invariant* rather than the verdict: whatever the service decides, nothing may
+  exist outside the workspace afterwards, and an accepted write must have landed
+  inside. It catches both historical escapes at the first iteration without
+  either being enumerated, which is the point — listing cases is the method that
+  missed them twice. Seeded, so failures reproduce (`ADA_FUZZ_SEED`).
+
+**Residual risk, stated rather than assumed.** An *intermediate* path component
+can still in principle be swapped for a symlink between resolution and the open.
+The kernel's answer is `openat2` with `RESOLVE_BENEATH`, which Node does not
+expose; closing it would take a native addon, or running the file operations in a
+process under the instance's uid — correct by the same mechanism as the shell, at
+the cost of a process spawn per operation on a container limited to a tenth of a
+core. Neither is done today. Also not covered: the **network**, which every
+command shares, so this is filesystem isolation between conversations rather than
+a general-purpose sandbox.
+
+Build caches are per-instance rather than shared across conversations — partly
+necessity (a dropped-privilege command can't write root's cache dirs) and partly
+the point, since a shared *mutable* cache is a channel between conversations that
+a uid split alone wouldn't close. Caching within a conversation is unchanged.
 
 The switch is automatic. The platform injects `KNOWLEDGE_SANDBOX_HOST` when
 `knowledge.sandbox` is deployed, and `agent/session/remote-sandbox.ts` routes

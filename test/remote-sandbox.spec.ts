@@ -1,7 +1,7 @@
 import { test, expect } from "@playwright/test";
-import { mkdtempSync, rmSync, existsSync, realpathSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readdirSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { remoteSandboxDriver, ensureRepoInSandbox, sandboxHost, sandboxEnabled } from "../agent/session/remote-sandbox.ts";
 import { cloneCommand } from "../agent/session/repo.ts";
@@ -193,6 +193,125 @@ test("rejects paths that escape the workspace root", async () => {
   }
   // The host filesystem is untouched by an attempt.
   expect(existsSync("/etc/passwd")).toBe(true);
+});
+
+test("no generated symlink shape can write outside the workspace", async () => {
+  /**
+   * A PROPERTY test, because enumerating cases has now failed twice.
+   *
+   * Both symlink escapes in this service were found by someone thinking of a
+   * shape nobody had thought of before: first a symlink to an existing target,
+   * then a DANGLING one. Each fix came with tests for the shape that was
+   * reported, and each looked complete. Listing cases is exactly the method
+   * that produced two misses, so this searches the space instead.
+   *
+   * The oracle is the INVARIANT rather than the verdict. Predicting whether a
+   * given shape should be accepted means reimplementing the resolver in the
+   * test, which would just reproduce its bugs. Instead: whatever the service
+   * decides, nothing may exist outside the workspace afterwards, and anything it
+   * accepted must have landed inside. That holds for every shape without the
+   * test needing to know which is which.
+   *
+   * Seeded so a failure is reproducible — the seed is printed on breakage.
+   */
+  const SEED = Number(process.env.ADA_FUZZ_SEED ?? 0x5eed);
+  let x = SEED;
+  const rnd = (n: number): number => {
+    // Deterministic LCG. A random-per-run test that fails once and passes on
+    // retry teaches nothing.
+    x = (x * 1103515245 + 12345) & 0x7fffffff;
+    return x % n;
+  };
+  const pick = <T,>(xs: T[]): T => xs[rnd(xs.length)];
+
+  const d = driverFor("inst-fuzz");
+  const wsFuzz = await d.workspacePath();
+  const outsideDir = mkdtempSync(join(tmpdir(), "ada-fuzz-outside-"));
+
+  try {
+    for (let i = 0; i < 120; i++) {
+      const name = `n${i}`;
+      // Build a link whose target is drawn from the whole space: inside and
+      // outside, absolute and relative, existing and dangling, direct and via
+      // another link, with traversal thrown in.
+      const target = pick([
+        `${outsideDir}/canary-${i}.txt`,        // absolute, outside, dangling
+        `${outsideDir}`,                        // absolute, outside, existing dir
+        "/etc/ada-fuzz-should-never-exist",     // absolute, outside, dangling
+        "/etc",                                 // absolute, outside, existing
+        `../../${basename(outsideDir)}/c-${i}`, // relative traversal out
+        `../../../../../../etc/x-${i}`,         // deep relative traversal
+        `${wsFuzz}/inside-${i}.txt`,            // absolute, inside, dangling
+        `inside-rel-${i}.txt`,                  // relative, inside, dangling
+        `./nested/deep-${i}.txt`,               // relative, inside, nested
+        `link-prev-${i - 1}`,                   // a chain through another link
+      ]);
+      await d.exec(`ln -sfn ${JSON.stringify(target)} ${JSON.stringify(`link-prev-${i}`)}`);
+
+      const shape = pick([
+        `link-prev-${i}`,                       // straight at the link
+        `link-prev-${i}/child.txt`,             // through it as a directory
+        `./link-prev-${i}`,
+        `sub/../link-prev-${i}`,                // traversal then the link
+      ]);
+
+      // Whatever it decides is fine; both outcomes are legal answers.
+      const wrote = await d
+        .writeFile(shape, `fuzz-${i}`)
+        .then(() => true)
+        .catch(() => false);
+
+      // INVARIANT 1: nothing may appear outside the workspace, ever.
+      const leaked = readdirSync(outsideDir).filter((f) => f.startsWith("canary"));
+      expect(
+        leaked,
+        `seed ${SEED}, iteration ${i}: shape ${shape} -> target ${target} escaped ` +
+          `(rerun with ADA_FUZZ_SEED=${SEED})`,
+      ).toEqual([]);
+      expect(
+        existsSync("/etc/ada-fuzz-should-never-exist"),
+        `seed ${SEED}, iteration ${i}: wrote into /etc via ${target}`,
+      ).toBe(false);
+
+      // INVARIANT 2: if it accepted the write, the bytes must be inside the
+      // workspace. An "accepted" that landed elsewhere is the actual bug.
+      if (wrote) {
+        const found = await d.exec(
+          `grep -rl ${JSON.stringify(`fuzz-${i}`)} . 2>/dev/null | head -1`,
+        );
+        expect(
+          found.stdout.trim().length > 0,
+          `seed ${SEED}, iteration ${i}: accepted ${shape} but the content is not in the workspace`,
+        ).toBe(true);
+      }
+    }
+  } finally {
+    rmSync(outsideDir, { recursive: true, force: true });
+  }
+});
+
+test("the kernel re-checks the resolver on the final component", async () => {
+  // Defence in depth, and cheap: `resolveIn` returns a path whose symlinks are
+  // already resolved, so opening with O_NOFOLLOW should never legitimately
+  // fail. Asserting it means a future resolver bug surfaces as ELOOP — an
+  // error — instead of as a write outside the workspace.
+  const d = driverFor("inst-nofollow");
+
+  // The legitimate cases must be unaffected by the flag.
+  await d.writeFile("plain.txt", "ok");
+  expect(await d.readFile("plain.txt")).toBe("ok");
+  await d.exec("ln -s plain.txt alias.txt");
+  expect(await d.readFile("alias.txt"), "an inside symlink still reads").toBe("ok");
+  await d.writeFile("nested/deep/new.txt", "fresh");
+  expect(await d.readFile("nested/deep/new.txt")).toBe("fresh");
+
+  // A component swapped for a symlink AFTER resolution is what O_NOFOLLOW
+  // catches. Simulated by pointing at a path the resolver treats as a plain new
+  // file while it is in fact a link at open time.
+  const raced = await d.exec("ln -sfn /etc/ada-race-target racy.txt && echo done");
+  expect(raced.exitCode).toBe(0);
+  await expect(d.writeFile("racy.txt", "pwned")).rejects.toThrow(/escapes the workspace|ELOOP/);
+  expect(existsSync("/etc/ada-race-target")).toBe(false);
 });
 
 test("a command sees only the env sent with it", async () => {
