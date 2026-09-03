@@ -68,6 +68,8 @@ import {
   chmodSync,
   existsSync,
   lchownSync,
+  lstatSync,
+  readlinkSync,
   mkdirSync,
   readFileSync,
   readdirSync,
@@ -424,22 +426,78 @@ function resolveIn(id: string, path: string): string {
   // /data elsewhere — compares equal to what the OS reports.
   const base = realpathSync(workspaceOf(id));
   const lexical = isAbsolute(path) ? resolve(path) : resolve(base, path);
-
-  let probe = lexical;
-  const missing: string[] = [];
-  while (!existsSync(probe)) {
-    const parent = dirname(probe);
-    if (parent === probe) break; // reached the filesystem root
-    missing.unshift(basename(probe));
-    probe = parent;
-  }
-  const real = existsSync(probe) ? realpathSync(probe) : probe;
-  const full = missing.length > 0 ? join(real, ...missing) : real;
+  const full = resolveSymlinksTolerantly(lexical, path);
 
   if (full !== base && !full.startsWith(base + sep)) {
     throw new HttpError(403, `path escapes the workspace: ${path}`);
   }
   return full;
+}
+
+/** A symlink chain longer than this is a loop, or close enough to one. */
+const MAX_SYMLINK_HOPS = 40;
+
+/**
+ * `realpath` for a path whose tail may not exist yet.
+ *
+ * `realpathSync` cannot be used directly: writing a NEW file is legitimate, and
+ * realpath fails on a path that isn't there. The previous approach was to walk
+ * up to the deepest EXISTING ancestor, realpath that, and rejoin the missing
+ * components lexically — which is correct only if "doesn't exist" and "isn't a
+ * symlink" are the same thing. They are not.
+ *
+ * A DANGLING symlink — one whose target does not exist — is invisible to
+ * `existsSync`, because that follows the link and finds nothing. So the link's
+ * own name was treated as a missing component and rejoined as text, never
+ * dereferenced. `ln -s /etc/cron.d/pwn link` then passed the containment check
+ * (the lexical path is inside the workspace) and `/write` followed the link on
+ * the way out. That write happens in THIS process, which runs as root so it can
+ * confine commands — so the escape bypassed the per-instance uid entirely and
+ * could land anywhere in the container. Confirmed reproducible before the fix.
+ *
+ * This resolves symlinks the way the kernel does: one component at a time,
+ * using `lstat` (which does NOT follow) so a dangling link is still seen as a
+ * link. When one is found, its target is expanded and the walk RESTARTS over
+ * the expansion plus whatever components remained — otherwise a link pointing
+ * through another symlinked directory would leave that one unresolved.
+ * Components that genuinely do not exist simply accumulate, which is what keeps
+ * writing a new file inside the workspace working.
+ */
+function resolveSymlinksTolerantly(lexical: string, original: string): string {
+  let resolved = sep;
+  let rest = lexical.split(sep).filter(Boolean);
+  let hops = 0;
+
+  while (rest.length > 0) {
+    const part = rest.shift() as string;
+    if (part === ".") continue;
+    if (part === "..") {
+      resolved = dirname(resolved);
+      continue;
+    }
+    const candidate = join(resolved, part);
+    let link: string | null = null;
+    try {
+      // lstat, never stat: the whole point is to see a link that points nowhere.
+      if (lstatSync(candidate).isSymbolicLink()) link = readlinkSync(candidate);
+    } catch {
+      link = null; // does not exist at all — a new file, or a new directory
+    }
+    if (link === null) {
+      resolved = candidate;
+      continue;
+    }
+    if (++hops > MAX_SYMLINK_HOPS) {
+      throw new HttpError(400, `too many symbolic links: ${original}`);
+    }
+    // A relative target resolves against the link's own directory, which is the
+    // already-resolved prefix. Either way the expansion is absolute, so the walk
+    // restarts from the root with the remaining components still queued.
+    const target = isAbsolute(link) ? resolve(link) : resolve(resolved, link);
+    rest = [...target.split(sep).filter(Boolean), ...rest];
+    resolved = sep;
+  }
+  return resolved;
 }
 
 /* ------------------------------------------------- bounded output capture */

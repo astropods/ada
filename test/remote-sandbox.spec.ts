@@ -120,6 +120,72 @@ test("rejects a symlink that points out of the workspace", async () => {
   expect(await d.readFile("alias.txt")).toBe("inside");
 });
 
+test("rejects a DANGLING symlink that points out of the workspace", async () => {
+  /**
+   * The second symlink hole, and the more dangerous one.
+   *
+   * The containment check walked up to the deepest EXISTING ancestor,
+   * realpath'd that, and rejoined the missing components as text — which is
+   * only sound if "does not exist" and "is not a symlink" mean the same thing.
+   * They do not. `existsSync` FOLLOWS a link, so a symlink whose target does
+   * not exist reads as absent: its own name became a "missing" component,
+   * never dereferenced, and the lexical path sailed through the check. `write`
+   * then followed it on the way out and created the file outside.
+   *
+   * Severity is the reason this is asserted from several angles rather than
+   * once. `/write` runs in the SERVICE process, which is root so it can confine
+   * commands — so this escaped the per-instance uid entirely and could land
+   * anywhere in the container, `/etc/cron.d` included.
+   */
+  const d = driverFor("inst-dangling");
+  const outside = join(root, "PWNED-dangling.txt");
+
+  // The target deliberately does not exist — that is the whole trick.
+  await d.exec(`ln -s ${outside} link`);
+  expect(existsSync(outside), "precondition: the target must not exist yet").toBe(false);
+
+  await expect(d.writeFile("link", "pwned")).rejects.toThrow(/escapes the workspace/);
+  expect(existsSync(outside), "nothing may be created outside the workspace").toBe(false);
+
+  // Reading through it is refused too, not just writing.
+  await expect(d.readFile("link")).rejects.toThrow(/escapes the workspace/);
+
+  // A dangling RELATIVE link out is the same hole spelled differently.
+  await d.exec("ln -s ../../PWNED-relative.txt rel-link");
+  await expect(d.writeFile("rel-link", "pwned")).rejects.toThrow(/escapes the workspace/);
+  expect(existsSync(join(root, "..", "PWNED-relative.txt"))).toBe(false);
+
+  // And so is a dangling link reached THROUGH a symlinked directory, which a
+  // fix that only special-cased the final component would miss.
+  await d.exec(`mkdir -p sub && ln -s ${root} sub/out`);
+  await expect(d.writeFile("sub/out/PWNED-via-dir.txt", "pwned")).rejects.toThrow(
+    /escapes the workspace/,
+  );
+});
+
+test("still allows a dangling symlink that points INSIDE the workspace", async () => {
+  // The other direction, and the one a careless fix breaks: refusing every
+  // symlink whose target is missing would also refuse this, which is ordinary
+  // and legitimate — a link created before the file it names. The rule is about
+  // WHERE the link lands, never about whether the target exists yet.
+  const d = driverFor("inst-dangling-ok");
+
+  await d.exec("ln -s not-yet.txt inside-link");
+  await d.writeFile("inside-link", "written through an inside link");
+  // It must land on the target, not on the link.
+  expect(await d.readFile("not-yet.txt")).toBe("written through an inside link");
+
+  // A chain of links that stays inside is still fine.
+  await d.exec("ln -s inside-link chain");
+  await d.writeFile("chain", "through a chain");
+  expect(await d.readFile("not-yet.txt")).toBe("through a chain");
+
+  // And so is an ordinary new file, nested directories included — the case the
+  // tolerant resolution exists to preserve.
+  await d.writeFile("a/b/c/new.txt", "fresh");
+  expect(await d.readFile("a/b/c/new.txt")).toBe("fresh");
+});
+
 test("rejects paths that escape the workspace root", async () => {
   const d = driverFor("inst-esc");
   for (const p of ["../../etc/passwd", "/etc/passwd", "a/../../../etc/passwd"]) {
