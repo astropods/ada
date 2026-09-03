@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://astropods.ai/schema/package.json
 spec: package/v1
-name: ada-your-personal-coding-agent
+name: ada-flue
 
 agent:
   build:
@@ -14,18 +14,22 @@ agent:
     # Also deploy the platform's messaging sidecar (chat UI / Slack). The sidecar
     # runs the channel adapters, normalizes every inbound message to one shape,
     # and streams it to us over gRPC (GRPC_SERVER_ADDR). agent/messaging/adapter.ts
-    # (a Claude Code AgentAdapter) + adapter-core `serve()` handle our side, so a
-    # Slack thread becomes a continuous Claude Code conversation. Slack itself is
+    # + adapter-core `serve()` handle our side, so a Slack thread becomes one
+    # durable Flue agent instance (thread id == instance id). Slack itself is
     # platform-managed (its app + workspace linking + user identity live in
     # astro-server) — this agent needs NO Slack tokens. frontend + messaging
     # coexist: our UI on its hostname, Slack/web on the sidecar's routes.
     messaging: true
-  # Route model calls through the Astro AI Gateway instead of a personal key.
-  # Injects ASTRO_GATEWAY_URL + ASTRO_GATEWAY_API_KEY (virtual key). config/model.ts
-  # maps these to the gateway's /anthropic endpoint (→ Bedrock). Opt out per-deploy
-  # by setting the optional ANTHROPIC_API_KEY input below — that bypasses the
-  # gateway and calls Anthropic directly.
-  astro_ai_gateway: true
+
+
+# Route model calls through the Astro AI Gateway instead of a personal key.
+# Injects ASTRO_GATEWAY_URL + ASTRO_GATEWAY_API_KEY (virtual key). config/model.ts
+# maps these to the gateway's /anthropic endpoint (→ Bedrock). Opt out per-deploy
+# by setting the optional ANTHROPIC_API_KEY input below — that bypasses the
+# gateway and calls Anthropic directly.
+models:
+  default:
+    provider: gateway
 
 inputs:
   # GitHub App provisioning is web-driven. List the email addresses allowed to
@@ -47,8 +51,9 @@ inputs:
   # Optional opt-out of the Astro AI Gateway (see astro_ai_gateway above). Provide
   # your own Anthropic API key and model calls go DIRECTLY to api.anthropic.com
   # with it, bypassing the gateway/Bedrock. Leave unset to use the gateway
-  # (default). In config/model.ts a set ANTHROPIC_API_KEY takes precedence over the
-  # injected ASTRO_GATEWAY_* and switches claudeSpawnEnv to direct mode.
+  # (default). In config/model.ts a set ANTHROPIC_API_KEY takes precedence over
+  # the injected ASTRO_GATEWAY_* and selects the built-in `anthropic` pi-ai
+  # provider instead of the custom gateway provider.
   ANTHROPIC_API_KEY:
     name: ANTHROPIC_API_KEY
     datatype: string
@@ -56,17 +61,43 @@ inputs:
     optional: true
     description: "Optional: use this Anthropic API key directly and bypass the Astro AI Gateway"
     display-as: short-text
-  # Max concurrent Claude runs. Each run is a `claude` child process (CPU+memory);
-  # messaging turns route through this limiter, so LOWERING it (e.g. 1–2) is the
-  # main lever to reduce memory pressure on the sandbox when its container can't
-  # be sized up. Default 3.
+  # Max concurrent agent runs. A run holds a sandbox and spawns real build/test
+  # commands in it (CPU+memory); both browser and messaging turns route through
+  # this limiter, so LOWERING it (e.g. 1–2) eases memory pressure when the
+  # container can't be sized up. Default 3.
+  #
+  # It is not the only lever, and no longer the first one to reach for. This
+  # bounds RUNS, but one run issues many tool calls and a reviewer delegate
+  # issues its own, so the sandbox container has its own limits that act closer
+  # to where the memory is actually spent — SANDBOX_MAX_CONCURRENT_EXEC bounds
+  # simultaneous commands, the head/tail capture windows bound retained output,
+  # and the worker-pool caps in sandbox/Dockerfile stop a build fanning out to
+  # the host's core count under a fractional CPU quota. See sandbox/index.ts.
   MAX_CONCURRENT_RUNS:
     name: MAX_CONCURRENT_RUNS
     datatype: number
     optional: true
     default: "3"
-    description: "Max concurrent Claude runs (each is a child process). Lower to 1–2 to ease sandbox memory pressure."
+    description: "Max concurrent agent runs. Lower to 1–2 to ease container memory pressure."
     display-as: short-text
+  # Independent code review. When on, a substantive change triggers a delegate
+  # (the `code-reviewer` subagent) that re-reads the diff with fresh context and
+  # no attachment to the approach taken — critical/high findings are fixed before
+  # the turn finishes, the rest are reported. Costs one extra model pass over the
+  # diff, so it is skipped for docs-only and sub-20-line changes
+  # (ADA_REVIEW_MIN_LINES tunes the threshold).
+  #
+  # This is only the DEFAULT. Either side can flip it mid-conversation — ask Ada
+  # to turn review off and it calls `set_review_mode`, which is durable for that
+  # conversation and actually unmounts the delegate on the next render.
+  ADA_REVIEWER_ENABLED:
+    name: ADA_REVIEWER_ENABLED
+    datatype: string
+    optional: true
+    default: "true"
+    description: "Run an independent code-reviewer pass on substantive changes. Can be toggled per conversation by asking Ada."
+    display-as: select
+    options: ["true", "false"]
   # GitHub App visibility. Default PRIVATE (single-tenant): only the account that
   # created the App can install it — right when one user/org runs their own Ada.
   # Set "true" for MULTI-TENANT: a PUBLIC App any teammate can install on THEIR
@@ -82,21 +113,52 @@ inputs:
     options: ["false", "true"]
 
 knowledge:
-  # Durable store for per-user GitHub OAuth tokens (access + refresh + expiry)
-  # and other per-interaction state. Platform-managed Postgres injects
-  # POSTGRES_HOST/PORT/USER/PASSWORD/DB. (If provider-mode injection misbehaves,
-  # fall back to container mode — see the migrate-to-astropods notes.)
-  db:
+  # Platform-managed Postgres, injecting POSTGRES_HOST/PORT/USER/PASSWORD/DB.
+  # Two consumers share it:
+  #   - Ada's own Store: per-user GitHub OAuth tokens, App credentials, repo
+  #     bindings, the HMAC signing secret (`github_tokens`, `kv`).
+  #   - Flue's conversation persistence via @flue/postgres (`flue_*`), which is
+  #     what makes a conversation survive a restart or redeploy. It owns its
+  #     schema; agent/db.ts only supplies the driver.
+  # The prefixes do not collide and both read agent/store/pg-config.ts, so the
+  # two cannot end up pointed at different databases.
+  # (If provider-mode injection misbehaves, fall back to container mode — see
+  # the migrate-to-astropods notes.)
+  ada-db:
     provider: postgres
-  # Isolated execution sandbox (the "gold standard" split). Runs Claude Code + git
-  # on per-conversation repo checkouts in a container that holds NONE of the
-  # control plane's secrets (DB, GitHub tokens, HMAC key) — a rogue tool the model
-  # runs can reach at most one thread's checkout. The agent reaches it over HTTP;
-  # the platform injects KNOWLEDGE_SANDBOX_HOST/PORT, which agent/sandbox-client.ts
-  # picks up to route execution here automatically. The model credential and the
-  # per-user GH_TOKEN are forwarded per request, so nothing sensitive lives here at
-  # rest. /data holds per-thread workspaces (TTL-GC'd). Remove this block to run
-  # Claude in-process in the agent container instead.
+  # Isolated execution sandbox — where the model's commands actually run.
+  #
+  # This container holds NONE of the control plane's secrets: no database
+  # credentials, no GitHub App client secret, no HMAC signing key, no model
+  # credential. It implements Flue's `SandboxDriver` over HTTP (nine filesystem
+  # and shell operations, no agent concepts), and the control plane sends a
+  # user's GH_TOKEN per command so it lives only as long as the command using
+  # it. A rogue `bash` the model runs therefore reaches at most one
+  # conversation's checkout, in a process with nothing else worth taking.
+  #
+  # Every path is resolved inside the requesting instance's own directory and
+  # rejected if it escapes — one conversation cannot read another's work.
+  #
+  # The switch is automatic: the platform injects KNOWLEDGE_SANDBOX_HOST/PORT,
+  # and agent/session/remote-sandbox.ts routes execution here. Remove this block
+  # and Ada falls back to Flue's in-process `local()` sandbox, which is how
+  # `node agent/index.ts` and `flue run` work locally.
+  #
+  # /data also gives the deployment a persistent volume: per-conversation repo
+  # checkouts (TTL-swept) and build caches survive a restart.
+  #
+  # TOOLCHAIN: the agent's commands run in THIS container, so a tool it lacks is
+  # a tool Ada cannot use — it will report "not verified locally" and open a PR
+  # without having run the project's checks. sandbox/Dockerfile ships `git`,
+  # `gh` and `bun`; extend it with build args rather than editing the file:
+  #
+  #   SANDBOX_NPM_PACKAGES  default "bun@1.3.9"   e.g. "bun@1.3.9 pnpm"
+  #   SANDBOX_APT_PACKAGES  default ""            e.g. "python3 golang-go"
+  #
+  # Build args, not runtime env: installing at boot would add a network
+  # dependency and mutable tooling to the one container that runs
+  # model-authored commands. If your platform cannot pass build args here,
+  # change the ARG defaults at the top of sandbox/Dockerfile.
   sandbox:
     container:
       build:

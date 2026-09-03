@@ -14,6 +14,7 @@
 
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import type { GithubAppCreds } from "./app-config.ts";
+import { resolveBaseUrl } from "./base-url.ts";
 
 const STATE_TTL_MS = 15 * 60 * 1000; // allows for time spent on GitHub's create screen
 
@@ -79,10 +80,6 @@ function b64url(buf: Buffer): string {
   return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-function externalBase(env: NodeJS.ProcessEnv): string {
-  return (env.ASTRO_EXTERNAL_AGENT_URL ?? `http://localhost:${env.PORT ?? 8080}`).replace(/\/+$/, "");
-}
-
 /** Mint an HMAC-signed, time-limited `state` for the manifest round-trip. */
 export function signState(secret: string): string {
   const body = b64url(Buffer.from(JSON.stringify({ n: randomUUID(), e: Date.now() + STATE_TTL_MS })));
@@ -116,14 +113,28 @@ export interface ManifestResult {
   manifestUrl: string;
 }
 
+export interface ManifestOptions {
+  /** Scope the App to an organization instead of the personal account. */
+  org?: string;
+  /**
+   * The agent's public base URL — pass `resolveBaseUrl(request)`. These URLs
+   * are registered with GitHub ONCE, at App-creation time, and GitHub will only
+   * ever redirect to them; getting the port wrong here bakes a dead callback
+   * into the App and the only cure is re-provisioning. See auth/base-url.ts.
+   */
+  baseUrl?: string;
+  env?: NodeJS.ProcessEnv;
+}
+
 /**
  * Build the App manifest + the GitHub URL to submit it to. Permissions mirror
  * what Ada's agent needs through the user token (Contents + Pull requests);
  * no webhook/private-key machinery since Ada only uses user-to-server OAuth.
- * `org` scopes the App to an organization instead of the personal account.
  */
-export function buildManifest(secret: string, org?: string, env: NodeJS.ProcessEnv = process.env): ManifestResult {
-  const base = externalBase(env);
+export function buildManifest(secret: string, opts: ManifestOptions = {}): ManifestResult {
+  const env = opts.env ?? process.env;
+  const org = opts.org;
+  const base = opts.baseUrl ?? resolveBaseUrl(undefined, env);
   const manifest = {
     name: "Ada",
     url: base,

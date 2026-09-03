@@ -28,11 +28,6 @@ export function sseFrame(seq: number, event: AguiEvent): string {
   return `id: ${seq}\ndata: ${JSON.stringify(event)}\n\n`;
 }
 
-/** Frame with no id (pure AG-UI compatibility, e.g. for non-reconnecting sinks). */
-export function sseFrameNoId(event: AguiEvent): string {
-  return `data: ${JSON.stringify(event)}\n\n`;
-}
-
 /** SSE comment line — keep-alive heartbeat; ignored by clients. */
 export function sseHeartbeat(): string {
   return `: keep-alive\n\n`;

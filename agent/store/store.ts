@@ -33,6 +33,7 @@ export interface Store {
   deleteGithubToken(userKey: string): Promise<void>;
   kvGet(namespace: string, key: string): Promise<unknown | null>;
   kvPut(namespace: string, key: string, value: unknown): Promise<void>;
+  kvDelete(namespace: string, key: string): Promise<void>;
 }
 
 /** Non-durable fallback — used locally when no Postgres env is injected. */
@@ -54,5 +55,8 @@ export class InMemoryStore implements Store {
   }
   async kvPut(namespace: string, key: string, value: unknown): Promise<void> {
     this.kv.set(`${namespace}:${key}`, value);
+  }
+  async kvDelete(namespace: string, key: string): Promise<void> {
+    this.kv.delete(`${namespace}:${key}`);
   }
 }

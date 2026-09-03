@@ -29,3 +29,9 @@ npm-debug.log*
 *.swp
 .idea/
 .vscode/
+
+# Flue local state
+.flue/
+*.db
+*.db-journal
+*.db-wal

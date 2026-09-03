@@ -9,6 +9,6 @@ export async function createStore(env: NodeJS.ProcessEnv = process.env): Promise
   const usePostgres = Boolean(env.POSTGRES_HOST ?? env.KNOWLEDGE_DB_HOST);
   const store: Store = usePostgres ? new PostgresStore(env) : new InMemoryStore();
   await store.init();
-  console.log(`[bridge] store: ${usePostgres ? "postgres" : "in-memory (no POSTGRES_* injected)"}`);
+  console.log(`[ada] store: ${usePostgres ? "postgres" : "in-memory (no POSTGRES_* injected)"}`);
   return store;
 }

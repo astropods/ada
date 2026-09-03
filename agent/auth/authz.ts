@@ -22,7 +22,14 @@
  * cookie — devs aren't blocked. See docs.astropods.com/manual-authz.
  */
 
-import type { IncomingMessage } from "node:http";
+/**
+ * Anything carrying request headers. Kept structural rather than tied to
+ * `node:http` so the Hono handlers in app.ts can pass a plain record from
+ * `Request.headers` without adapting the request object.
+ */
+export interface HeaderBearing {
+  headers: Record<string, string | string[] | undefined>;
+}
 
 export interface AuthzResult {
   /** Final decision. Deny → the caller should 403 (or, for status, report anonymous). */
@@ -46,8 +53,8 @@ function decodeJwtPayload(token: string): Record<string, unknown> | null {
   }
 }
 
-/** Header value as a single string (Node lower-cases header names). */
-function header(req: IncomingMessage, name: string): string {
+/** Header value as a single string (both sources lower-case header names). */
+function header(req: HeaderBearing, name: string): string {
   const v = req.headers[name];
   return (Array.isArray(v) ? v[0] : v) ?? "";
 }
@@ -56,7 +63,7 @@ function header(req: IncomingMessage, name: string): string {
  * The signed-in user's platform id, injected by the ALB after OIDC login.
  * Empty in local dev or for a request that didn't pass through the ALB.
  */
-export function oidcIdentity(req: IncomingMessage): string {
+export function oidcIdentity(req: HeaderBearing): string {
   return header(req, "x-amzn-oidc-identity");
 }
 
@@ -65,7 +72,7 @@ export function oidcIdentity(req: IncomingMessage): string {
  * (`x-amzn-oidc-data`). The authorize endpoint never returns email, so this
  * header is the only source. Empty if absent or unverified.
  */
-export function oidcEmail(req: IncomingMessage): string {
+export function oidcEmail(req: HeaderBearing): string {
   const data = header(req, "x-amzn-oidc-data");
   if (!data) return "";
   const claims = decodeJwtPayload(data);

@@ -1,40 +1,56 @@
 ---
-description: "Ada — a coding agent (powered by Claude Code) you talk to over Slack, web chat, or an AG-UI/SSE frontend."
-tags: [ada, claude-code, ag-ui, sse, slack, github, wrapper]
+description: "Ada — a coding agent (built on Flue 2.0) you talk to over Slack, web chat, or an AG-UI/SSE frontend."
+tags: [ada, flue, ag-ui, sse, slack, github, coding-agent]
 capabilities:
-  - "Runs a Claude Code session via the Claude Agent SDK inside the container"
-  - "Holds multi-turn conversations, resuming session context across follow-up turns"
-  - "Isolates each session in its own writable sandbox workspace"
-  - "Scrubs the spawned agent's env so tools can't read host secrets (AWS/DB/gateway)"
-  - "Translates Claude Code stream-json events into AG-UI protocol events, one-to-one"
+  - "Runs a Flue 2.0 agent loop in-process — no CLI child, no stream-json contract"
+  - "Secure by default: always-on principles, on-demand security playbooks, and enforced diff gates"
+  - "Holds multi-turn conversations, durable in Postgres across restarts and redeploys"
+  - "Runs the model's commands in a separate, secret-less sandbox container"
+  - "Isolates each session in its own writable workspace"
+  - "Scrubs the sandbox env so tools can't read host secrets (AWS/DB/gateway)"
+  - "Translates Flue's event stream into AG-UI protocol events, one-to-one"
   - "Re-emits AG-UI events over SSE with lossless reconnect (Last-Event-ID replay)"
   - "Serves an AG-UI-compatible frontend; external AG-UI clients (e.g. CopilotKit) can consume the stream"
+  - "Also exposes Flue's native agent routes for @flue/sdk clients"
   - "Connects each user's GitHub via per-user OAuth so git/gh act as them"
-  - "Persists the final run result (cost, usage) and exports OTel traces/metrics"
+  - "Exports OTel traces/metrics via @flue/opentelemetry; content capture off by default"
 repository: github:astropods/ada
 integrations: [GitHub, Slack]
 ---
 
 ## Overview
 
-**Ada** is a coding agent powered by Claude Code. A wrapper process runs a
-Claude Code session (via the Claude Agent SDK) and exposes it over a clean event
-API — converse with Ada over Slack / web chat (the platform messaging sidecar)
-or any AG-UI frontend. Claude Code runs headless inside the container; its
-newline-delimited `stream-json` output is translated into
-[AG-UI](https://docs.ag-ui.com) protocol events and streamed to the browser
-over Server-Sent Events. Any AG-UI-compatible frontend can render the run — a
-plain chat UI or a richer dashboard — without backend changes.
+**Ada** is a coding agent built on [Flue 2.0](https://flueframework.com), the
+open TypeScript agent framework. The agent is a function — `Ada()` in
+`agent/agents/ada.ts` — that declares what it needs through hooks: `useModel()`
+for the LLM, `useSandbox()` for a filesystem and shell, `useInstruction()` for
+guidance, `useTool()` for capabilities. Flue runs the loop in-process.
 
-Each session gets its own writable sandbox workspace as its working directory,
-and the spawned agent runs with a scrubbed environment: only the essentials
-(PATH/HOME, proxy/TLS, the model credential, and the user's GitHub token) are
-forwarded, so a tool the model runs — e.g. `bash` → `env` — can't read the
-container's host secrets (AWS, database, gateway keys).
+Converse with Ada over Slack / web chat (the platform messaging sidecar) or any
+AG-UI frontend. Flue's event stream is translated into
+[AG-UI](https://docs.ag-ui.com) protocol events and streamed to the browser over
+Server-Sent Events, so any AG-UI-compatible frontend can render a run — a plain
+chat UI or a richer dashboard — without backend changes.
 
-Model calls route through the Astro AI Gateway (`astro_ai_gateway: true`), so
-the container needs no personal `ANTHROPIC_API_KEY`. Supplying one as an input
-opts out of the gateway and talks to Anthropic directly.
+Each session gets its own writable sandbox workspace as its working directory.
+When the sandbox container is deployed, that workspace is also isolated FROM
+OTHER SESSIONS two ways: path resolution rejects a file operation that escapes
+it, and shell commands run under a per-instance uid against a 0700 directory, so
+one conversation cannot read another's checkout by naming an absolute path
+either. Command confinement needs the sandbox service to run as root and is
+reported by its `/health`; the network is not isolated. The in-process `local()`
+fallback has neither — it is for local runs, not a multi-tenant boundary.
+
+The sandbox env is scrubbed: Flue's `local()` allowlist plus the proxy/TLS
+and build-cache vars, and the user's GitHub token. So a command the model runs —
+`bash` → `env` — can't read the container's host secrets (AWS, database, gateway
+keys). The model credential is no longer forwarded at all, because no child
+process needs it.
+
+Model calls route through the Astro AI Gateway (`astro_ai_gateway: true`) via a
+custom pi-ai provider, so the container needs no personal `ANTHROPIC_API_KEY`.
+Supplying one as an input opts out of the gateway and talks to Anthropic
+directly.
 
 > **Why the name?** Named after **Ada Lovelace** — widely regarded as the first
 > computer programmer — a fitting namesake for a coding agent. The Astropods
@@ -53,19 +69,42 @@ per-session token/cost readout, a session-history switcher, and a settings panel
 
 External clients can drive the same pipeline over HTTP:
 
-- **`POST /sessions`** `{prompt, allowedTools?, permissionMode?}` → `{sessionId}` (starts a session)
+- **`POST /sessions`** `{prompt}` → `{sessionId}` (starts a session)
 - **`POST /sessions/:id/messages`** `{prompt}` → continue that session with a follow-up turn
 - **`GET /sessions/:id/events`** → SSE AG-UI stream; honours `Last-Event-ID` for lossless replay
+
+Flue's own routes are mounted alongside at **`/agents/ada/:id`** for `@flue/sdk`
+clients. Both address the same durable instances, so a session started over one
+is readable over the other — which is why `/agents/ada/*` is admin-gated rather
+than open, and why every `/sessions/:id` route checks session OWNERSHIP and not
+just whether the caller is authorized. See "Who may touch which session" in the
+README; set `ADMIN_EMAILS` in any multi-user deployment.
+
+The native router is **read/abort only**: `POST /agents/ada/:id` (prompt
+dispatch) returns 405. It renders the agent without `SessionRunner`, so the
+per-session context that selects the sandbox was never published and the turn
+executed in the control-plane container at `process.cwd()` instead. Start turns
+with `POST /sessions`.
+
+Three ways to run it:
+
+```bash
+node agent/index.ts                                   # no build step (type-stripping)
+vite build && node dist/server.mjs                    # the Flue Node target
+npx flue run agent/agents/ada.ts --message "…"        # one turn, terminal only
+```
 
 ## GitHub
 
 Ada can act on GitHub as the individual user it's talking to — no static token
 baked into the container.
 
-- **Connect** — a user runs `/connect-github` in a DM (or clicks **Connect
+- **Connect** — a user runs `connect github` in a DM (or clicks **Connect
   GitHub** in the web UI); Ada replies with a link to authorize. Their token is
-  stored per-user and injected as `GH_TOKEN`, so `git` and `gh` inside the Claude
-  session act as them.
+  stored per-user and injected as `GH_TOKEN` into the sandbox env, so `git` and
+  `gh` inside the session act as them. A connected user's render also gains the
+  `checkout_repo` tool, which clones with that token server-side — the model
+  names `owner/repo` and never handles a credential.
 - **Set up** — an admin (whose verified email is listed in `ADMIN_EMAILS`) opens
   the web UI and clicks **Set up GitHub App** to provision the App through
   GitHub's App-Manifest flow. No manual App registration, no client id/secret to
@@ -75,12 +114,45 @@ baked into the container.
   If `ADMIN_EMAILS` is unset, any signed-in user can perform the *initial* setup;
   provisioning then locks.)
 
+## Secure by default
+
+Ada is opinionated about how code gets written, in three layers: a short set of
+always-on principles, seven security playbooks loaded on demand as Flue skills
+(API authorization, safe migrations, injection defence, docs, dependencies,
+secrets, agent integrity), and enforcement gates that read the real diff at
+every would-stop point and send the model back when a default was missed.
+
+Before planning, Ada also reads the repository's own conventions
+(`AGENTS.md`/`AGENT.md`/`CLAUDE.md`/`CONVENTIONS.md`, matched case-insensitively
+in the working directory or a checkout one level below it) and treats them as
+overriding its own defaults — so project rules like "every PR needs a changelog
+file" are followed rather than discovered by CI.
+
+A further layer runs on substantive changes: an independent `code-reviewer`
+subagent whose lenses are ported from Cruise Line (test quality, error handling,
+API contract, concurrency). It reviews with fresh context — an agent re-reading
+its own work has already convinced itself — and its critical/high findings send
+Ada back before finishing. Enabled by `ADA_REVIEWER_ENABLED`, and switchable
+mid-conversation by just asking Ada to turn review off.
+
+The gates block on credentials appearing in a diff and on controls being
+weakened to reach green (a skipped test, a `@ts-ignore`, `--no-verify`), and
+advise on endpoints changed without tests, stale API specs, migrations without a
+reversal, and dependencies added without a lockfile. Advisory rules fire once
+per session and blocking ones escalate three times then stop, so a gate can
+never loop.
+
 ## Limitations
 
-- Sessions, the AG-UI event log, and GitHub OAuth CSRF state live in memory /
-  Postgres with no GC yet; sandbox workspaces are kept, not cleaned up.
+- Flue's conversation database and the sandbox workspaces live on the container
+  filesystem, so **conversation history does not survive a restart or
+  redeploy** — a resumed Slack thread re-clones its repo and starts fresh. A
+  volume can only attach to a knowledge *container*, and the out-of-process
+  sandbox that used to provide one is gone; the durable fix is a
+  Postgres-backed Flue `PersistenceAdapter`. GitHub tokens and repo bindings
+  are unaffected (those are in Postgres).
+- Locally, with no database, conversations are in SQLite and do not survive a
+  restart. Deployed they are in Postgres and do.
+- The AG-UI event log is in memory with no GC yet. (The OAuth CSRF state is no
+  longer among these — it is a signed, self-contained token now.)
 - One turn runs at a time per session — an overlapping follow-up gets `409 busy`.
-- The stream-json contract is version-dependent — the `claude` CLI version is
-  pinned in the Dockerfile; see the repo README "Pin list".
-</content>
-</invoke>

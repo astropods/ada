@@ -21,8 +21,9 @@ jobs:
         with:
           node-version: "24" # >= 23 for native TypeScript type-stripping
 
-      # The server boots on Node alone (all external deps are dynamically imported
-      # and guarded), so this is really just for @playwright/test. If the private
+      # Since the Flue rewrite the server has real runtime dependencies
+      # (@flue/runtime, hono, pi-ai) — it no longer boots on Node alone, so this
+      # install is required, not just for @playwright/test. If the private
       # @astropods/* packages aren't reachable, configure a registry/token here.
       - name: Install dependencies
         run: npm install --no-audit --no-fund

@@ -35,6 +35,20 @@ export function parseRepoSpec(input: string): RepoSpec | null {
 }
 
 /** Directory the repo is checked out to inside a workspace (one repo per thread). */
+/**
+ * The clone command, shared by every path that checks a repo out.
+ *
+ * `pack.threads=1` is a MEMORY control, not a speed one. `git index-pack`
+ * resolves deltas on one thread per detected CPU (capped at 3), and its own
+ * documentation notes that "the required amount of memory for the delta search
+ * window is multiplied by the number of threads". Inside a CPU-quota'd
+ * container that detection reads the HOST's cores, so it takes up to 3 windows'
+ * worth of memory to do work a tenth of a core cannot do in parallel anyway.
+ */
+export function cloneCommand(spec: RepoSpec, dir: string): string {
+  return `git -c pack.threads=1 clone --depth=1 https://github.com/${spec.owner}/${spec.repo}.git ${dir}`;
+}
+
 export function repoDir(workspaceDir: string, spec: RepoSpec): string {
   return join(workspaceDir, spec.repo);
 }

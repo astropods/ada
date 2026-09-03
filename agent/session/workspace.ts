@@ -46,21 +46,37 @@ export function removeWorkspace(path: string | null | undefined): void {
 }
 
 /**
- * Delete workspaces under ROOT whose last modification is older than maxAgeMs.
+ * Delete workspaces under `root` whose last modification is older than maxAgeMs.
  * mtime advances as the repo checkout is written to, so an actively-used thread's
  * workspace stays alive; only idle ones are reclaimed. Returns the count removed.
  * Best-effort: a workspace mid-run is unlikely to be stale, but a delete racing a
  * live run is swallowed rather than crashing the sweep.
+ *
+ * DIRECTORIES ONLY, and that is a correctness requirement rather than tidiness.
+ * Workspaces are directories (`mkdtempSync`), but WORKSPACE_ROOT is shared: the
+ * local SQLite conversation database lives there too, and it is a FILE that also
+ * begins with `ada-` — `ada-flue.db`, plus its `-wal`/`-shm`/`-journal`
+ * siblings. The prefix test alone matched every one of them, so a deployment
+ * idle for longer than maxAgeMs reclaimed its own conversation history: exactly
+ * the durability the persistence layer exists to provide, deleted by another
+ * module's housekeeping. (db.ts now also keeps the database out of this
+ * namespace; either fix alone closes the hole, and they are independent on
+ * purpose.)
+ *
+ * `root` is injectable for the same reason `now` is: ROOT is bound at module
+ * load from WORKSPACE_ROOT, so a test cannot reach it by setting the variable.
  */
-export function sweepWorkspaces(maxAgeMs: number, now: number): number {
-  if (!existsSync(ROOT)) return 0;
+export function sweepWorkspaces(maxAgeMs: number, now: number, root: string = ROOT): number {
+  if (!existsSync(root)) return 0;
   const cutoff = now - maxAgeMs;
   let removed = 0;
-  for (const name of readdirSync(ROOT)) {
+  for (const name of readdirSync(root)) {
     if (!name.startsWith(PREFIX)) continue; // only our own dirs
-    const full = join(ROOT, name);
+    const full = join(root, name);
     try {
-      if (statSync(full).mtimeMs >= cutoff) continue;
+      const st = statSync(full);
+      if (!st.isDirectory()) continue; // a workspace is a directory; see above
+      if (st.mtimeMs >= cutoff) continue;
       rmSync(full, { recursive: true, force: true });
       removed += 1;
     } catch {

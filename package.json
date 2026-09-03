@@ -1,37 +1,51 @@
 {
   "name": "ada",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Supervises a headless `claude -p` session and re-emits its stream-json output as AG-UI events over SSE.",
+  "description": "A coding agent built on Flue 2.0, exposed as AG-UI events over SSE and over Slack/web chat.",
   "engines": {
     "node": ">=23"
   },
   "scripts": {
-    "demo": "node scripts/demo-translate.ts",
-    "demo:sse": "node scripts/demo-translate.ts --sse",
     "start": "node agent/index.ts",
+    "dev": "vite dev",
+    "build": "vite build",
+    "agent": "flue run agent/agents/ada.ts",
     "typecheck": "tsc --noEmit",
     "test": "playwright test",
     "test:ui": "playwright test --ui"
   },
   "dependencies": {
-    "@astropods/adapter-claude-agent-sdk": "^0.5.2",
     "@astropods/adapter-core": "latest",
+    "@earendil-works/pi-ai": "0.83.0",
+    "@flue/cli": "2.0.3",
+    "@flue/opentelemetry": "2.0.3",
+    "@flue/postgres": "2.0.3",
+    "@flue/runtime": "2.0.3",
+    "@flue/vite": "2.0.3",
+    "@hono/node-server": "^2.1.1",
     "@opentelemetry/api": "^1.9.0",
-    "pg": "^8.13.0",
-    "@opentelemetry/sdk-node": "0.217.0",
-    "@opentelemetry/exporter-trace-otlp-proto": "0.217.0",
     "@opentelemetry/exporter-metrics-otlp-proto": "0.217.0",
-    "@opentelemetry/sdk-metrics": "^2.0.0"
+    "@opentelemetry/exporter-trace-otlp-proto": "0.217.0",
+    "@opentelemetry/sdk-metrics": "^2.0.0",
+    "@opentelemetry/sdk-node": "0.217.0",
+    "hono": "^4.13.2",
+    "pg": "^8.13.0",
+    "valibot": "^1.4.2"
   },
   "devDependencies": {
     "@ag-ui/core": "^0.0.42",
+    "@opentelemetry/context-async-hooks": "^2.10.0",
+    "@opentelemetry/sdk-trace-base": "^2.10.0",
     "@playwright/test": "^1.50.0",
-    "typescript": "^5.7.0"
+    "@types/pg": "^8.23.0",
+    "typescript": "^5.7.0",
+    "vite": "^8.2.1"
   },
   "comments": {
-    "runtime": "Node >=23 runs the .ts sources natively (type stripping). The demo needs NO deps.",
+    "runtime": "Node >=23 runs the .ts sources natively (type stripping), so `npm start` needs no build step. `vite build` produces the optimized Flue Node server for the image.",
+    "@earendil-works/pi-ai": "Flue's model layer. Imported DIRECTLY (not just transitively) because agent/config/model.ts builds a custom provider for the Astro AI Gateway with createProvider().",
     "@ag-ui/core": "PINNED reference for validating emitted AG-UI events against the canonical Zod schemas in CI. Local types in agent/types/agui.ts mirror it.",
     "@opentelemetry/api": "Optional at runtime — telemetry degrades to no-op if absent. The OTLP SDK/exporter is provided out-of-process by the astropods telemetry adapter."
   }

@@ -1,11 +1,12 @@
 /**
- * A tiny FIFO counting semaphore for bounding concurrent Claude runs.
+ * A tiny FIFO counting semaphore for bounding concurrent agent runs.
  *
- * Each agent turn spawns a `claude` child (CPU + memory); without a cap, N
- * concurrent Slack threads spawn N children and can OOM the container. Turns
- * acquire a slot before running and release it when done (or aborted); excess
- * turns queue in arrival order. Cap via MAX_CONCURRENT_RUNS (cruise-line's
- * MAX_CONCURRENT_JOBS analog; default 3).
+ * A turn is no longer a `claude` child process, but it is still expensive: the
+ * agent loop holds a sandbox and spawns real build/test commands in it. Without
+ * a cap, N concurrent Slack threads run N loops and can OOM the container.
+ * Turns acquire a slot before running and release it when done (or aborted);
+ * excess turns queue in arrival order. Cap via MAX_CONCURRENT_RUNS
+ * (cruise-line's MAX_CONCURRENT_JOBS analog; default 3).
  */
 
 export class Semaphore {
@@ -51,5 +52,5 @@ export class Semaphore {
   }
 }
 
-/** Process-wide run limiter. Each Claude turn holds one slot. */
+/** Process-wide run limiter. Each agent turn holds one slot. */
 export const runLimiter = new Semaphore(Number(process.env.MAX_CONCURRENT_RUNS ?? "3"));

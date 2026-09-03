@@ -1,44 +1,84 @@
 /**
- * Persist the final `result` of each run for later billing/observability
+ * Persist the final result of each run for later billing/observability
  * queries — not just streamed to the client and discarded.
  *
- * Captures session_id, cost, usage, per-model breakdown, duration, turns, and
+ * Captures session id, model, cost, token usage, turn count, duration, and
  * outcome. Interface + an in-memory and a JSONL-file impl for the scaffold;
  * swap for the platform's datastore later.
+ *
+ * Usage and cost come from Flue's per-turn `turn` events (pi-ai computes cost
+ * from the model catalog), accumulated across the turns of one delivery. There
+ * is no longer a `total_cost_usd` field reported by an upstream CLI, so the
+ * `costSource: "reported" | "computed"` distinction is gone — the catalog is
+ * the single basis, direct or gateway.
  */
 
-import { appendFile } from "node:fs/promises";
-import { computeCostUsd } from "../config/model.ts";
-import type { ResultEvent } from "../types/streamjson.ts";
+export interface RunUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  totalTokens: number;
+  costUsd: number;
+}
 
-export interface RunRecord {
+export interface RunRecord extends RunUsage {
   sessionId: string;
   model: string | null;
-  costUsd: number | null;
-  costSource: "reported" | "computed" | "unknown";
-  usage: ResultEvent["usage"] | null;
-  modelUsage: ResultEvent["model_usage"] | null;
-  numTurns: number | null;
+  numTurns: number;
   durationMs: number | null;
-  stopReason: string | null;
   isError: boolean;
   finishedAt: string; // ISO
 }
 
-export function toRunRecord(model: string | null, ev: ResultEvent): RunRecord {
-  const reported = ev.total_cost_usd ?? null;
-  const computed = model ? computeCostUsd(model, ev.usage ?? {}) : null;
+export function emptyUsage(): RunUsage {
   return {
-    sessionId: ev.session_id,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    totalTokens: 0,
+    costUsd: 0,
+  };
+}
+
+/** Fold one Flue `turn` event's usage into a running total. Mutates `into`. */
+export function addTurnUsage(
+  into: RunUsage,
+  usage: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    totalTokens: number;
+    cost?: { total: number };
+  },
+): RunUsage {
+  into.inputTokens += usage.input;
+  into.outputTokens += usage.output;
+  into.cacheReadTokens += usage.cacheRead;
+  into.cacheCreationTokens += usage.cacheWrite;
+  into.totalTokens += usage.totalTokens;
+  into.costUsd += usage.cost?.total ?? 0;
+  return into;
+}
+
+export function toRunRecord(
+  sessionId: string,
+  model: string | null,
+  usage: RunUsage,
+  meta: { numTurns: number; durationMs: number | null; isError: boolean },
+): RunRecord {
+  return {
+    sessionId,
     model,
-    costUsd: reported ?? computed,
-    costSource: reported != null ? "reported" : computed != null ? "computed" : "unknown",
-    usage: ev.usage ?? null,
-    modelUsage: ev.model_usage ?? null,
-    numTurns: ev.num_turns ?? null,
-    durationMs: ev.duration_ms ?? null,
-    stopReason: ev.stop_reason ?? null,
-    isError: Boolean(ev.is_error),
+    ...usage,
+    // Cost is summed in floating point across turns; round to the cent-fraction
+    // the pricing catalog is meaningful at rather than emitting 1e-17 tails.
+    costUsd: Math.round(usage.costUsd * 1e6) / 1e6,
+    numTurns: meta.numTurns,
+    durationMs: meta.durationMs,
+    isError: meta.isError,
     finishedAt: new Date().toISOString(),
   };
 }
@@ -54,12 +94,3 @@ export class InMemoryResultStore implements ResultStore {
   }
 }
 
-export class JsonlFileResultStore implements ResultStore {
-  private readonly path: string;
-  constructor(path: string) {
-    this.path = path;
-  }
-  async save(record: RunRecord): Promise<void> {
-    await appendFile(this.path, JSON.stringify(record) + "\n", "utf8");
-  }
-}

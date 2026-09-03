@@ -19,6 +19,7 @@
 
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { Store } from "../store/store.ts";
+import { resolveBaseUrl } from "./base-url.ts";
 
 const SECRET_NS = "server";
 const SECRET_KEY = "hmac_secret";
@@ -57,9 +58,15 @@ function safeEqual(a: string, b: string): boolean {
   return timingSafeEqual(ab, bb);
 }
 
-/** Mint a signed, time-limited link token of a given kind, binding a userId. */
-export function mintLink(kind: LinkKind, userId: string, secret: string): string {
-  const body = b64url(Buffer.from(JSON.stringify({ k: kind, u: userId, e: Date.now() + LINK_TTL_MS })));
+/**
+ * Mint a signed, time-limited link token of a given kind, binding a userId.
+ *
+ * `ttlMs` overrides the default lifetime. The OAuth `state` uses a longer one
+ * than a chat link: that round-trip includes GitHub's install + repo-picker
+ * screens, which a user can easily sit on for more than ten minutes.
+ */
+export function mintLink(kind: LinkKind, userId: string, secret: string, ttlMs = LINK_TTL_MS): string {
+  const body = b64url(Buffer.from(JSON.stringify({ k: kind, u: userId, e: Date.now() + ttlMs })));
   const mac = b64url(createHmac("sha256", secret).update(body).digest());
   return `${body}.${mac}`;
 }
@@ -91,11 +98,15 @@ export function verifyLink(token: string | null | undefined, kind: LinkKind, sec
   }
 }
 
-function externalBase(env: NodeJS.ProcessEnv): string {
-  return (env.ASTRO_EXTERNAL_AGENT_URL ?? `http://localhost:${env.PORT ?? 8080}`).replace(/\/+$/, "");
-}
-
-/** Link a messaging user clicks to connect their own GitHub account. */
-export function buildConnectUrl(userId: string, secret: string, env: NodeJS.ProcessEnv = process.env): string {
-  return `${externalBase(env)}/auth/github/login?link=${encodeURIComponent(mintLink("connect", userId, secret))}`;
+/**
+ * Link a messaging user clicks to connect their own GitHub account.
+ *
+ * Usually minted from chat, where there is no HTTP request to derive an origin
+ * from — so this relies on `PUBLIC_BASE_URL` / `ASTRO_EXTERNAL_AGENT_URL` being
+ * set, which is the case in any deployment that has Slack attached. `baseUrl`
+ * is accepted for the browser-initiated path. See auth/base-url.ts.
+ */
+export function buildConnectUrl(userId: string, secret: string, baseUrl?: string): string {
+  const base = baseUrl ?? resolveBaseUrl();
+  return `${base}/auth/github/login?link=${encodeURIComponent(mintLink("connect", userId, secret))}`;
 }
