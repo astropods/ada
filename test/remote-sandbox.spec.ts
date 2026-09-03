@@ -783,6 +783,78 @@ test.describe("the shipped image, running as root", () => {
     expect(own.stdout).toContain("ok");
   });
 
+  test("the shell can modify what the file endpoints created", async () => {
+    /**
+     * The two halves of the service have to agree about who owns the workspace.
+     *
+     * File endpoints run in the service process, which is root so it can
+     * confine commands; `/exec` runs commands as the instance's uid. Nothing
+     * reconciled that, so everything `/write` and `/mkdir` produced was
+     * root-owned: the shell could read it and not touch it.
+     *
+     * This is the agent's core loop, not an edge case — write a file, then run
+     * the formatter, the codegen, the test that rewrites a snapshot, the
+     * `git checkout` that touches it. Confinement that costs the agent the
+     * ability to do its work is not a good trade, so both directions are
+     * asserted: the isolation holds AND the workspace stays usable.
+     */
+    await call("/write", { id: "ownership", path: "f.txt", content: "line1\n" });
+
+    // Appending to a file the file endpoints wrote.
+    const append = await call("/exec", {
+      id: "ownership",
+      command: "echo appended >> f.txt && cat f.txt",
+    });
+    expect(append.exitCode, `append failed: ${append.stderr}`).toBe(0);
+    expect(append.stdout).toContain("line1");
+    expect(append.stdout).toContain("appended");
+
+    // Creating a sibling inside a directory `/write` created implicitly.
+    await call("/write", { id: "ownership", path: "sub/dir/g.txt", content: "x\n" });
+    const sibling = await call("/exec", {
+      id: "ownership",
+      command: "echo hi > sub/dir/sibling.txt && echo OK",
+    });
+    expect(sibling.exitCode, `sibling failed: ${sibling.stderr}`).toBe(0);
+    expect(sibling.stdout.trim()).toBe("OK");
+
+    // …and inside one `/mkdir` created, including the intermediate levels,
+    // which is why ownership follows mkdir's reported topmost new directory
+    // rather than just the leaf.
+    await call("/mkdir", { id: "ownership", path: "mkd/deep" });
+    const inMkdir = await call("/exec", {
+      id: "ownership",
+      command: "echo hi > mkd/deep/x.txt && echo OK",
+    });
+    expect(inMkdir.exitCode, `mkdir write failed: ${inMkdir.stderr}`).toBe(0);
+
+    // A write into an ALREADY-existing directory creates no new dirs, so the
+    // file itself has to be adopted — not only trees that mkdir reported.
+    await call("/write", { id: "ownership", path: "sub/dir/h.txt", content: "y" });
+    const existingDir = await call("/exec", {
+      id: "ownership",
+      command: "echo more >> sub/dir/h.txt && echo OK",
+    });
+    expect(existingDir.exitCode, `existing-dir write failed: ${existingDir.stderr}`).toBe(0);
+
+    // Re-writing through /write must not take the file back from the instance.
+    await call("/write", { id: "ownership", path: "f.txt", content: "reset\n" });
+    const afterRewrite = await call("/exec", {
+      id: "ownership",
+      command: "echo again >> f.txt && echo OK",
+    });
+    expect(afterRewrite.exitCode, `post-rewrite append failed: ${afterRewrite.stderr}`).toBe(0);
+
+    // Nothing above may have loosened the boundary this all exists to enforce.
+    await call("/write", { id: "ownership-other", path: "secret.txt", content: "private" });
+    const cross = await call("/exec", {
+      id: "ownership",
+      command: "cat /data/ownership-other/secret.txt",
+    });
+    expect(cross.exitCode, "cross-instance reads must still be refused").not.toBe(0);
+    expect(cross.stdout).not.toContain("private");
+  });
+
   test("the toolchain still works after dropping privileges", async () => {
     // The risk of a synthetic uid is tools that call getpwuid() and fail. Real
     // work has to keep working, or the isolation is bought with a broken agent.

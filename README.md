@@ -599,6 +599,18 @@ necessity (a dropped-privilege command can't write root's cache dirs) and partly
 the point, since a shared *mutable* cache is a channel between conversations that
 a uid split alone wouldn't close. Caching within a conversation is unchanged.
 
+The two halves also have to agree about **who owns the workspace**. File
+endpoints run in the service process (root); commands run as the instance's uid.
+Left unreconciled, everything `/write` and `/mkdir` produced was root-owned, so
+the shell could read it and not touch it — which breaks the agent's core loop,
+not an edge case: write a file, then run the formatter, the codegen, the test
+that rewrites a snapshot, the `git checkout` that touches it. New entries are
+therefore handed to the instance's uid, using the topmost directory
+`mkdir(recursive)` reports having created so nothing pre-existing is disturbed.
+Confinement that costs the agent the ability to do its work is not a good trade,
+so the tests assert both directions: the boundary holds *and* the workspace
+stays usable.
+
 The switch is automatic. The platform injects `KNOWLEDGE_SANDBOX_HOST` when
 `knowledge.sandbox` is deployed, and `agent/session/remote-sandbox.ts` routes
 execution there; with no sandbox service, Ada falls back to Flue's in-process

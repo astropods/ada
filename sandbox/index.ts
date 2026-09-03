@@ -635,6 +635,44 @@ async function readBody(req: IncomingMessage): Promise<Body> {
   }
 }
 
+/**
+ * Hand newly-created entries to the instance's uid.
+ *
+ * The file endpoints run in THIS process, which is root so it can confine
+ * commands; `/exec` runs commands AS the instance's uid. Nothing reconciled the
+ * two, so everything `/write` and `/mkdir` produced was root-owned and the
+ * shell could read it but not touch it — `echo x >> f` after writing `f`
+ * returned "Permission denied", as did creating anything inside a directory the
+ * file tools had made.
+ *
+ * That is the agent's core loop, not an edge case: write a file, then run the
+ * formatter, the codegen, the test that rewrites a snapshot, or a `git checkout`
+ * that touches it. Confinement is worthless if it costs the agent the ability to
+ * do its work, so the two halves have to agree about who owns the workspace.
+ *
+ * `mkdir(recursive)` returns the TOPMOST directory it actually created, or
+ * undefined when everything already existed — which is exactly the information
+ * needed here. `chownTree` from that point covers every directory the call
+ * created, and the file written inside it, without touching anything that was
+ * already there and already correctly owned.
+ */
+function adoptForInstance(id: string, file?: string, createdDir?: string): void {
+  if (!confineCommands) return;
+  try {
+    const uid = uidFor(id, workspaceOf(id));
+    if (createdDir) chownTree(createdDir, uid);
+    if (file) lchownSync(file, uid, uid); // lchown: never follow, same reason as chownTree
+  } catch (e) {
+    if (!confinementWarned) {
+      confinementWarned = true;
+      console.warn(
+        `[sandbox] could not hand ${file ?? createdDir} to instance ${id}: ${(e as Error).message} ` +
+          "— commands may be unable to modify files the file endpoints created",
+      );
+    }
+  }
+}
+
 /* -------------------------------------------------------------- handlers */
 
 /** What `/exec` answers with — Flue's `ShellResult`, without importing it. */
@@ -782,14 +820,18 @@ const handlers: Record<string, (b: Body) => Promise<unknown>> = {
   },
 
   async "/write"(b) {
-    const full = resolveIn(str(b, "id"), str(b, "path"));
-    await mkdir(join(full, ".."), { recursive: true }); // the FlueFs.writeFile guarantee
+    const id = str(b, "id");
+    const full = resolveIn(id, str(b, "path"));
+    // the FlueFs.writeFile guarantee; the return value names the topmost
+    // directory this actually created, so ownership can follow it.
+    const createdDir = await mkdir(join(full, ".."), { recursive: true });
     const base64 = b.base64;
     await writeFile(
       full,
       typeof base64 === "string" ? Buffer.from(base64, "base64") : str(b, "content", false),
       { flag: WRITE_FLAGS },
     );
+    adoptForInstance(id, full, createdDir);
     return { ok: true };
   },
 
@@ -818,7 +860,11 @@ const handlers: Record<string, (b: Body) => Promise<unknown>> = {
   },
 
   async "/mkdir"(b) {
-    await mkdir(resolveIn(str(b, "id"), str(b, "path")), { recursive: b.recursive !== false });
+    const id = str(b, "id");
+    const created = await mkdir(resolveIn(id, str(b, "path")), {
+      recursive: b.recursive !== false,
+    });
+    adoptForInstance(id, undefined, created);
     return { ok: true };
   },
 
