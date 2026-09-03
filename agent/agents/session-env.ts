@@ -47,6 +47,15 @@ export interface SessionEnv {
   repo?: RepoSpec;
   /** Messaging/platform identity that owns the session (telemetry attribution). */
   userId?: string;
+  /**
+   * Where this conversation is being read.
+   *
+   * The agent writes for a reader, and the two readers are not alike: the web
+   * client renders a long answer as a scrollable transcript, while Slack renders
+   * it as a wall of text in someone's sidebar. Same run, same events — only the
+   * length that suits them differs, so the surface has to reach the prompt.
+   */
+  surface?: "browser" | "slack";
 }
 
 const contexts = new Map<string, SessionEnv>();

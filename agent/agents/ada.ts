@@ -69,6 +69,31 @@ Work like an experienced engineer on someone else's codebase:
 - Keep replies short. Show the diff or the command output that matters, not a
   narration of every step.`;
 
+/**
+ * Extra brevity for chat, where a long answer is a wall of text in a sidebar.
+ *
+ * Deliberately a SHAPE rather than a word count. "Be brief" reliably produces
+ * either a padded short answer or a dropped fact; naming what to lead with and
+ * what to leave out gives the model something it can actually act on.
+ *
+ * The last line is the important one. Brevity must not become a reason to omit
+ * a failure — an agent that reports "done" in one confident line, having
+ * skipped the tests, is far worse than a verbose one. Short applies to the
+ * NARRATION, never to the bad news.
+ */
+const CHAT_BREVITY = `You are answering in Slack, where your reply lands in
+someone's sidebar and a long one is read as noise. Keep it to a few lines:
+
+- Lead with the outcome — what now works, what changed, what you found.
+- Link the PR or branch instead of pasting diffs or file contents.
+- Don't narrate the steps you took or explain your reasoning unless asked. The
+  person can see which tools ran, and can ask for the detail if they want it.
+- Prefer one line over three; skip preamble and restating the question.
+
+This is about length, not candour. Still say plainly what failed, what you
+skipped, and what you could not verify — in a line rather than a paragraph.
+Never let brevity turn a caveat into a silence.`;
+
 export function Ada({ id }: AgentProps) {
   const env = getSessionEnv(id);
 
@@ -133,6 +158,8 @@ export function Ada({ id }: AgentProps) {
    *   gates       read the real diff at every would-stop point and send the
    *               model back. The only layer that actually ENFORCES anything.
    */
+
+  if (env.surface === "slack") useInstruction(CHAT_BREVITY);
 
   useInstruction(SECURITY_PRINCIPLES);
 

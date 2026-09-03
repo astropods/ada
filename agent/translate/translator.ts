@@ -373,6 +373,35 @@ export class Translator {
     if (!this.runOpen) return [];
     return this.onSettled(outcome, message);
   }
+
+  /**
+   * Report a delivery that failed, INCLUDING one that failed before it started.
+   *
+   * `flush` deliberately does nothing when no run is open, which is right for
+   * its job (don't invent a terminal event for a delivery that never began).
+   * But a turn can fail before the model is ever reached — resolving a GitHub
+   * token, cloning the repo — and those failures still need to reach the
+   * client. Left to `flush`, they emitted NOTHING: the caller sat on an open
+   * stream waiting for a run that had already died.
+   *
+   * A run is opened first so the client sees a well-formed RUN_STARTED ->
+   * RUN_ERROR pair. A bare terminal event for a run the client never saw start
+   * is a harder thing for it to reason about than an empty run that failed.
+   */
+  failRun(message: string, code = "failed"): AguiEvent[] {
+    const out: AguiEvent[] = [];
+    if (!this.runOpen) {
+      this.runOpen = true;
+      this.runId = this.nextRunId();
+      out.push({
+        type: EventType.RUN_STARTED,
+        threadId: this.threadId ?? "unknown",
+        runId: this.runId,
+      });
+    }
+    out.push(...this.onSettled("failed", message, code));
+    return out;
+  }
 }
 
 interface FlueUsage {

@@ -353,6 +353,10 @@ app.post("/sessions", async (c) => {
       userKey: id.userKey,
       userId: id.userId ?? undefined,
       meta: { kind: "browser", userId: id.userKey, title: body.prompt.slice(0, DEFAULT_TITLE_LEN) },
+      // Answer as soon as the session exists; the turn streams over SSE. This
+      // used to await the whole turn, so the client only got its id once there
+      // was nothing left to stream and replayed a finished turn in one block.
+      background: true,
     });
     return c.json({ sessionId }, 201);
   } catch (e) {
@@ -387,6 +391,9 @@ app.post("/sessions/:id/messages", async (c) => {
       prompt: body.prompt,
       userKey: id.userKey,
       userId: id.userId ?? undefined,
+      // Same reasoning as POST /sessions: a follow-up turn is just as long, and
+      // the client is already watching the stream this will arrive on.
+      background: true,
     });
     // The follow-up turn streams over the session's already-open SSE.
     return c.json({ sessionId }, 202);

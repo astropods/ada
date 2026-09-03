@@ -62,6 +62,22 @@ export interface TurnOpts {
   repo?: RepoSpec;
   /** Descriptive metadata for the conversation-review list. */
   meta?: SessionMeta;
+  /**
+   * Return as soon as the session exists, and run the turn in the background.
+   *
+   * For the BROWSER. Awaiting a whole turn meant `POST /sessions` did not answer
+   * until the work was finished, so the client could not open the event stream
+   * until there was nothing left to stream — it replayed a completed turn in one
+   * block, and every incremental event the AG-UI contract exists for was wasted.
+   * A long turn was also indistinguishable from a hung server, and a POST held
+   * open for minutes is what a proxy kills at 60s even though the turn succeeded.
+   *
+   * NOT for messaging. Slack streams live through `onAguiEvent` and has to hold
+   * the run to know when to close the thread, so it keeps awaiting. Opt-in
+   * rather than the default precisely so the two callers cannot drift apart
+   * silently.
+   */
+  background?: boolean;
 }
 
 /** Per-turn extras a caller can observe without subscribing to the registry. */
@@ -192,7 +208,13 @@ export class SessionRunner {
       title: opts.prompt.slice(0, 80),
       ...opts.meta,
     });
-    await this.runTurn(instanceId, opts, hooks);
+    // Create the workspace BEFORE returning even in background mode. It is one
+    // memoized store round-trip, and it keeps the likeliest startup failure
+    // (no volume, store unreachable) a synchronous error the caller can answer
+    // with a 5xx — rather than a session that exists, streams nothing, and has
+    // to explain itself over SSE.
+    await this.workspaceFor(instanceId);
+    await this.dispatchTurn(instanceId, opts, hooks);
     return instanceId;
   }
 
@@ -203,7 +225,26 @@ export class SessionRunner {
   async continueSession(instanceId: string, opts: TurnOpts, hooks?: TurnHooks): Promise<void> {
     this.registry.ensure(instanceId);
     if (opts.meta) this.registry.setMeta(instanceId, opts.meta);
-    await this.runTurn(instanceId, opts, hooks);
+    await this.dispatchTurn(instanceId, opts, hooks);
+  }
+
+  /**
+   * Run a turn, awaiting it or not according to `opts.background`.
+   *
+   * The background path still reports every failure the awaited path does —
+   * `runTurn` emits the terminal AG-UI event itself before rethrowing, so the
+   * client learns of an error over the stream it is already watching. The catch
+   * here only stops the rethrow becoming an unhandled rejection, which in
+   * current Node would take the whole process down.
+   *
+   * `registry.ensure` has already set the status to "starting", and `busy()`
+   * counts "starting", so a follow-up that races this still gets its 409.
+   */
+  private async dispatchTurn(instanceId: string, opts: TurnOpts, hooks?: TurnHooks): Promise<void> {
+    if (!opts.background) return this.runTurn(instanceId, opts, hooks);
+    void this.runTurn(instanceId, opts, hooks).catch((e) => {
+      console.warn(`[runner] background turn failed for ${instanceId}: ${(e as Error).message}`);
+    });
   }
 
   /**
@@ -216,6 +257,41 @@ export class SessionRunner {
   private async runTurn(instanceId: string, opts: TurnOpts, hooks?: TurnHooks): Promise<void> {
     this.registry.setStatus(instanceId, "running");
 
+    // BEFORE any of the work below, because this is what `failTurn` needs to
+    // report a failure. Everything from here to `dispatch` — resolving a token,
+    // cloning the repo — used to throw with no translator registered, so
+    // `flushRun` found no session and emitted nothing at all. Awaited, that was
+    // survivable (the caller got a 500); backgrounded it would strand the client
+    // on a stream that never says anything.
+    //
+    // One translator per session (it carries the AG-UI run/message state across
+    // turns); usage and turn counts reset per delivery, which is the unit the
+    // run record describes.
+    this.sessions.set(instanceId, {
+      translator: this.sessions.get(instanceId)?.translator ?? new Translator({ includeRawEvent: false }),
+      hooks,
+      usage: emptyUsage(),
+      turns: 0,
+      model: null,
+      startedAt: Date.now(),
+    });
+
+    try {
+      await this.runTurnInner(instanceId, opts, hooks);
+    } catch (e) {
+      // A local read cancellation (supersede) is not a failure: the durable
+      // abort is what stops the work and the observer already emitted the
+      // settlement.
+      if (hooks?.signal?.aborted) return;
+      // Report ONCE, here, whatever stage failed — then rethrow so an awaiting
+      // caller (messaging) still sees it. The background caller swallows it,
+      // having already had it delivered over the stream.
+      this.failTurn(instanceId, (e as Error).message);
+      throw e;
+    }
+  }
+
+  private async runTurnInner(instanceId: string, opts: TurnOpts, hooks?: TurnHooks): Promise<void> {
     const cwd = await this.workspaceFor(instanceId);
     const configured = githubConfigured();
     const githubToken = configured
@@ -259,6 +335,10 @@ export class SessionRunner {
 
     setSessionEnv(instanceId, {
       modelRef: resolveModel().ref,
+      // Read from the registry rather than from `opts.meta`, which a browser
+      // FOLLOW-UP does not send — deriving it from the turn would make Ada
+      // verbose again on every message after the first.
+      surface: this.registry.kind(instanceId) ?? "browser",
       cwd: sandboxCwd,
       remote,
       sandboxEnv: sandboxEnv({ githubToken }),
@@ -266,18 +346,6 @@ export class SessionRunner {
       githubConnected: Boolean(githubToken),
       repo: opts.repo,
       userId: opts.userId,
-    });
-
-    // One translator per session (it carries the AG-UI run/message state across
-    // turns); usage and turn counts reset per delivery, which is the unit the
-    // run record describes.
-    this.sessions.set(instanceId, {
-      translator: this.sessions.get(instanceId)?.translator ?? new Translator({ includeRawEvent: false }),
-      hooks,
-      usage: emptyUsage(),
-      turns: 0,
-      model: null,
-      startedAt: Date.now(),
     });
 
     // Hold a concurrency slot so N live threads don't run N agent loops and
@@ -293,18 +361,29 @@ export class SessionRunner {
         // close the AG-UI run here rather than leaving a client waiting on a
         // run that will never end.
         this.flushRun(instanceId, "completed");
-      } catch (e) {
-        // A local read cancellation (supersede) is not a failure: the durable
-        // abort above is what stops the work, and the observer already emitted
-        // the settlement. Anything else is a real error for the client.
-        if (hooks?.signal?.aborted) return;
-        this.flushRun(instanceId, "failed", (e as Error).message);
-        this.registry.setStatus(instanceId, "errored");
-        throw e;
       } finally {
         hooks?.signal?.removeEventListener("abort", onAbort);
       }
     });
+  }
+
+  /**
+   * Report a failed turn to whoever is watching the stream.
+   *
+   * Uses `failRun` rather than `flush` because the two cover different cases:
+   * `flush` closes a run that IS open, and does nothing otherwise, which is
+   * exactly wrong for a turn that died before the model was reached. `failRun`
+   * opens one so the client gets RUN_STARTED -> RUN_ERROR instead of silence.
+   */
+  private failTurn(instanceId: string, message: string): void {
+    const live = this.sessions.get(instanceId);
+    if (live) {
+      for (const agui of live.translator.failRun(message)) {
+        this.registry.append(instanceId, agui);
+        live.hooks?.onAguiEvent?.(agui);
+      }
+    }
+    this.registry.setStatus(instanceId, "errored");
   }
 
   /** Emit a terminal AG-UI event if the delivery did not produce one itself. */
