@@ -285,6 +285,7 @@ npm test                                       # or: npm run test:ui
 |---|---|
 | `server-sse.spec.ts` | `Last-Event-ID` beats a stale `?lastEventId` query; `DELETE /sessions/:id` semantics |
 | `session-authz.spec.ts` | Whose session an authorized user may read/drive/delete; `/agents/ada/*` is gated; 404-vs-403 |
+| `thread-context.spec.ts` | A Slack mention reads the thread in, once per conversation, capped, and degrades when unavailable |
 | `native-router.spec.ts` | Native prompt dispatch is refused; a context-less render still selects the sandbox |
 | `background-turn.spec.ts` | `POST /sessions` returns before the turn settles; a pre-dispatch failure still reports |
 | `chat-brevity.spec.ts` | Slack gets the brevity instruction, the browser does not, and it survives follow-ups |
@@ -515,6 +516,22 @@ work and isolation**. The thread id *is* the Flue instance id, so each thread
 gets its own durable conversation, its own workspace, and its own repo checkout
 — different threads work on different repos at the same time without
 interfering.
+
+**Mention Ada mid-thread and it reads the thread.** The sidecar delivers only
+the message that triggered the turn, so a bare *"Ada fix this"* used to arrive
+with the pronoun and none of its referent — Ada had to ask what "this" was,
+which is the friction the mention was meant to avoid. The first mention in a
+conversation now pulls the thread in via `getThreadHistory()` (adapter-core
+≥ 0.10) and prepends it as a `<thread>` block, oldest first, with Ada's own
+replies and the triggering message left out.
+
+Once per conversation, not per turn: a Slack thread *is* a Flue instance, so
+after the first turn the conversation history already carries it. The trade is
+that humans talking to each other in the thread *between* Ada's turns aren't
+picked up — Ada only receives messages addressed to it. The block is capped
+(40 messages, ~4KB, 600 chars per message) and trims the *oldest* first, since
+the end of a thread is what a mention usually refers back to. If the platform
+can't hydrate the thread, the turn runs on the user's message alone.
 
 **One thread = one task = one repo.** In a thread, bind the repo once:
 

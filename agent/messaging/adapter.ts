@@ -38,6 +38,14 @@ import { getServerSecret, buildConnectUrl } from "../auth/connect.ts";
 
 const HINT_NS = "gh_connect_hint"; // conversationId -> "1" once the connect hint has been shown
 const REPO_NS = "conv_repo"; // conversationId -> { owner, repo } bound to this thread
+const THREAD_CTX_NS = "conv_thread_ctx"; // conversationId -> "1" once the thread has been read in
+
+/** Most thread messages to read in, oldest first. */
+const THREAD_CONTEXT_MAX_MESSAGES = 40;
+/** Ceiling on the rendered block, so a long thread cannot dominate the turn. */
+const THREAD_CONTEXT_MAX_CHARS = 4000;
+/** Any single message longer than this is clipped before the block budget applies. */
+const THREAD_CONTEXT_MAX_MESSAGE_CHARS = 600;
 
 /**
  * What the sidecar advertises about this agent. Mirrors what `useSandbox()`
@@ -199,6 +207,83 @@ export class AdaMessagingAdapter implements AgentAdapter {
     );
   }
 
+  /**
+   * Prepend the Slack thread Ada was pinged into, so a bare "Ada fix this"
+   * resolves.
+   *
+   * The sidecar delivers only the message that triggered the turn. Someone
+   * @-mentioning Ada halfway down a thread has usually said everything that
+   * matters ABOVE the mention — the error, the link, the decision — and the
+   * mention itself is a pronoun. Without the thread, Ada has to ask what "this"
+   * is, which is exactly the friction the mention was meant to avoid.
+   *
+   * ONCE PER CONVERSATION, recorded durably in the store like the connect hint
+   * and the repo binding. A Slack thread IS a Flue instance, so after the first
+   * turn the conversation history already carries this; re-reading it every turn
+   * would resend the same messages and spend the budget twice. The trade is that
+   * humans talking to each other in the thread BETWEEN Ada's turns are not
+   * picked up — Ada only receives messages addressed to it. That is worth
+   * knowing and not worth the duplication to fix.
+   *
+   * Best-effort throughout. `getThreadHistory` is optional (an older sidecar, or
+   * the web playground, simply does not have it), and a thread that cannot be
+   * read must degrade to today's behaviour rather than fail the turn — the
+   * message the user actually sent is still there.
+   */
+  private async withThreadContext(prompt: string, options: StreamOptions): Promise<string> {
+    if (!options.getThreadHistory) return prompt;
+    if (await this.store.kvGet(THREAD_CTX_NS, options.conversationId)) return prompt;
+
+    let messages: Awaited<ReturnType<NonNullable<StreamOptions["getThreadHistory"]>>>;
+    try {
+      messages = await options.getThreadHistory(THREAD_CONTEXT_MAX_MESSAGES);
+    } catch {
+      return prompt; // the platform could not hydrate the thread; carry on without it
+    }
+    // Record the attempt, not the success: a thread with nothing usable in it
+    // should not be re-fetched on every subsequent turn.
+    await this.store.kvPut(THREAD_CTX_NS, options.conversationId, "1");
+
+    const botUserId = options.platformContext?.botUserId;
+    const triggerId = options.platformContext?.messageId;
+    const lines: string[] = [];
+    for (const m of messages) {
+      // Ada's own replies are already in the Flue conversation, and the
+      // triggering message is the prompt — including either would just be the
+      // model reading itself back.
+      if (botUserId && m.user?.id === botUserId) continue;
+      if (triggerId && m.messageId === triggerId) continue;
+      if (m.isDeleted) continue;
+      const text = (m.content ?? "").trim();
+      if (!text) continue;
+      const who = m.user?.username || m.user?.id || "someone";
+      const clipped =
+        text.length > THREAD_CONTEXT_MAX_MESSAGE_CHARS
+          ? `${text.slice(0, THREAD_CONTEXT_MAX_MESSAGE_CHARS)}… [truncated]`
+          : text;
+      lines.push(`${who}: ${clipped}`);
+    }
+    if (lines.length === 0) return prompt;
+
+    // Keep the NEWEST messages when trimming: the end of a thread is what a
+    // mention usually refers back to, and the top is often stale setup.
+    let block = lines.join("\n");
+    if (block.length > THREAD_CONTEXT_MAX_CHARS) {
+      while (lines.length > 1 && lines.join("\n").length > THREAD_CONTEXT_MAX_CHARS) lines.shift();
+      block = `[…earlier messages omitted]\n${lines.join("\n")}`;
+    }
+
+    return (
+      "<thread>\n" +
+      "You were mentioned partway through this conversation. It is the context for " +
+      "the request below — a bare \"fix this\" or \"take a look\" almost certainly " +
+      "refers to something in here. Oldest first; your own replies are omitted.\n\n" +
+      `${block}\n` +
+      "</thread>\n\n" +
+      prompt
+    );
+  }
+
   async stream(prompt: string, hooks: StreamHooks, options: StreamOptions): Promise<void> {
     // Already superseded/stopped before we began — nothing to do.
     if (options.signal?.aborted) {
@@ -211,6 +296,9 @@ export class AdaMessagingAdapter implements AgentAdapter {
       await this.runDirective(directive, hooks, options);
       return;
     }
+
+    // "Ada fix this" only means something if Ada can see what "this" is.
+    const contextualPrompt = await this.withThreadContext(prompt, options);
 
     const repo = await this.boundRepo(options.conversationId);
 
@@ -246,7 +334,7 @@ export class AdaMessagingAdapter implements AgentAdapter {
       await this.runner.continueSession(
         options.conversationId,
         {
-          prompt,
+          prompt: contextualPrompt,
           // The sidecar's userId is the key GitHub tokens are stored under and
           // the identity the run's trace is attributed to.
           userKey: options.userId,
@@ -256,6 +344,9 @@ export class AdaMessagingAdapter implements AgentAdapter {
             kind: "slack",
             userId: options.userId,
             repo: repo ? `${repo.owner}/${repo.repo}` : undefined,
+            // The user's own words, deliberately — titling a conversation with
+            // the injected thread block would make every mention look alike in
+            // the review list.
             title: prompt.slice(0, 80),
           },
         },
