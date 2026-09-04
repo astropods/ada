@@ -542,6 +542,37 @@ app.get("/sessions/:id/events", async (c) => {
  * but it drives the same translator and yields the same 23 AG-UI events, so the
  * assertions in test/server-sse.spec.ts are unchanged.
  */
+/**
+ * Test-only: configure (or clear) GitHub App credentials.
+ *
+ * The OAuth routes are inert without an App, and credentials come only from the
+ * manifest setup flow into the store — there is no env path. So the routing
+ * these tests exist to pin (authorize by default, install only on request) had
+ * no way to run, and the assertions silently skipped, which is worse than not
+ * having them: the bug they cover shipped once already.
+ *
+ * Fake credentials, never exchanged — the tests read the redirect's Location and
+ * stop there. Reversible so a spec restores the deployment's real state.
+ */
+app.post("/test/github-app", async (c) => {
+  if (process.env.ADA_TEST_HOOKS !== "1") return c.text("not found", 404);
+  type Creds = { clientId?: string; slug?: string | null };
+  const body = await c.req.json<Creds>().catch((): Creds => ({}));
+  if (!body.clientId) {
+    await saveAppCreds(store, { clientId: "", clientSecret: "" });
+    // saveAppCreds caches whatever it is given; an empty id must read as
+    // unconfigured, which is what loadAppCreds would conclude from the same row.
+    await loadAppCreds(store);
+    return c.json({ configured: githubConfigured() });
+  }
+  await saveAppCreds(store, {
+    clientId: body.clientId,
+    clientSecret: "test-secret",
+    slug: body.slug ?? null,
+  });
+  return c.json({ configured: githubConfigured() });
+});
+
 app.post("/test/seed", async (c) => {
   if (process.env.ADA_TEST_HOOKS !== "1") return c.text("not found", 404);
   // An optional `{kind, userId}` stamps the session's ownership metadata. The
@@ -627,19 +658,39 @@ app.get("/auth/github/login", async (c) => {
   // primitives as the chat connect links.
   const state = mintLink("connect", userKey, await getServerSecret(store), OAUTH_STATE_TTL_MS);
 
-  // Route through the App INSTALLATION (repo picker + write grant), not the
-  // bare OAuth authorize. With `request_oauth_on_install` on the App,
-  // installing also authorizes, and GitHub redirects back to
-  // /auth/github/callback with `code` (+ installation_id).
-  //
-  // `?authorize=1` skips the picker and goes straight to OAuth — used when the
-  // App is ALREADY installed and only the user authorization is missing (see
-  // the callback's recovery path). Sending them back to the install screen in
-  // that case just shows a confusing "configure" page.
+  /**
+   * AUTHORIZE by default. Install only when explicitly asked for.
+   *
+   * A GitHub App has two independent grants and they are easy to conflate:
+   *
+   *   INSTALLATION  — an org owner decides which repositories the App may
+   *                   touch. Once per org, by someone with rights to do it.
+   *   AUTHORIZATION — each person authorizes the App so it can act AS them.
+   *                   Once per user, by anyone.
+   *
+   * A user-to-server token reaches the intersection: repos the installation
+   * covers AND the user can see. So a new colleague joining an org where the
+   * App is already installed needs ONLY the second one.
+   *
+   * This used to send everyone to `installations/new`, on the reasoning that
+   * `request_oauth_on_install` makes an install authorize too. It does — but it
+   * asks every user to configure an installation, which most of them cannot do
+   * and none of them need. In an org where IT had already installed the App,
+   * the picker offered an installation the user had no rights to modify and
+   * GitHub refused: "access denied", on a step that was unnecessary. Picking
+   * their personal account instead produced a token with no access to the org's
+   * repos, so the clone failed and the agent reported being unauthenticated —
+   * a loop with no exit for the person in it.
+   *
+   * `?install=1` is the escape hatch for the cases that genuinely need it: the
+   * first install in an org (an owner doing it deliberately), or adding
+   * personal repos. Offered when a push or clone comes back 403 — see
+   * github-guidance.ts — rather than demanded up front from everyone.
+   */
   const slug = getAppCreds()?.slug;
-  const authorizeOnly = c.req.query("authorize") === "1";
+  const wantsInstall = c.req.query("install") === "1";
   return c.redirect(
-    slug && !authorizeOnly
+    slug && wantsInstall
       ? `https://github.com/apps/${slug}/installations/new?state=${encodeURIComponent(state)}`
       : authorizeUrl(state, baseUrlFor(c)),
   );
@@ -683,8 +734,13 @@ app.get("/auth/github/callback", async (c) => {
       );
     }
     setCookie(c, RETRY_COOKIE, "1", { httpOnly: true, path: "/", sameSite: "Lax", maxAge: 300 });
-    const installed = Boolean(c.req.query("installation_id"));
-    return c.redirect(`/auth/github/login${installed ? "?authorize=1" : ""}`);
+    // Always the authorize flow now — that is the default, and it is what this
+    // recovery needs in both cases. Arriving here after an install (case 1)
+    // means the installation already exists and only the user token is
+    // missing; arriving after an expired state (case 2) means retrying the
+    // whole thing, and sending someone back to a picker they did not ask for
+    // is what this route exists to undo.
+    return c.redirect("/auth/github/login");
   }
 
   if (!code) return c.text("invalid OAuth callback (no code)", 400);
@@ -702,7 +758,21 @@ app.get("/auth/github/callback", async (c) => {
           : " — no installation_id; token has no repo access until the App is installed"
       }`,
     );
-    // Land back on the app frontend rather than a dead-end confirmation page.
+    // Land back on the app frontend — but ONLY for someone who can actually
+    // open it. A chat user connecting from Slack has no reason to be authorized
+    // for the web UI, and redirecting them into it served the themed 401: the
+    // connection had already succeeded, and the last thing they saw said access
+    // denied. Indistinguishable, from the user's side, from the flow failing.
+    const viewer = await resolveIdentity(c);
+    if (!viewer.allowed) {
+      return c.html(
+        renderPage(
+          "GitHub connected",
+          `Connected as <b>${rec.githubLogin ?? "your account"}</b>. You can close this tab and ` +
+            "carry on in chat.",
+        ),
+      );
+    }
     return c.redirect("/?github=connected");
   } catch (e) {
     console.error(`[github] code exchange failed: ${(e as Error).message}`);
