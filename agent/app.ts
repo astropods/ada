@@ -689,6 +689,17 @@ app.get("/auth/github/login", async (c) => {
    */
   const slug = getAppCreds()?.slug;
   const wantsInstall = c.req.query("install") === "1";
+  if (wantsInstall && !slug) {
+    // The install URL is built from the App slug, and nothing else can stand in
+    // for it. GitHub's manifest conversion does return one, so this is the
+    // degenerate case (an App configured before the slug was recorded) — but
+    // falling through to authorize without a word would leave an admin
+    // wondering why "install" authorized instead, so say so.
+    console.warn(
+      "[github] install requested but no App slug is known — falling back to authorization. " +
+        "Install the App from GitHub directly, or re-run setup so the slug is recorded.",
+    );
+  }
   return c.redirect(
     slug && wantsInstall
       ? `https://github.com/apps/${slug}/installations/new?state=${encodeURIComponent(state)}`
@@ -740,7 +751,7 @@ app.get("/auth/github/callback", async (c) => {
     // missing; arriving after an expired state (case 2) means retrying the
     // whole thing, and sending someone back to a picker they did not ask for
     // is what this route exists to undo.
-    return c.redirect("/auth/github/login");
+    return c.redirect("/auth/github/login?install=1");
   }
 
   if (!code) return c.text("invalid OAuth callback (no code)", 400);
@@ -900,7 +911,14 @@ app.get("/api/setup/github/callback", async (c) => {
     const creds = await convertManifestCode(code);
     await saveAppCreds(store, creds);
     console.log(`[setup] GitHub App '${creds.slug ?? "?"}' provisioned; OAuth is now configured`);
-    return c.redirect("/auth/github/login");
+    // `?install=1` because this is the ONE place that genuinely needs the
+    // picker: the App has just been created and is installed nowhere, so the
+    // admin who provisioned it has to choose repositories before it can reach
+    // any. The login route defaults to plain authorization now — correct for
+    // every other caller, and a silent no-op here, which is what this flag
+    // exists to say. (Provisioning also has to work when `slug` is missing;
+    // see the login route.)
+    return c.redirect("/auth/github/login?install=1");
   } catch (e) {
     console.error(`[setup] manifest conversion failed: ${(e as Error).message}`);
     return c.html(

@@ -68,6 +68,53 @@ test("the install screen is still reachable, but only when asked for", async ({ 
   expect(location).toContain("state=");
 });
 
+test("a freshly provisioned App is sent to the installation screen", async () => {
+  /**
+   * The one caller that genuinely needs the picker.
+   *
+   * Setup has just created the App; it is installed nowhere, so the admin who
+   * provisioned it must choose repositories before it can reach any. Flipping
+   * the login route's default to authorization silently turned this redirect
+   * into a no-op — the App existed and could reach nothing, with no step left
+   * in the flow to fix it.
+   *
+   * Asserted on the source: reaching the redirect for real needs a valid
+   * manifest code and a round-trip to GitHub, and mocking that would test the
+   * mock. What can break here is the pairing between the two routes, so that is
+   * what this pins.
+   */
+  const src = await (await import("node:fs/promises")).readFile("agent/app.ts", "utf8");
+  const setupCallback = src.slice(src.indexOf('app.get("/api/setup/github/callback"'));
+  const redirect = setupCallback.slice(0, setupCallback.indexOf("} catch"));
+  expect(redirect, "post-provision must open the installation picker").toContain(
+    '/auth/github/login?install=1',
+  );
+});
+
+test("an install request with no App slug degrades loudly, not silently", async ({ request }) => {
+  // The install URL is built from the slug and nothing substitutes for it.
+  // GitHub's manifest conversion does return one, so this is the degenerate
+  // case — but `?install=1` quietly behaving as authorize is exactly how the
+  // regression above hid, so the fallback is asserted rather than assumed.
+  const seeded = await request.post("/test/github-app", { data: { clientId: "Iv1.noslug" } });
+  expect(seeded.status()).toBe(200);
+  try {
+    const res = await request.get("/auth/github/login?install=1", { maxRedirects: 0 });
+    expect(res.status()).toBe(302);
+    const location = res.headers()["location"] ?? "";
+    expect(location, "no slug means no install URL to build").toContain(
+      "github.com/login/oauth/authorize",
+    );
+    expect(location).not.toContain("installations/new");
+    expect(location, "and it must not emit a broken URL with an empty slug").not.toContain(
+      "apps//installations",
+    );
+  } finally {
+    // Restore the slug the other tests in this file rely on.
+    await request.post("/test/github-app", { data: { clientId: "Iv1.test", slug: "ada-test" } });
+  }
+});
+
 test("guidance never tells a user to grant repo access themselves", () => {
   // The transcript that prompted this said: "finish the authorization
   // (including granting access to the postman-eng/postman-app repo when
