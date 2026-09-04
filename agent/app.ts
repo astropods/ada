@@ -751,7 +751,7 @@ app.get("/auth/github/callback", async (c) => {
     // missing; arriving after an expired state (case 2) means retrying the
     // whole thing, and sending someone back to a picker they did not ask for
     // is what this route exists to undo.
-    return c.redirect("/auth/github/login?install=1");
+    return c.redirect("/auth/github/login");
   }
 
   if (!code) return c.text("invalid OAuth callback (no code)", 400);

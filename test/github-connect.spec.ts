@@ -1,6 +1,8 @@
 import { test, expect } from "@playwright/test";
 import { githubPromptGuidance } from "../agent/github-guidance.ts";
 
+const BASE = `http://localhost:${process.env.PORT ?? 8123}`;
+
 /**
  * What `connect github` actually asks a user to do.
  *
@@ -112,6 +114,42 @@ test("an install request with no App slug degrades loudly, not silently", async 
   } finally {
     // Restore the slug the other tests in this file rely on.
     await request.post("/test/github-app", { data: { clientId: "Iv1.test", slug: "ada-test" } });
+  }
+});
+
+test("the no-state recovery restarts on authorize, not on the picker", async ({ playwright }) => {
+  /**
+   * The recovery branch exists to UNDO a confusing picker, so it must not open
+   * one.
+   *
+   * It handles two arrivals: a flow that began on GitHub (someone opened the
+   * install URL directly, or an org owner approved a request) and so carries no
+   * state, and a state that simply expired. Neither is the user's fault and
+   * both want the same thing — restart the flow properly, which under the new
+   * routing means plain authorization.
+   *
+   * A fresh request context, because the route sets a one-shot retry cookie: a
+   * jar carrying that cookie from an earlier request takes the OTHER branch and
+   * renders the give-up page instead, so the assertion would silently stop
+   * testing the redirect.
+   */
+  const ctx = await playwright.request.newContext({ baseURL: BASE });
+  try {
+    const res = await ctx.get("/auth/github/callback", { maxRedirects: 0 });
+    expect(res.status()).toBe(302);
+    const location = res.headers()["location"] ?? "";
+    expect(location, "must restart the flow at the login route").toContain("/auth/github/login");
+    expect(location, "and must NOT reopen the installation picker").not.toContain("install=1");
+    // No stray query at all: the default IS the authorize flow now, and adding
+    // one back would be the same class of mistake in the other direction.
+    expect(location).toBe("/auth/github/login");
+
+    // Second time through, the retry cookie is set and the route stops rather
+    // than ping-ponging a persistently bad state.
+    const again = await ctx.get("/auth/github/callback", { maxRedirects: 0 });
+    expect(again.status(), "a repeat attempt gives up instead of looping").toBe(400);
+  } finally {
+    await ctx.dispose();
   }
 });
 
