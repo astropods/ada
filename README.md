@@ -285,7 +285,8 @@ npm test                                       # or: npm run test:ui
 |---|---|
 | `server-sse.spec.ts` | `Last-Event-ID` beats a stale `?lastEventId` query; `DELETE /sessions/:id` semantics |
 | `session-authz.spec.ts` | Whose session an authorized user may read/drive/delete; `/agents/ada/*` is gated; 404-vs-403 |
-| `thread-context.spec.ts` | A Slack mention reads the thread in, once per conversation, capped, and degrades when unavailable |
+| `github-connect.spec.ts` | `connect github` authorizes rather than opening a repo picker; guidance never asks users to grant repo access |
+| `thread-context.spec.ts` | A Slack mention reads the thread in; an empty first read is retried (bounded), capped, and degrades when unavailable |
 | `native-router.spec.ts` | Native prompt dispatch is refused; a context-less render still selects the sandbox |
 | `background-turn.spec.ts` | `POST /sessions` returns before the turn settles; a pre-dispatch failure still reports |
 | `chat-brevity.spec.ts` | Slack gets the brevity instruction, the browser does not, and it survives follow-ups |
@@ -857,6 +858,41 @@ CUSTOM ada.usage          {inputTokens, outputTokens, cache*, costUsd}
 TEXT_MESSAGE_START/…/END  msg_3  "Done — retries is now 5."
 RUN_FINISHED
 ```
+
+## GitHub access: two grants, not one
+
+Worth stating plainly, because conflating them cost a user an afternoon.
+
+| | who does it | what it decides |
+|---|---|---|
+| **Installation** | an org owner, once per org | *which repositories* the App may touch |
+| **Authorization** | every person, once each | *who Ada acts as* — a user-to-server token |
+
+A user token reaches the **intersection**: repos the installation covers and the
+user can see. So someone joining an org where the App is already installed needs
+only to authorize — `connect github` — and should never be shown a repo picker.
+
+`/auth/github/login` therefore goes to GitHub's **user-authorization** endpoint
+by default. `?install=1` reaches the installation screen, for the cases that
+genuinely need it: the first install in an org, or adding personal repos.
+
+It used to be the other way round, on the reasoning that
+`request_oauth_on_install` makes an install authorize too. It does — but it
+asked every user to configure an installation, which most cannot do and none
+need. In an org where IT had already installed the App, the picker offered an
+installation the user had no rights to change and GitHub refused with **access
+denied**, on a step that was never necessary; choosing their personal account
+instead produced a token with no access to the org's repos, so the clone failed
+and Ada reported being unauthenticated. A loop with no exit for the person in it.
+
+Two smaller things fell out of the same report. A `403` on push is an **org
+owner's** problem, not the user's, so the prompt guidance now says that instead
+of telling them to reconnect and grant repo access — advice that sends them
+back into the picker they cannot use. And a chat-initiated connect no longer
+redirects to `/` on success: a Slack user has no reason to be authorized for the
+web UI, and bouncing them there served the themed 401 *after* the token was
+already stored, so a successful connection ended on a page saying access denied.
+They get their own confirmation page now.
 
 ## GitHub App callback URLs
 

@@ -31,9 +31,15 @@ export function githubPromptGuidance(opts: { configured: boolean; connected: boo
       "App is INSTALLED on, with Contents + Pull requests write. So to propose changes, push a branch " +
       "to the repo and open a PR (via `gh pr create`) — do NOT try to fork (the App token cannot create " +
       "forks; it will 403). If a `git push`/`gh` call returns 403 or 'not found' on a repo, the App simply " +
-      "isn't installed on that repo (or the org) — do NOT retry, fork, or suggest a PAT. Instead tell the " +
-      "user to install the Ada GitHub App on that repository by sending `connect github` here and picking " +
-      "it (org repos may need an org admin to approve the install)."
+      "isn't installed on that repo (or the org) — do NOT retry, fork, or suggest a PAT. " +
+      "Be precise about WHOSE problem that is, because getting it wrong sends people in circles: " +
+      "the user has already done their part (authorizing). What is missing is the App INSTALLATION on " +
+      "that repository, which is an ORG OWNER's action, once per org — not something the user can fix by " +
+      "reconnecting. Say the App needs installing on <org>/<repo> by someone who administers that org — " +
+      "in the Ada web app that is Settings → \"Add a repository on GitHub\" (or \"Manage <org> on GitHub\" " +
+      "when it is already installed elsewhere). " +
+      "Do NOT tell the user to re-run `connect github` and grant repo access: they will be shown an " +
+      "installation they have no rights to change, and GitHub will refuse."
     );
   }
   return (
@@ -42,6 +48,9 @@ export function githubPromptGuidance(opts: { configured: boolean; connected: boo
     "If the task needs GitHub, tell the user to send the message `connect github` here in chat " +
     "(no leading slash — it's not a Slack command) — I'll reply with a link that connects their " +
     "account securely through Ada's GitHub App, with no tokens to paste. " +
+    "It only asks them to authorize Ada to act as them; it does NOT ask them to choose repositories, " +
+    "so do not tell them to grant access to a repo or to install anything — for a repo in an org where " +
+    "the App is already installed, authorizing is the whole of their part. " +
     "Do not attempt any other authentication method."
   );
 }
