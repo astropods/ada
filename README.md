@@ -526,7 +526,12 @@ conversation now pulls the thread in via `getThreadHistory()` (adapter-core
 replies and the triggering message left out.
 
 Once per conversation, not per turn: a Slack thread *is* a Flue instance, so
-after the first turn the conversation history already carries it. The trade is
+after the first turn the conversation history already carries it. "Once" is
+bounded-retry rather than one-shot, because the first mention is frequently the
+one that *opens* the thread — "Ada, can you look at this?" has nothing above it,
+and treating that empty read as spent meant the next message, the one pasting
+the actual error, was never picked up. A read that finds nothing usable costs an
+attempt (3); a read that finds something is terminal. The trade is
 that humans talking to each other in the thread *between* Ada's turns aren't
 picked up — Ada only receives messages addressed to it. The block is capped
 (40 messages, ~4KB, 600 chars per message) and trims the *oldest* first, since

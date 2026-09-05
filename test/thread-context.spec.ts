@@ -99,6 +99,97 @@ test("reads the thread in, so a bare 'fix this' has something to refer to", asyn
   expect(sent.match(/Ada fix this/g), "the trigger appears once, as the prompt").toHaveLength(1);
 });
 
+test("an empty first thread does not spend the read — the next ping still works", async () => {
+  /**
+   * The flow this feature exists for was the one it failed on.
+   *
+   * "Ada, can you look at this?" posted at top level OPENS the thread: there is
+   * nothing above it, so the fetch finds nothing usable. Recording that as the
+   * read being spent meant the very next message — the one pasting the actual
+   * error — was never picked up. A one-shot flag is wrong precisely when the
+   * mention comes first.
+   */
+  const { runner, prompts } = stubRunner();
+  const adapter = new AdaMessagingAdapter(new InMemoryStore(), runner);
+
+  // Ping 1 opens the thread: only Ada and the trigger exist, so nothing usable.
+  await adapter.stream(
+    "Ada can you look at this?",
+    noopHooks(),
+    opts({
+      history: [
+        { messageId: "m-trigger", user: { id: "U-human", username: "sam" }, content: "Ada can you look at this?" },
+      ],
+    }),
+  );
+  expect(prompts[0], "nothing to add yet").toBe("Ada can you look at this?");
+
+  // The human pastes the error, then pings again. THIS is the read that matters.
+  await adapter.stream(
+    "ok now fix it",
+    noopHooks(),
+    opts({
+      history: [
+        { messageId: "m-trigger", user: { id: "U-human", username: "sam" }, content: "Ada can you look at this?" },
+        { messageId: "m-err", user: { id: "U-human", username: "sam" }, content: "TypeError: cannot read x of undefined at line 42" },
+        { messageId: "m-trigger2", user: { id: "U-human", username: "sam" }, content: "ok now fix it" },
+      ],
+      platformContext: {
+        messageId: "m-trigger2",
+        channelId: "C1",
+        botUserId: "U-ada",
+      } as StreamOptions["platformContext"],
+    }),
+  );
+  expect(prompts[1], "the second ping must pick the thread up").toContain("<thread>");
+  expect(prompts[1]).toContain("TypeError: cannot read x of undefined");
+  expect(prompts[1].endsWith("ok now fix it")).toBe(true);
+});
+
+test("stops looking after a bounded number of empty threads", async () => {
+  // The counter exists so a genuinely empty thread is not re-fetched on every
+  // turn forever. Bounded, not unlimited — and not one, which was the bug.
+  let fetches = 0;
+  const { runner } = stubRunner();
+  const adapter = new AdaMessagingAdapter(new InMemoryStore(), runner);
+  const emptyThread = () => {
+    fetches += 1;
+    return Promise.resolve([
+      { messageId: "m-trigger", user: { id: "U-human" }, content: "ping" } as FakeMsg,
+    ]);
+  };
+
+  for (let i = 0; i < 6; i++) {
+    await adapter.stream("ping", noopHooks(), opts({ history: emptyThread }));
+  }
+  expect(fetches, "attempts are capped").toBe(3);
+});
+
+test("a fetch failure costs an attempt rather than the whole budget", async () => {
+  // A transient platform failure must not permanently disable the feature for
+  // that conversation, but it must not be retried forever either.
+  let fetches = 0;
+  const { runner, prompts } = stubRunner();
+  const adapter = new AdaMessagingAdapter(new InMemoryStore(), runner);
+
+  await adapter.stream(
+    "first",
+    noopHooks(),
+    opts({
+      history: () => {
+        fetches += 1;
+        return Promise.reject(new Error("slack unavailable"));
+      },
+    }),
+  );
+  expect(prompts[0], "the turn still runs").toBe("first");
+
+  // Recovered by the next ping: still allowed to look.
+  await adapter.stream("second", noopHooks(), opts({ history: THREAD }));
+  expect(fetches).toBe(1);
+  expect(prompts[1], "a recovered platform is read on the next ping").toContain("<thread>");
+});
+
 test("reads the thread once per conversation, not on every turn", async () => {
   // A Slack thread IS a Flue instance, so after the first turn the conversation
   // history already carries this. Re-reading would resend the same messages and

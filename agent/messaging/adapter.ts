@@ -38,7 +38,22 @@ import { getServerSecret, buildConnectUrl } from "../auth/connect.ts";
 
 const HINT_NS = "gh_connect_hint"; // conversationId -> "1" once the connect hint has been shown
 const REPO_NS = "conv_repo"; // conversationId -> { owner, repo } bound to this thread
-const THREAD_CTX_NS = "conv_thread_ctx"; // conversationId -> "1" once the thread has been read in
+const THREAD_CTX_NS = "conv_thread_ctx"; // conversationId -> {done} | {attempts}
+
+/**
+ * How many times a conversation may look for thread context before giving up.
+ *
+ * Not a single one-shot flag, because the FIRST mention is frequently the one
+ * that opens the thread — "Ada, can you look at this?" posted at top level has
+ * nothing above it. Recording the read as spent there meant the very next
+ * message, the one pasting the actual error, was never picked up: the flow this
+ * feature exists for was the flow it failed on.
+ *
+ * So a fetch that finds nothing usable costs an attempt rather than the whole
+ * budget, and a fetch that finds something is terminal. The bound is what keeps
+ * a genuinely empty thread from re-asking the platform on every turn forever.
+ */
+const THREAD_CONTEXT_MAX_ATTEMPTS = 3;
 
 /** Most thread messages to read in, oldest first. */
 const THREAD_CONTEXT_MAX_MESSAGES = 40;
@@ -232,17 +247,26 @@ export class AdaMessagingAdapter implements AgentAdapter {
    */
   private async withThreadContext(prompt: string, options: StreamOptions): Promise<string> {
     if (!options.getThreadHistory) return prompt;
-    if (await this.store.kvGet(THREAD_CTX_NS, options.conversationId)) return prompt;
+
+    const raw = await this.store.kvGet(THREAD_CTX_NS, options.conversationId);
+    // Legacy one-shot flag, written before this became a bounded counter. A
+    // conversation that already had its context injected is done.
+    if (raw === "1") return prompt;
+    const state = (raw ?? {}) as { done?: boolean; attempts?: number };
+    if (state.done) return prompt;
+    const attempts = state.attempts ?? 0;
+    if (attempts >= THREAD_CONTEXT_MAX_ATTEMPTS) return prompt;
 
     let messages: Awaited<ReturnType<NonNullable<StreamOptions["getThreadHistory"]>>>;
     try {
       messages = await options.getThreadHistory(THREAD_CONTEXT_MAX_MESSAGES);
     } catch {
-      return prompt; // the platform could not hydrate the thread; carry on without it
+      // The platform could not hydrate the thread. Costs an attempt so a
+      // persistently failing platform is not re-asked every turn, and carries
+      // on: the message the user actually sent is still there.
+      await this.spendThreadAttempt(options.conversationId, attempts);
+      return prompt;
     }
-    // Record the attempt, not the success: a thread with nothing usable in it
-    // should not be re-fetched on every subsequent turn.
-    await this.store.kvPut(THREAD_CTX_NS, options.conversationId, "1");
 
     const botUserId = options.platformContext?.botUserId;
     const triggerId = options.platformContext?.messageId;
@@ -263,7 +287,13 @@ export class AdaMessagingAdapter implements AgentAdapter {
           : text;
       lines.push(`${who}: ${clipped}`);
     }
-    if (lines.length === 0) return prompt;
+    if (lines.length === 0) {
+      // Nothing usable YET — most often because this mention opened the thread.
+      // Spend an attempt, not the budget, so the next message in the thread can
+      // still be read.
+      await this.spendThreadAttempt(options.conversationId, attempts);
+      return prompt;
+    }
 
     // Keep the NEWEST messages when trimming: the end of a thread is what a
     // mention usually refers back to, and the top is often stale setup.
@@ -272,6 +302,10 @@ export class AdaMessagingAdapter implements AgentAdapter {
       while (lines.length > 1 && lines.join("\n").length > THREAD_CONTEXT_MAX_CHARS) lines.shift();
       block = `[…earlier messages omitted]\n${lines.join("\n")}`;
     }
+
+    // Terminal only now that a block actually exists. Anything earlier burns
+    // the read on a thread that had nothing in it to read.
+    await this.store.kvPut(THREAD_CTX_NS, options.conversationId, { done: true });
 
     return (
       "<thread>\n" +
@@ -282,6 +316,15 @@ export class AdaMessagingAdapter implements AgentAdapter {
       "</thread>\n\n" +
       prompt
     );
+  }
+
+  /** Record one unproductive look at the thread, best-effort. */
+  private async spendThreadAttempt(conversationId: string, attempts: number): Promise<void> {
+    await this.store
+      .kvPut(THREAD_CTX_NS, conversationId, { attempts: attempts + 1 })
+      // A store failure must not cost the user their turn; the worst case is
+      // one more look at the thread next time.
+      .catch(() => {});
   }
 
   async stream(prompt: string, hooks: StreamHooks, options: StreamOptions): Promise<void> {
