@@ -297,7 +297,8 @@ npm test                                       # or: npm run test:ui
 | `reviewer-subagent.spec.ts` | Actually **invokes** the delegate via the `task` tool |
 | `repo-rules.spec.ts` | Convention discovery: casing, nesting, symlinks, truncation |
 | `remote-sandbox.spec.ts` | The isolation boundary — containment and env leakage — over real HTTP |
-| `telemetry.spec.ts` | A real agent turn's trace: names, parenting, durations, no content capture |
+| `telemetry.spec.ts` | A real agent turn's trace: names, parenting, durations, subagent nesting, scrubbed content |
+| `redact.spec.ts` | The trace-content scrubber: credentials masked, ordinary content intact |
 | `persistence.spec.ts` | Backend selection always; a real restart when `ADA_TEST_POSTGRES_HOST` is set |
 
 Two habits worth keeping, both learned the hard way here:
@@ -364,7 +365,7 @@ messaging sidecar.
 | `agent/auth/*` | Per-user GitHub App OAuth, App-Manifest provisioning, signed chat connect links, ALB-identity resolution. |
 | `agent/store/*` | Postgres-backed store (GitHub tokens, App creds, repo bindings, server secret); in-memory fallback. |
 | `agent/transport/sse.ts` | AG-UI SSE framing + `Last-Event-ID` replay. |
-| `agent/telemetry/*` | Installs `@flue/opentelemetry` (content capture off) plus Ada's cost metric. |
+| `agent/telemetry/*` | Installs `@flue/opentelemetry` (content captured, credentials scrubbed) plus Ada's cost metric. |
 
 ### Keeping secrets out of durable state
 
@@ -1029,7 +1030,7 @@ the `ResultStore`.
 `telemetry/otel.ts`:
 
 ```ts
-instrument(createOpenTelemetryInstrumentation({ content: false }))
+instrument(createOpenTelemetryInstrumentation({ content: { transform: redactContent } }))
 ```
 
 > This replaced ~440 lines that reimplemented Flue's Cloudflare tracing backend
@@ -1043,11 +1044,21 @@ A real turn produces one correlated trace, with spans that WRAP the work — so
 durations are real and nested instrumentation parents correctly:
 
 ```
-invoke_agent ada          39ms   ROOT
-├─ chat claude-opus-4-8    2ms   gen_ai.provider.name, request.model, usage.*
-├─ execute_tool bash      27ms   gen_ai.tool.name, tool.call.id, flue.tool.origin
-└─ chat claude-opus-4-8    1ms
+invoke_agent ada              39ms   ROOT
+├─ chat claude-opus-4-8        2ms   gen_ai.provider.name, request.model, usage.*
+├─ execute_tool bash          27ms   gen_ai.tool.name, tool.call.id, the COMMAND
+├─ invoke_agent code-reviewer 11ms   the subagent — its own span, same trace
+│  └─ chat claude-opus-4-8     9ms   its tokens billed to IT, not to the caller
+└─ chat claude-opus-4-8        1ms
 ```
+
+**A subagent shows up as a nested `invoke_agent`, not as a tool span.** Flue's
+framework-owned `task` tool emits no `execute_tool` span of its own, so the
+delegate hangs directly off the agent that spawned it. Worth knowing before you
+go looking: a reasonable reading of "the delegate runs as a tool call" predicts
+a tool span, and not finding one is how you conclude subagent tracing is broken
+when it is working. `test/telemetry.spec.ts` pins both the nesting and the
+absence.
 
 Span names follow the GenAI semconv (`invoke_agent` / `chat` / `execute_tool`)
 and `gen_ai.usage.input_tokens` is the semconv **total sent** — non-cached +
@@ -1055,10 +1066,26 @@ cache read + cache write.
 
 Two things are ours rather than the framework's, both deliberate:
 
-- **`content: false`.** Prompts, completions, and tool payloads never become
-  span attributes. Ada works on private repositories and attributes are retained
-  by the collector. If content is ever wanted, use the package's `transform`
-  hook to redact in place rather than flipping this on.
+- **Content capture, scrubbed.** Prompts, completions and tool payloads DO
+  become span attributes, through the instrumentation's `transform` hook. This
+  reverses an earlier `content: false`, whose reasoning was sound as far as it
+  went — Ada works on private repositories — but which bought a trace that could
+  tell you an `execute_tool bash` span took 40 seconds and not what it ran,
+  which is the first question anyone opening a trace has.
+
+  Everything is scrubbed for **credentials** on the way out
+  (`telemetry/redact.ts`): App tokens, cloud keys, JWTs, PEM blocks,
+  `Authorization:` headers, `SECRET=` values, credentials embedded in a clone
+  URL. The patterns are anchored on structure — a vendor prefix, an assignment,
+  a URL's credential slot — rather than on entropy, because entropy cannot tell
+  a token from a git SHA, and a scrubber that eats the useful parts sends people
+  back to reading logs.
+
+  It does **not** scrub repository content, and cannot: that is the payload you
+  asked to see. **The collector now holds source code.** Set its retention and
+  access accordingly — the startup log says so loudly, because it is a
+  deployment decision this code can only surface. `ADA_TRACE_CONTENT=off`
+  restores the previous behaviour with no deploy.
 - **A cost histogram** (`gen_ai.usage.cost_usd`). Cost is absent from the GenAI
   semconv and from Flue's instrumentation — it's provider- and pricing-specific
   — but pi-ai computes it per turn, and "tool usage + token usage → money" is a
@@ -1069,9 +1096,13 @@ the runner's observer returns early for instances it doesn't track, so driving
 telemetry from there silently excluded every session started through Flue's
 native `/agents/ada/:id` routes.
 
-`test/telemetry.spec.ts` drives a real agent turn against a faux model provider
-(no network, no credential) and asserts span names, parenting, a single trace,
-non-zero durations, the cost metric, and the absence of content attributes.
+`test/telemetry.spec.ts` drives a real agent turn — including a subagent
+delegation — against a faux model provider (no network, no credential) and
+asserts span names, parenting, a single trace, non-zero durations, the cost
+metric, that tool arguments reach the span, and that a token passed through one
+does not. `test/redact.spec.ts` covers the scrubber from both sides: the
+credential shapes that must not get through, and the ordinary content that must
+survive.
 
 | env | purpose |
 |---|---|

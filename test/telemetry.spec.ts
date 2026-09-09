@@ -18,7 +18,7 @@ import {
   fauxText,
   fauxToolCall,
 } from "@earendil-works/pi-ai/providers/faux";
-import { defineTool, init, useModel, useTool } from "@flue/runtime";
+import { defineSubagent, defineTool, init, useModel, useSubagent, useTool } from "@flue/runtime";
 import { start } from "@flue/runtime/node";
 import * as v from "valibot";
 import { installTelemetry } from "../agent/telemetry/otel.ts";
@@ -30,8 +30,9 @@ import { installTelemetry } from "../agent/telemetry/otel.ts";
  * framework — it is testing that WE INSTALLED IT, and installed it with the
  * settings this deployment requires. Both are easy to get silently wrong: a
  * broken or absent trace looks exactly like a working one until someone opens
- * a dashboard, and a content-capture regression looks like nothing at all
- * while quietly shipping private source to a collector.
+ * a dashboard, and a content-capture regression looks like nothing at all —
+ * either quietly shipping unscrubbed credentials, or quietly reverting to a
+ * trace that cannot tell you what the agent ran.
  *
  * So this drives an actual agent — real runtime, real interceptor, real tool
  * call — against a faux model provider (no network, no credential).
@@ -74,21 +75,31 @@ test("emits a correctly parented GenAI trace for a real agent turn", async () =>
 
   const dispose = await installTelemetry("ada-test");
 
-  // A scripted model: one tool call, then a final answer. Two model turns and
-  // one tool execution, so the trace has something to nest.
+  // A scripted model: a tool call carrying a credential, a delegation to a
+  // subagent, then a final answer. That gives the trace something to nest, a
+  // payload to check the scrubber against, and a child agent to look for.
   const faux = fauxProvider({
     provider: "faux",
     models: [{ id: "faux-1", cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } }],
   });
   faux.setResponses([
-    fauxAssistantMessage([fauxToolCall("ping", { n: 1 }, { id: "call_1" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage(
+      [fauxToolCall("ping", { n: 1, command: "git clone https://x-access-token:ghs_AAAABBBBCCCCDDDD1234@github.com/o/r" }, { id: "call_1" })],
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage(
+      [fauxToolCall("task", { agent: "probe-helper", prompt: "check the clone" }, { id: "call_2" })],
+      { stopReason: "toolUse" },
+    ),
+    // The delegate's own model turn.
+    fauxAssistantMessage([fauxText("looks fine")], { stopReason: "stop" }),
     fauxAssistantMessage([fauxText("done")], { stopReason: "stop" }),
   ]);
 
   const ping = defineTool({
     name: "ping",
     description: "test tool",
-    input: v.object({ n: v.number() }),
+    input: v.object({ n: v.number(), command: v.optional(v.string()) }),
     async run({ data }) {
       // Long enough that a real (wrapping) span records a duration a
       // zero-width, event-derived span could not.
@@ -97,9 +108,22 @@ test("emits a correctly parented GenAI trace for a real agent turn", async () =>
     },
   });
 
+  // A delegate, so the trace covers the reviewer's shape. Ada's real subagent
+  // (`code-reviewer`) runs only on substantive changes and needs a model, so
+  // this stands in for it: what is being checked is that a `task` delegation
+  // produces its OWN spans, correlated into the parent's trace.
+  const helper = defineSubagent({
+    name: "probe-helper",
+    description: "a delegate for the trace test",
+    agent: function ProbeHelper() {
+      return "You are a delegate.";
+    },
+  });
+
   function Probe() {
     useModel("faux/faux-1");
     useTool(ping);
+    useSubagent(helper);
     return "You are a test agent.";
   }
   Probe.agentName = "probe";
@@ -140,13 +164,38 @@ test("emits a correctly parented GenAI trace for a real agent turn", async () =>
   const chats = spans.filter((s) => s.name === "chat faux-1");
   expect(agent, "an invoke_agent span").toBeTruthy();
   expect(tool, "an execute_tool span").toBeTruthy();
-  expect(chats.length, "one chat span per model turn").toBe(2);
+  // Three parent turns' worth plus the delegate's own.
+  expect(chats.length, "one chat span per model turn").toBeGreaterThanOrEqual(3);
 
   // ---- structure ---------------------------------------------------------
   expect(new Set(spans.map((s) => s.traceId)).size, "all spans in one trace").toBe(1);
   expect(agent!.parent, "invoke_agent is the root").toBeNull();
   expect(tool!.parent, "tool nests under the agent").toBe("invoke_agent probe");
-  for (const c of chats) expect(c.parent, "chat nests under the agent").toBe("invoke_agent probe");
+  // The parent's own chats nest under it; the delegate's nest under the
+  // delegate, which is the whole point of the assertion below.
+  const parentChats = chats.filter((c) => c.parent === "invoke_agent probe");
+  expect(parentChats.length, "the parent's model turns nest under it").toBeGreaterThanOrEqual(3);
+
+  // ---- the subagent ------------------------------------------------------
+  // A delegate is a detached task, so "does it show up at all, and is it
+  // correlated to the run that spawned it" is a real question rather than an
+  // obvious yes. Ada's code-reviewer is invisible in production if this breaks,
+  // and it is the most expensive thing the agent does.
+  const delegate = spans.find((s) => s.name === "invoke_agent probe-helper");
+  expect(delegate, "the subagent gets its own invoke_agent span").toBeTruthy();
+  expect(delegate!.traceId, "the delegate is in the SAME trace as its parent").toBe(agent!.traceId);
+  // Directly under the parent agent, NOT under an `execute_tool task` span —
+  // the framework-owned `task` tool does not produce one. Worth pinning: a
+  // reasonable reading of "the delegate runs as a tool call" predicts a tool
+  // span, and looking for one is how you conclude subagent tracing is broken
+  // when it is working.
+  expect(delegate!.parent, "the delegate hangs off the agent that spawned it").toBe("invoke_agent probe");
+  expect(find("execute_tool task"), "the framework's task tool emits no tool span").toBeUndefined();
+  expect(delegate!.attributes["gen_ai.agent.name"]).toBe("probe-helper");
+  // The delegate's model turn is attributed to the delegate, not to the parent
+  // — otherwise a subagent's token spend is silently billed to the caller.
+  const delegateChats = chats.filter((c) => c.parent === "invoke_agent probe-helper");
+  expect(delegateChats.length, "the delegate's model turn is attributed to it").toBeGreaterThanOrEqual(1);
 
   // ---- spans WRAP the work ----------------------------------------------
   // The regression guard. An event-derived span opens and closes from outside
@@ -206,14 +255,24 @@ test("emits a correctly parented GenAI trace for a real agent turn", async () =>
     "the run span carries a cost attribute",
   ).toContain("gen_ai.usage.cost_usd");
 
-  // ---- no content capture ------------------------------------------------
-  // Ada works on private repositories; prompts, completions and tool payloads
-  // must never travel to the collector.
-  for (const s of spans) {
-    for (const key of Object.keys(s.attributes)) {
-      expect(key, `no message content on ${s.name}`).not.toMatch(
-        /input_messages|output_messages|system_instructions|tool_definitions|arguments|result/,
-      );
-    }
-  }
+  // ---- content capture ---------------------------------------------------
+  // The point of turning content on: a trace that can answer "what did it
+  // actually run". Without this, an `execute_tool` span says a command took
+  // 40 seconds and not which command it was.
+  const toolContent = JSON.stringify(tool!.attributes);
+  expect(toolContent, "the tool's arguments reach the span").toContain("command");
+  expect(toolContent, "including the command itself").toContain("git clone");
+
+  const anyContentKey = spans
+    .flatMap((s) => Object.keys(s.attributes))
+    .some((k) => /input\.messages|output\.messages|system_instructions|tool\.call\.arguments/.test(k));
+  expect(anyContentKey, "GenAI content attributes are populated").toBe(true);
+
+  // ---- …but scrubbed ------------------------------------------------------
+  // The mitigation that makes the above survivable. The clone URL the model
+  // passed carries an App installation token; the host must survive and the
+  // token must not.
+  const everything = JSON.stringify(spans.map((s) => s.attributes));
+  expect(everything, "no credential reaches the collector").not.toContain("ghs_AAAABBBBCCCCDDDD1234");
+  expect(everything, "the useful half of the URL survives").toContain("github.com/o/r");
 });

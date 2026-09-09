@@ -18,17 +18,64 @@
  *
  * What is left here is the part that genuinely isn't the framework's job:
  *
- *   - `content: false`. Ada works on private repositories; prompts,
- *     completions, and tool payloads must never reach the collector, where
- *     they would be retained. This is a policy decision, so it lives with us.
+ *   - The content policy. Traces carry prompts, completions and tool payloads,
+ *     scrubbed for credentials on the way out (see CONTENT POLICY below).
  *   - A cost histogram. Cost is absent from the GenAI semconv and from Flue's
  *     instrumentation, deliberately — it is provider- and pricing-specific.
  *     But pi-ai computes it per turn, and "tool usage + token usage → money" is
  *     a question this deployment has to answer, so we record the one metric
  *     the framework won't.
+ *
+ * ── CONTENT POLICY ────────────────────────────────────────────────────────
+ *
+ * Content capture is ON, through the instrumentation's `transform` hook.
+ *
+ * This reverses the earlier `content: false`, and the reasoning it reverses was
+ * sound as far as it went: Ada works on private repositories, and everything
+ * the model reads or writes is repository content. What that setting also
+ * bought, though, was a trace that could tell you an `execute_tool bash` span
+ * took 40 seconds and not what it ran — which is the first question anyone
+ * opening a trace has, and the reason they opened it. Answering "what did the
+ * agent actually do" is the job.
+ *
+ * So the trade is made explicitly rather than by omission:
+ *
+ *   - Everything is scrubbed for CREDENTIALS first (telemetry/redact.ts). That
+ *     covers the shapes that are catastrophic and recognisable — App tokens,
+ *     cloud keys, JWTs, PEM blocks, `Authorization:` headers, `SECRET=` values,
+ *     credentials embedded in a clone URL.
+ *   - It does NOT scrub repository content, and cannot: that is the payload the
+ *     operator asked to see. THE COLLECTOR NOW HOLDS SOURCE CODE. Its retention
+ *     and access controls have to be set accordingly — that is a deployment
+ *     decision this module can only surface, which is why it is logged loudly
+ *     at startup.
+ *   - `ADA_TRACE_CONTENT=off` restores the previous behaviour with no deploy.
+ *
+ * Flue caps content at 56 KiB per span itself, so size is the framework's
+ * problem rather than ours.
  */
 
 import type { FlueEvent } from "@flue/runtime";
+import { redactContent } from "./redact.ts";
+
+/**
+ * Resolve the content policy from the environment.
+ *
+ * Two states on purpose. A third — content on with no scrubbing — would be
+ * useful about once a year, for debugging the scrubber itself, and would be
+ * available by accident for the rest of the time.
+ *
+ * Exported for tests: `installTelemetry` registers process-global providers and
+ * can only run once, so the switch itself has to be checkable on its own.
+ */
+export function contentPolicy(env: NodeJS.ProcessEnv = process.env): false | { transform: (c: unknown) => unknown } {
+  const setting = (env.ADA_TRACE_CONTENT ?? "").toLowerCase();
+  if (setting === "off" || setting === "0" || setting === "false") return false;
+  // The hook's signature also passes a scope (contentType, agent, session ids).
+  // Unused: the scrubber's job is the same for a prompt, a tool argument and a
+  // tool result, and branching on scope is how a gap gets introduced.
+  return { transform: (content: unknown) => redactContent(content) };
+}
 
 /** Emitted alongside the framework's metrics; namespaced so they're clearly ours. */
 const COST_METRIC = "gen_ai.usage.cost_usd";
@@ -118,10 +165,8 @@ export async function installTelemetry(serviceName = "ada"): Promise<() => Promi
     return async () => {};
   }
 
-  // `content: false` opts out of prompt/completion/tool-payload capture
-  // entirely. If content is ever wanted, prefer the `transform` hook (redact
-  // in place) over flipping this on — see the package's ContentOption.
-  const disposeTracing = deps.instrument(deps.createOpenTelemetryInstrumentation({ content: false }));
+  const content = contentPolicy();
+  const disposeTracing = deps.instrument(deps.createOpenTelemetryInstrumentation({ content }));
 
   const costHistogram = deps.meter.createHistogram(COST_METRIC, { unit: "USD" });
   const reviewRuns = deps.meter.createCounter(REVIEW_RUNS_METRIC);
@@ -178,11 +223,20 @@ export async function installTelemetry(serviceName = "ada"): Promise<() => Promi
     }
   });
 
-  console.log(
-    process.env.OTEL_EXPORTER_OTLP_ENDPOINT
-      ? "[ada] telemetry: @flue/opentelemetry registered (traces + metrics, no content capture)"
-      : "[ada] telemetry: @flue/opentelemetry registered, but no exporter — spans are discarded",
-  );
+  // Loud, and specifically about the content, because "the collector now holds
+  // repository source" is a deployment fact an operator has to act on and
+  // cannot discover from a dashboard until it is already true.
+  if (!process.env.OTEL_EXPORTER_OTLP_ENDPOINT) {
+    console.log("[ada] telemetry: @flue/opentelemetry registered, but no exporter — spans are discarded");
+  } else if (content === false) {
+    console.log("[ada] telemetry: registered (traces + metrics, content capture OFF)");
+  } else {
+    console.warn(
+      "[ada] telemetry: registered WITH content capture — prompts, completions and tool " +
+        "payloads are exported (credentials scrubbed, repository content is NOT). " +
+        "Set ADA_TRACE_CONTENT=off to disable.",
+    );
+  }
 
   return async () => {
     disposeMetrics();
