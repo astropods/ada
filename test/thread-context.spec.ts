@@ -19,14 +19,26 @@ import type { StreamHooks, StreamOptions } from "@astropods/adapter-core";
  * thing that decides whether the model can resolve "this".
  */
 
-/** Captures the prompt the adapter dispatches, without running an agent. */
-function stubRunner(): { runner: SessionRunner; prompts: string[]; titles: (string | undefined)[] } {
+/**
+ * Captures the prompt the adapter dispatches, without running an agent.
+ *
+ * `outcomes` queues what the Nth turn does: resolve (the default) or throw. A
+ * thrown turn is how a real one dies — the model erroring, the repo failing to
+ * clone — and the thread read must survive it.
+ */
+function stubRunner(outcomes: Array<"ok" | Error> = []): {
+  runner: SessionRunner;
+  prompts: string[];
+  titles: (string | undefined)[];
+} {
   const prompts: string[] = [];
   const titles: (string | undefined)[] = [];
   const runner = {
     async continueSession(_id: string, opts: { prompt: string; meta?: { title?: string } }) {
       prompts.push(opts.prompt);
       titles.push(opts.meta?.title);
+      const outcome = outcomes[prompts.length - 1];
+      if (outcome instanceof Error) throw outcome;
     },
   } as unknown as SessionRunner;
   return { runner, prompts, titles };
@@ -203,6 +215,84 @@ test("reads the thread once per conversation, not on every turn", async () => {
   expect(prompts[0]).toContain("<thread>");
   expect(prompts[1], "the second turn must not repeat the thread").not.toContain("<thread>");
   expect(prompts[1]).toBe("and add a test");
+});
+
+test("a turn that dies does not spend the read — the retry still gets the thread", async () => {
+  /**
+   * `done` used to be written before the turn was dispatched, so the first-turn
+   * failures this feature exists for were the ones it abandoned: the thread was
+   * marked read, the turn that would have carried it never landed, and no later
+   * message in that conversation ever saw the context again.
+   */
+  const { runner, prompts } = stubRunner([new Error("model unavailable")]);
+  const adapter = new AdaMessagingAdapter(new InMemoryStore(), runner);
+
+  await adapter.stream("Ada fix this", noopHooks(), opts({ history: THREAD }));
+  expect(prompts[0], "the block reached the failed turn").toContain("<thread>");
+
+  // The user pings again. The context never landed, so it must be read back in.
+  await adapter.stream("try again", noopHooks(), opts({ history: THREAD }));
+  expect(prompts[1], "a failed turn must not consume the read").toContain("<thread>");
+  expect(prompts[1]).toContain("/orders endpoint is 500ing");
+
+  // …and once a turn actually settles, we are back to once per conversation.
+  await adapter.stream("and add a test", noopHooks(), opts({ history: THREAD }));
+  expect(prompts[2], "the settled turn spent it").not.toContain("<thread>");
+});
+
+test("a superseded turn does not spend the read", async () => {
+  // A new message in the same thread aborts the in-flight one. That turn was
+  // replaced rather than delivered, so the successor the sidecar is already
+  // driving still needs the thread — both when the abort surfaces as a throw
+  // and when the runner swallows it and returns.
+  for (const mode of ["throws", "returns"] as const) {
+    const prompts: string[] = [];
+    const ctrl = new AbortController();
+    let turn = 0;
+    const runner = {
+      async continueSession(_id: string, o: { prompt: string }) {
+        prompts.push(o.prompt);
+        if (turn++ > 0) return; // only the first turn is superseded
+        ctrl.abort();
+        if (mode === "throws") throw new Error("read cancelled");
+      },
+    } as unknown as SessionRunner;
+    const adapter = new AdaMessagingAdapter(new InMemoryStore(), runner);
+
+    await adapter.stream(
+      "Ada fix this",
+      noopHooks(),
+      opts({ history: THREAD, signal: ctrl.signal } as Partial<StreamOptions>),
+    );
+    expect(prompts[0], mode).toContain("<thread>");
+
+    // The message that superseded it: the block never landed, so read it again.
+    await adapter.stream("actually, this one", noopHooks(), opts({ history: THREAD }));
+    expect(prompts[1], `superseded turn must not spend the read (${mode})`).toContain("<thread>");
+  }
+});
+
+test("keeps re-reading bounded when every turn dies", async () => {
+  // The counter is the backstop: a conversation whose turns keep failing must
+  // stop re-fetching the thread rather than doing it on every message forever.
+  let fetches = 0;
+  const boom = () => new Error("model unavailable");
+  const { runner } = stubRunner([boom(), boom(), boom(), boom(), boom(), boom()]);
+  const adapter = new AdaMessagingAdapter(new InMemoryStore(), runner);
+
+  for (let i = 0; i < 6; i++) {
+    await adapter.stream(
+      "ping",
+      noopHooks(),
+      opts({
+        history: () => {
+          fetches += 1;
+          return Promise.resolve(THREAD);
+        },
+      }),
+    );
+  }
+  expect(fetches, "attempts bound the retry").toBe(3);
 });
 
 test("degrades to today's behaviour when the thread cannot be read", async () => {

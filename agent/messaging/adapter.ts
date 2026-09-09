@@ -49,9 +49,10 @@ const THREAD_CTX_NS = "conv_thread_ctx"; // conversationId -> {done} | {attempts
  * message, the one pasting the actual error, was never picked up: the flow this
  * feature exists for was the flow it failed on.
  *
- * So a fetch that finds nothing usable costs an attempt rather than the whole
- * budget, and a fetch that finds something is terminal. The bound is what keeps
- * a genuinely empty thread from re-asking the platform on every turn forever.
+ * So EVERY look costs an attempt, and only a look whose block reached a turn
+ * that actually finished is terminal. The bound is what keeps a genuinely empty
+ * thread — or one whose turns keep dying — from re-asking the platform on every
+ * turn forever.
  */
 const THREAD_CONTEXT_MAX_ATTEMPTS = 3;
 
@@ -232,30 +233,39 @@ export class AdaMessagingAdapter implements AgentAdapter {
    * mention itself is a pronoun. Without the thread, Ada has to ask what "this"
    * is, which is exactly the friction the mention was meant to avoid.
    *
-   * ONCE PER CONVERSATION, recorded durably in the store like the connect hint
-   * and the repo binding. A Slack thread IS a Flue instance, so after the first
-   * turn the conversation history already carries this; re-reading it every turn
-   * would resend the same messages and spend the budget twice. The trade is that
-   * humans talking to each other in the thread BETWEEN Ada's turns are not
-   * picked up — Ada only receives messages addressed to it. That is worth
-   * knowing and not worth the duplication to fix.
+   * ONCE PER SETTLED TURN, recorded durably in the store like the connect hint
+   * and the repo binding. A Slack thread IS a Flue instance, so once a turn
+   * carrying the block has finished, the conversation history already has it;
+   * re-reading it every turn would resend the same messages and spend the budget
+   * twice. The trade is that humans talking to each other in the thread BETWEEN
+   * Ada's turns are not picked up — Ada only receives messages addressed to it.
+   * That is worth knowing and not worth the duplication to fix.
+   *
+   * SETTLED is the operative word. This reports whether it injected; `stream`
+   * commits `done` only after the turn finishes. Writing `done` here instead
+   * meant a turn that then threw, or was superseded by the next message, left
+   * the conversation marked read with nothing in its history to show for it —
+   * and the first-turn failure is exactly the case this feature exists for.
    *
    * Best-effort throughout. `getThreadHistory` is optional (an older sidecar, or
    * the web playground, simply does not have it), and a thread that cannot be
    * read must degrade to today's behaviour rather than fail the turn — the
    * message the user actually sent is still there.
    */
-  private async withThreadContext(prompt: string, options: StreamOptions): Promise<string> {
-    if (!options.getThreadHistory) return prompt;
+  private async withThreadContext(
+    prompt: string,
+    options: StreamOptions,
+  ): Promise<{ prompt: string; injected: boolean }> {
+    if (!options.getThreadHistory) return { prompt, injected: false };
 
     const raw = await this.store.kvGet(THREAD_CTX_NS, options.conversationId);
     // Legacy one-shot flag, written before this became a bounded counter. A
     // conversation that already had its context injected is done.
-    if (raw === "1") return prompt;
+    if (raw === "1") return { prompt, injected: false };
     const state = (raw ?? {}) as { done?: boolean; attempts?: number };
-    if (state.done) return prompt;
+    if (state.done) return { prompt, injected: false };
     const attempts = state.attempts ?? 0;
-    if (attempts >= THREAD_CONTEXT_MAX_ATTEMPTS) return prompt;
+    if (attempts >= THREAD_CONTEXT_MAX_ATTEMPTS) return { prompt, injected: false };
 
     let messages: Awaited<ReturnType<NonNullable<StreamOptions["getThreadHistory"]>>>;
     try {
@@ -265,7 +275,7 @@ export class AdaMessagingAdapter implements AgentAdapter {
       // persistently failing platform is not re-asked every turn, and carries
       // on: the message the user actually sent is still there.
       await this.spendThreadAttempt(options.conversationId, attempts);
-      return prompt;
+      return { prompt, injected: false };
     }
 
     const botUserId = options.platformContext?.botUserId;
@@ -292,7 +302,7 @@ export class AdaMessagingAdapter implements AgentAdapter {
       // Spend an attempt, not the budget, so the next message in the thread can
       // still be read.
       await this.spendThreadAttempt(options.conversationId, attempts);
-      return prompt;
+      return { prompt, injected: false };
     }
 
     // Keep the NEWEST messages when trimming: the end of a thread is what a
@@ -303,19 +313,24 @@ export class AdaMessagingAdapter implements AgentAdapter {
       block = `[…earlier messages omitted]\n${lines.join("\n")}`;
     }
 
-    // Terminal only now that a block actually exists. Anything earlier burns
-    // the read on a thread that had nothing in it to read.
-    await this.store.kvPut(THREAD_CTX_NS, options.conversationId, { done: true });
+    // An attempt, NOT `done`: the turn carrying this block has not run yet, and
+    // if it dies the thread still needs reading. `stream` commits `done` once it
+    // settles. Spending the attempt here is what bounds that retry — a
+    // conversation whose turns keep failing stops re-fetching, rather than
+    // re-reading the thread on every message forever.
+    await this.spendThreadAttempt(options.conversationId, attempts);
 
-    return (
-      "<thread>\n" +
-      "You were mentioned partway through this conversation. It is the context for " +
-      "the request below — a bare \"fix this\" or \"take a look\" almost certainly " +
-      "refers to something in here. Oldest first; your own replies are omitted.\n\n" +
-      `${block}\n` +
-      "</thread>\n\n" +
-      prompt
-    );
+    return {
+      injected: true,
+      prompt:
+        "<thread>\n" +
+        "You were mentioned partway through this conversation. It is the context for " +
+        "the request below — a bare \"fix this\" or \"take a look\" almost certainly " +
+        "refers to something in here. Oldest first; your own replies are omitted.\n\n" +
+        `${block}\n` +
+        "</thread>\n\n" +
+        prompt,
+    };
   }
 
   /** Record one unproductive look at the thread, best-effort. */
@@ -341,7 +356,8 @@ export class AdaMessagingAdapter implements AgentAdapter {
     }
 
     // "Ada fix this" only means something if Ada can see what "this" is.
-    const contextualPrompt = await this.withThreadContext(prompt, options);
+    const { prompt: contextualPrompt, injected: threadContextInjected } =
+      await this.withThreadContext(prompt, options);
 
     const repo = await this.boundRepo(options.conversationId);
 
@@ -355,10 +371,25 @@ export class AdaMessagingAdapter implements AgentAdapter {
       hintUrl = buildConnectUrl(options.userId, await getServerSecret(this.store));
     }
 
+    // The thread read is only spent once the turn it fed has actually settled;
+    // awaited before `stream` returns so the next message in the thread sees it.
+    let threadContextCommitted: Promise<void> | undefined;
+    const commitThreadContext = () => {
+      // A superseded turn has not delivered the block to anyone — the successor
+      // the sidecar is already driving needs to read the thread in again.
+      if (!threadContextInjected || threadContextCommitted || options.signal?.aborted) return;
+      threadContextCommitted = this.store
+        .kvPut(THREAD_CTX_NS, options.conversationId, { done: true })
+        // A store failure must not cost the user their turn; the worst case is
+        // one more look at the thread next time, and attempts still bound that.
+        .catch(() => {});
+    };
+
     let settled = false;
     const finish = () => {
       if (settled) return;
       settled = true;
+      commitThreadContext();
       if (hintUrl) {
         hooks.onChunk(
           `\n\n---\n💡 Tip: install me on your GitHub repos so I can read, push, and open PRs — ${hintUrl}`,
@@ -435,8 +466,14 @@ export class AdaMessagingAdapter implements AgentAdapter {
       }
       fail(e as Error);
       return;
+    } finally {
+      // Defensive: settle even if the run produced no terminal AG-UI event. A
+      // turn that failed or was superseded is already settled, so this is a
+      // no-op there — and no `done` is committed for it.
+      finish();
+      // Don't let the `done` write race the sidecar's next message: reading it
+      // is what stops the block being sent a second time.
+      await threadContextCommitted;
     }
-    // Defensive: settle even if the run produced no terminal AG-UI event.
-    finish();
   }
 }

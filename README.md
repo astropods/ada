@@ -531,8 +531,10 @@ after the first turn the conversation history already carries it. "Once" is
 bounded-retry rather than one-shot, because the first mention is frequently the
 one that *opens* the thread — "Ada, can you look at this?" has nothing above it,
 and treating that empty read as spent meant the next message, the one pasting
-the actual error, was never picked up. A read that finds nothing usable costs an
-attempt (3); a read that finds something is terminal. The trade is
+the actual error, was never picked up. Every read costs an attempt (3), and only a read
+whose block reached a turn that actually settled is terminal — a turn that dies
+or is superseded before it lands must not leave the thread marked read, since a
+first-turn failure is exactly the case this exists for. The trade is
 that humans talking to each other in the thread *between* Ada's turns aren't
 picked up — Ada only receives messages addressed to it. The block is capped
 (40 messages, ~4KB, 600 chars per message) and trims the *oldest* first, since
