@@ -150,6 +150,78 @@
     background:var(--panel); border:1px solid var(--ok); color:var(--fg); border-radius:8px;
     padding:8px 14px; box-shadow:0 8px 28px rgba(0,0,0,.45); transition:opacity .3s; }
   #toast[hidden] { display:none; }
+
+  /* ── Responsive ────────────────────────────────────────────────────────
+     Added as a layer on top of the desktop rules rather than woven through
+     them, so the small-screen behaviour is readable in one place.
+
+     `--header-h` is measured in JS (see setHeaderHeight). The floating panels
+     hang off the header, and the header's height is not a constant: chips wrap
+     at narrow widths, `Review` appears only for admins, and the debug chip
+     appears with ?debug. The hardcoded `top:52px` those panels used was right
+     for exactly one of those combinations and put the panel over the header
+     for the rest. */
+  :root { --header-h: 52px; }
+
+  /* Fall back to 100vh where dvh is unsupported. On mobile Safari and Chrome
+     100vh is the LARGEST viewport — the one with the browser chrome scrolled
+     away — so a 100vh column puts the composer behind the address bar until
+     you scroll. dvh tracks the chrome as it comes and goes. */
+  @supports (height: 100dvh) {
+    body { height:100dvh; }
+  }
+
+  #settings-panel, #session-menu, #review-menu { top:calc(var(--header-h) + 6px); }
+
+  /* Long URLs and stack frames must not force the whole column wide enough to
+     read them — a code block scrolls, but running prose should wrap. */
+  .bubble .body { overflow-wrap:anywhere; }
+
+  @media (max-width: 720px) {
+    /* The metrics chips are the compressible part: brand, session, status and
+       settings are what you act on. Two tight rows beats one row of eight
+       truncated chips. */
+    header { padding:8px 10px; gap:6px; }
+    header h1 { font-size:14px; }
+    .chip { font-size:11px; padding:2px 8px; }
+    .brand-mark { width:22px; height:22px; }
+
+    #timeline { padding:12px 10px; }
+    .bubble, .tool { padding:9px 10px; margin-bottom:10px; }
+    .welcome { margin-top:3vh; }
+    .welcome .tagline { font-size:14px; }
+
+    /* Panels become near-full-width sheets: a 360px popover pinned to one edge
+       of a 375px screen is a popover with nowhere to go. */
+    #settings-panel, #session-menu, #review-menu {
+      left:8px; right:8px; width:auto; max-height:70vh;
+    }
+    #toast { left:8px; right:8px; transform:none; text-align:center; }
+
+    /* The debug pane stacks under the timeline instead of taking a 380px
+       column that would leave ~0 for the conversation. */
+    body.debug main { grid-template-columns:1fr; grid-template-rows:1fr auto; }
+    body.debug #side { border-left:none; border-top:1px solid var(--line); max-height:38vh; }
+
+    /* 16px is the threshold below which iOS Safari zooms the page on focus,
+       which then leaves the composer off-screen and the layout scrolled. */
+    input[type=text] { font-size:16px; padding:10px; }
+    /* Comfortable touch targets, and room for the iPhone home indicator. */
+    button { padding:10px 12px; }
+    form { padding:10px 10px calc(10px + env(safe-area-inset-bottom)); }
+    .sess-item { padding:10px; }
+    .sess-del { padding:10px 14px; }
+  }
+
+  @media (max-width: 420px) {
+    /* At this width the send button's label is the difference between the
+       input being usable and not. The chips that remain are the two you read
+       mid-turn; the rest are diagnostics, and they are one tap away in the
+       raw-event pane with ?debug. */
+    #model-chip, #conn-chip { display:none; }
+    .brand h1 { display:none; }
+    #send { padding:10px 14px; }
+  }
 </style>
 </head>
 <body>
@@ -169,10 +241,10 @@
   </div>
   <button id="sid-btn" class="chip chip-btn" title="Switch session">session <b id="sid">—</b> <span class="caret">▾</span></button>
   <span class="chip">status <b id="status">idle</b></span>
-  <span class="chip">model <b id="model">—</b></span>
+  <span class="chip" id="model-chip">model <b id="model">—</b></span>
   <span class="chip">tokens <b id="tok">—</b></span>
   <span class="chip">cost <b id="cost">—</b></span>
-  <span class="chip">conn <b id="conn">—</b></span>
+  <span class="chip" id="conn-chip">conn <b id="conn">—</b></span>
   <span class="chip chip-debug">lastEventId <b id="lei">—</b></span>
   <button id="review-btn" class="chip chip-btn" title="Review conversations Ada handled" hidden>Review <span class="caret">▾</span></button>
   <button id="settings-btn" class="chip chip-btn" title="Settings" aria-label="Settings">
@@ -212,6 +284,20 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const timeline = $("timeline"), rawlog = $("rawlog");
+
+/* Publish the header's real height so the floating panels can hang off it.
+   It is not a constant: the chips wrap at narrow widths, `Review` appears only
+   for admins, and ?debug adds another chip — so the panels' old hardcoded
+   `top:52px` was correct for one combination and overlapped the header for the
+   rest. ResizeObserver rather than a resize listener, because wrapping is
+   triggered by content appearing as much as by the window changing. */
+function setHeaderHeight(){
+  const h = document.querySelector("header")?.offsetHeight;
+  if (h) document.documentElement.style.setProperty("--header-h", h + "px");
+}
+setHeaderHeight();
+if (window.ResizeObserver) new ResizeObserver(setHeaderHeight).observe(document.querySelector("header"));
+else window.addEventListener("resize", setHeaderHeight);
 let es = null, sessionId = null, lastEventId = null, pendingEl = null;
 // AG-UI seqs already rendered into the timeline. The timeline isn't cleared on
 // an SSE reconnect, so a replayed event we've already shown must be skipped —

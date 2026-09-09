@@ -179,6 +179,17 @@ Reads, aborts and attachment fetches over the native router are untouched.
 | `GET  /agents/ada/:id` · `/abort` · `/attachments/:aid` | Flue's native agent routes (`@flue/sdk`) — admin-gated, **read/abort only** |
 | `POST /agents/ada/:id` | **405** — native prompt dispatch is refused; use `POST /sessions` |
 
+**The client works on a phone.** The layout had no breakpoints, and the
+failures that caused were structural rather than cosmetic: a `100vh` column put
+the composer behind mobile Safari's chrome, a 14px input made iOS zoom the page
+on focus, the floating panels were pinned at a hardcoded `top:52px` while the
+header wraps to twice that at 375px, and the debug pane's 380px column left the
+conversation ~0. Breakpoints at 720px and 420px are layered on top of the
+desktop rules rather than woven through them, and `--header-h` is measured at
+runtime so the panels hang off the header's real height — which varies with chip
+wrapping, admin-only buttons and `?debug`. Geometry is covered by
+`test/client-responsive.spec.ts` at phone, tablet and desktop widths.
+
 Only one turn runs at a time per session — an overlapping `POST .../messages`
 returns `409 busy`. (Flue serializes concurrent deliveries to one instance
 anyway; the 409 is kept because the AG-UI client relies on it to keep its own

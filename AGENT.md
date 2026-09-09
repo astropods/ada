@@ -1,5 +1,5 @@
 ---
-description: "Ada — a coding agent (built on Flue 2.0) you talk to over Slack, web chat, or an AG-UI/SSE frontend."
+description: "Ada — a coding agent you talk to over Slack, web chat, or an AG-UI/SSE frontend."
 tags: [ada, flue, ag-ui, sse, slack, github, coding-agent]
 capabilities:
   - "Runs a Flue 2.0 agent loop in-process — no CLI child, no stream-json contract"
