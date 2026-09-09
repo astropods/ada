@@ -4,6 +4,7 @@
  *   GET  /                         -> built-in AG-UI test client (public/index.html)
  *   POST /sessions {prompt,...}    -> {sessionId} (starts a new multi-turn session)
  *   POST /sessions/:id/messages    -> continue a session with a follow-up turn
+ *                                     (both take JSON, or multipart with files)
  *   DELETE /sessions/:id           -> drop a session (log, workspace, Flue state)
  *   GET  /sessions/:id/events      -> SSE AG-UI stream; honours Last-Event-ID
  *   GET  /conversations            -> list handled conversations (admin-gated)
@@ -50,6 +51,7 @@ import { describeAuth } from "./config/model.ts";
 import { SessionRegistry } from "./session/registry.ts";
 import { SessionRunner } from "./session/runner.ts";
 import { startWorkspaceGc } from "./session/workspace.ts";
+import { checkUploadLimits, MAX_UPLOAD_FILES, type UploadInput } from "./session/uploads.ts";
 import { installTelemetry } from "./telemetry/otel.ts";
 import { InMemoryResultStore } from "./persistence/results.ts";
 import { createStore, type Store } from "./store/index.ts";
@@ -381,20 +383,79 @@ app.get("/index.html", (c) => c.redirect("/"));
 
 const DEFAULT_TITLE_LEN = 80;
 
+/**
+ * Read `{ prompt, uploads }` from a turn request, in either encoding.
+ *
+ * JSON stays the contract for a plain prompt — the messaging adapter, external
+ * AG-UI clients and every existing test speak it, and a turn with no files must
+ * keep producing byte-identical requests. Multipart is added ALONGSIDE it,
+ * chosen by content-type, purely so the browser can attach files without
+ * base64-inflating them by a third into a JSON body.
+ *
+ * Returns an error string instead of throwing: every caller turns it straight
+ * into a 4xx, and the limit messages are written to be shown to the user.
+ */
+async function readTurnRequest(
+  c: Context,
+): Promise<{ prompt: string; uploads: UploadInput[] } | { error: string }> {
+  const contentType = c.req.header("content-type") ?? "";
+
+  if (!contentType.includes("multipart/form-data")) {
+    const body = await c.req.json<{ prompt?: string }>().catch(() => ({}) as { prompt?: string });
+    if (!body.prompt) return { error: "prompt required" };
+    return { prompt: body.prompt, uploads: [] };
+  }
+
+  // `all: true` so repeated `files` parts arrive as an array rather than the
+  // last one winning — attaching three files and silently sending one is the
+  // failure this flag exists to avoid.
+  const form = await c.req.parseBody({ all: true }).catch(() => null);
+  if (!form) return { error: "malformed multipart body" };
+
+  const prompt = typeof form.prompt === "string" ? form.prompt : "";
+  if (!prompt) return { error: "prompt required" };
+
+  const parts = form.files;
+  const list = (Array.isArray(parts) ? parts : parts ? [parts] : []).filter(
+    (f): f is File => typeof f === "object" && f !== null && "arrayBuffer" in f,
+  );
+  if (list.length > MAX_UPLOAD_FILES) {
+    // Checked before reading any bytes: the point of a count limit is to avoid
+    // buffering an unbounded batch into memory, which reading first would do.
+    return { error: `too many files — ${list.length} attached, limit is ${MAX_UPLOAD_FILES}` };
+  }
+
+  const uploads: UploadInput[] = [];
+  for (const f of list) {
+    uploads.push({
+      filename: f.name,
+      mimeType: f.type,
+      bytes: new Uint8Array(await f.arrayBuffer()),
+    });
+  }
+  const limit = checkUploadLimits(uploads);
+  if (limit) return { error: limit };
+  return { prompt, uploads };
+}
+
 app.post("/sessions", async (c) => {
-  const body = await c.req.json<{ prompt?: string }>().catch(() => ({}) as { prompt?: string });
-  if (!body.prompt) return c.text("prompt required", 400);
   // Resolve + authorize the caller the same way the sidecar does; the GitHub
   // token is keyed by the resolved platform id so git/gh act as the same
   // identity the user connected in chat.
+  //
+  // BEFORE the body is read, so an unauthorized caller cannot make us buffer
+  // 50MB of attachments to be told no.
   const id = await resolveIdentity(c);
   if (!id.allowed) return c.text("forbidden", 403);
+  const req = await readTurnRequest(c);
+  if ("error" in req) return c.text(req.error, 400);
   try {
     const sessionId = await runner.startSession({
-      prompt: body.prompt,
+      prompt: req.prompt,
+      uploads: req.uploads,
       userKey: id.userKey,
       userId: id.userId ?? undefined,
-      meta: { kind: "browser", userId: id.userKey, title: body.prompt.slice(0, DEFAULT_TITLE_LEN) },
+      meta: { kind: "browser", userId: id.userKey, title: req.prompt.slice(0, DEFAULT_TITLE_LEN) },
       // Answer as soon as the session exists; the turn streams over SSE. This
       // used to await the whole turn, so the client only got its id once there
       // was nothing left to stream and replayed a finished turn in one block.
@@ -423,14 +484,17 @@ app.post("/sessions/:id/messages", async (c) => {
   if (!id.allowed) return c.text("forbidden", 403);
   if (!maySession(sessionId, id)) return c.text("forbidden", 403);
   if (!runner.has(sessionId)) return c.text("unknown session", 404);
-  const body = await c.req.json<{ prompt?: string }>().catch(() => ({}) as { prompt?: string });
-  if (!body.prompt) return c.text("prompt required", 400);
   // Flue serializes concurrent deliveries to one instance, but the AG-UI client
   // relies on 409 to keep its own turn state coherent — so keep refusing here.
+  // Ahead of the body read for the same reason as the authorization gate: a
+  // turn we are going to refuse should not cost us the upload first.
   if (runner.busy(sessionId)) return c.text("session busy", 409);
+  const req = await readTurnRequest(c);
+  if ("error" in req) return c.text(req.error, 400);
   try {
     await runner.continueSession(sessionId, {
-      prompt: body.prompt,
+      prompt: req.prompt,
+      uploads: req.uploads,
       userKey: id.userKey,
       userId: id.userId ?? undefined,
       // Same reasoning as POST /sessions: a follow-up turn is just as long, and

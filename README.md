@@ -168,8 +168,8 @@ Reads, aborts and attachment fetches over the native router are untouched.
 | Route | Purpose |
 |---|---|
 | `GET  /` | Built-in AG-UI test client (`public/index.html`) |
-| `POST /sessions` `{prompt}` | Start a session → `{sessionId}` |
-| `POST /sessions/:id/messages` `{prompt}` | Continue a session with a follow-up turn |
+| `POST /sessions` `{prompt}` | Start a session → `{sessionId}`. Also accepts `multipart/form-data` (`prompt` + `files`) |
+| `POST /sessions/:id/messages` `{prompt}` | Continue a session with a follow-up turn. Same two encodings |
 | `DELETE /sessions/:id` | Drop a session (event log, workspace, Flue state) |
 | `GET  /sessions/:id/events` | SSE AG-UI stream; honours `Last-Event-ID` replay |
 | `GET  /conversations` | List handled conversations (admin-gated) |
@@ -178,6 +178,26 @@ Reads, aborts and attachment fetches over the native router are untouched.
 | `GET  /api/setup/github/start` · `/callback` · `/api/setup/status` | Web-driven GitHub App provisioning |
 | `GET  /agents/ada/:id` · `/abort` · `/attachments/:aid` | Flue's native agent routes (`@flue/sdk`) — admin-gated, **read/abort only** |
 | `POST /agents/ada/:id` | **405** — native prompt dispatch is refused; use `POST /sessions` |
+
+**Attachments split by MIME type, because Flue's delivery contract does.**
+Both turn endpoints take `multipart/form-data` alongside JSON; JSON stays the
+shape for a plain prompt, so the messaging adapter and external AG-UI clients
+are untouched. Images (`png`/`jpeg`/`gif`/`webp`) ride as native Flue
+attachments and the model *sees* them — that is the only attachment shape Flue
+accepts today. Everything else is written into the session sandbox at
+`uploads/<name>` and named in the prompt, which is both what Flue allows and
+what is actually useful: a log or a heap dump is something the agent greps and
+runs tools against, not something a model reads by looking at it. The path is
+`uploads/<name>` in either sandbox mode, since local runs are rooted at the
+workspace and remote runs at the workspace subdir.
+
+The filename arrives from the browser, is joined onto a sandbox path, and is
+interpolated into the prompt line naming the file — so it is reduced to a
+`[A-Za-z0-9._-]` basename before any of that, and names that collide after
+sanitizing are suffixed rather than allowed to overwrite each other. Limits (10
+files, 5MB an image, 25MB a file, 50MB a message) are refused with a message
+rather than silently trimmed: dropping the oversized attachment would have the
+agent answer confidently about a file it never received.
 
 Only one turn runs at a time per session — an overlapping `POST .../messages`
 returns `409 busy`. (Flue serializes concurrent deliveries to one instance

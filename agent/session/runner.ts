@@ -35,6 +35,13 @@ import {
   remoteSandboxDriver,
   sandboxHost,
 } from "./remote-sandbox.ts";
+import {
+  describeUploads,
+  routeUploads,
+  writeUploadsLocal,
+  writeUploadsRemote,
+  type UploadInput,
+} from "./uploads.ts";
 import { resolveModel, sandboxEnv } from "../config/model.ts";
 import { githubConfigured } from "../auth/app-config.ts";
 import { getValidToken } from "../auth/github-app.ts";
@@ -54,6 +61,15 @@ type SessionEnvRemote = NonNullable<SessionEnv["remote"]>;
 
 export interface TurnOpts {
   prompt: string;
+  /**
+   * Files the user attached to this turn, unrouted.
+   *
+   * Routing happens in the runner rather than at the HTTP edge because it is
+   * the runner that knows which sandbox this session has: a non-image upload
+   * has to be written where the agent's tools will look for it, and that path
+   * is only settled once the workspace (local dir vs remote subdir) is.
+   */
+  uploads?: UploadInput[];
   /** Key the GitHub token is stored under (resolved platform id, or bridge_uid). */
   userKey: string;
   /** Resolved platform id for tracing (undefined in local dev → "anonymous"). */
@@ -309,18 +325,27 @@ export class SessionRunner {
     let sandboxCwd = cwd;
     let remote: SessionEnvRemote | undefined;
 
+    // Routed here, not at the HTTP edge: only now is it settled where a
+    // non-image upload has to land for the agent's tools to find it.
+    const routedUploads = opts.uploads?.length ? routeUploads(opts.uploads) : null;
+
     if (baseUrl) {
       // Isolated execution: the checkout lives in the sandbox container, and
       // every path the agent sees is relative to its own workspace there.
       const token = process.env.SANDBOX_TOKEN;
       let subdir: string | undefined;
+      let driver: ReturnType<typeof remoteSandboxDriver> | undefined;
       if (opts.repo) {
-        const driver = remoteSandboxDriver({ baseUrl, id: instanceId, token, env: sandboxEnv({ githubToken }) });
+        driver = remoteSandboxDriver({ baseUrl, id: instanceId, token, env: sandboxEnv({ githubToken }) });
         subdir = (await ensureRepoInSandbox(driver, opts.repo, { githubToken })).dir;
       } else {
         // A repo the agent cloned itself on an earlier turn, so the next turn
         // is rooted inside it and Flue's AGENTS.md discovery sees the project.
         subdir = getCheckoutDir(instanceId);
+      }
+      if (routedUploads?.files.length) {
+        driver ??= remoteSandboxDriver({ baseUrl, id: instanceId, token, env: sandboxEnv({ githubToken }) });
+        await writeUploadsRemote(driver, routedUploads.files, subdir);
       }
       remote = { baseUrl, token, subdir };
     } else if (opts.repo) {
@@ -331,6 +356,13 @@ export class SessionRunner {
       // control-plane path.
       const checkout = getCheckoutDir(instanceId);
       if (checkout) sandboxCwd = ensureWorkspace(join(cwd, checkout));
+    }
+
+    // After the local branches above have settled sandboxCwd, so the files land
+    // in the directory the agent is actually rooted at (the checkout when there
+    // is one, the workspace otherwise) and `uploads/<name>` resolves for it.
+    if (!baseUrl && routedUploads?.files.length) {
+      writeUploadsLocal(sandboxCwd, routedUploads.files);
     }
 
     setSessionEnv(instanceId, {
@@ -355,7 +387,20 @@ export class SessionRunner {
       const onAbort = () => void handle.abort().catch(() => {});
       hooks?.signal?.addEventListener("abort", onAbort, { once: true });
       try {
-        const receipt = await handle.dispatch(opts.prompt);
+        // A bare string stays a bare string: Flue treats it as
+        // `{ kind: 'user', body }`, and a turn with no attachments must produce
+        // exactly the delivery it always did.
+        const receipt = await handle.dispatch(
+          routedUploads
+            ? {
+                message: {
+                  kind: "user",
+                  body: describeUploads(opts.prompt, routedUploads),
+                  attachments: routedUploads.attachments,
+                },
+              }
+            : opts.prompt,
+        );
         await handle.read(receipt, { signal: hooks?.signal });
         // Belt and braces: if `submission_settled` never reached the observer,
         // close the AG-UI run here rather than leaving a client waiting on a
