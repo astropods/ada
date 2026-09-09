@@ -570,6 +570,31 @@ function renderMarkdown(src){
   return DOMPurify.sanitize(marked.parse(String(src), { breaks: true }));
 }
 
+/* Links in a reply open in a new tab.
+   Following one in place TEARS DOWN THE PAGE, and the page is the live turn:
+   the EventSource closes, and coming back is a fresh load that has to
+   re-establish the stream and replay. Ada's links are things you open while it
+   keeps working — a PR it just pushed, a failing CI run, a doc it cited.
+
+   Applied in an `afterSanitizeAttributes` hook rather than by rewriting the
+   HTML, so it runs after DOMPurify has finished filtering and the attributes
+   set here are not themselves re-inspected or dropped by the allowlist.
+   `javascript:` hrefs are already gone by this point — the hook adds a target
+   to what survived, it does not decide what survives.
+
+   `noreferrer` as well as `noopener`: this is model- and repo-derived content,
+   so the destination is not ours to trust with either a handle on our window
+   or the URL the user was on. Registered once, guarded, because the CDN scripts
+   are allowed to be missing (renderMarkdown falls back to plain text). */
+if (typeof DOMPurify !== "undefined") {
+  DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+    if (node.tagName === "A" && node.hasAttribute("href")) {
+      node.setAttribute("target", "_blank");
+      node.setAttribute("rel", "noopener noreferrer");
+    }
+  });
+}
+
 function setComposerEnabled(on){
   $("prompt").disabled = !on;
   $("send").disabled = !on;

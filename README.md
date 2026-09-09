@@ -179,6 +179,16 @@ Reads, aborts and attachment fetches over the native router are untouched.
 | `GET  /agents/ada/:id` · `/abort` · `/attachments/:aid` | Flue's native agent routes (`@flue/sdk`) — admin-gated, **read/abort only** |
 | `POST /agents/ada/:id` | **405** — native prompt dispatch is refused; use `POST /sessions` |
 
+**Links in a reply open in a new tab.** Following one in place tears down the
+page, and the page *is* the live turn — the EventSource closes and coming back
+is a fresh load that has to re-establish the stream and replay. It is applied in
+a DOMPurify `afterSanitizeAttributes` hook, so it runs after filtering and the
+attributes it sets aren't re-inspected by the allowlist; `javascript:` hrefs are
+already gone by then, so the hook adds a target to what survived rather than
+deciding what survives. `rel="noopener noreferrer"` — this is model- and
+repo-derived content, so the destination gets neither a handle on the window nor
+the URL the user was on.
+
 Only one turn runs at a time per session — an overlapping `POST .../messages`
 returns `409 busy`. (Flue serializes concurrent deliveries to one instance
 anyway; the 409 is kept because the AG-UI client relies on it to keep its own
