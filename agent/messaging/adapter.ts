@@ -104,6 +104,58 @@ function parseDirective(prompt: string): Directive | null {
 }
 
 /**
+ * Anything that could pass for the delimiter wrapping the thread block.
+ *
+ * Optional whitespace inside the tag and either slash position, because
+ * `< / THREAD >` closes an XML-ish block for a reader as surely as `</thread>`
+ * does. Deliberately NOT permissive about attributes — the block Ada emits is
+ * exactly `<thread>`, and a looser pattern would start eating legitimate prose
+ * that merely mentions a thread.
+ */
+const THREAD_TAG = /<\s*\/?\s*thread\s*>/gi;
+
+/**
+ * Neutralize a delimiter a thread participant typed, so it cannot close the
+ * block early.
+ *
+ * The thread is UNTRUSTED text pasted into Ada's prompt. Someone who writes
+ * `</thread>` mid-message would otherwise end the block where Ada's own framing
+ * says the untrusted region stops, and everything after it reads as top-level
+ * instruction — the classic delimiter escape. Escaping the angle brackets keeps
+ * the message readable and says what the person actually typed, where dropping
+ * the text would quietly rewrite them.
+ *
+ * This closes the DELIMITER hole specifically. It is not a defence against
+ * instructions written in plain prose ("ignore the above and…") — nothing at
+ * this layer can be, which is why the block tells the model what it is reading.
+ */
+function neutralizeThreadTags(text: string): string {
+  return text.replace(THREAD_TAG, (tag) => `&lt;${tag.slice(1, -1)}&gt;`);
+}
+
+/**
+ * Order two thread messages oldest-first by their platform timestamp.
+ *
+ * `ThreadMessage.timestamp` is a protobuf Timestamp (`{ seconds: string;
+ * nanos: number }`), so seconds is an int64 AS A STRING and the two fields are
+ * compared in turn — folding them into one number (`seconds * 1e9 + nanos`)
+ * overflows 2^53 for any real epoch and silently loses the nanos.
+ */
+function compareByTimestamp(a: ThreadMessageLike, b: ThreadMessageLike): number {
+  const sa = Number(a.timestamp?.seconds);
+  const sb = Number(b.timestamp?.seconds);
+  if (sa !== sb) return sa - sb;
+  return (a.timestamp?.nanos ?? 0) - (b.timestamp?.nanos ?? 0);
+}
+
+/** A message we can order: both timestamp halves present and finite. */
+function hasUsableTimestamp(m: ThreadMessageLike): boolean {
+  return Number.isFinite(Number(m.timestamp?.seconds));
+}
+
+type ThreadMessageLike = { timestamp?: { seconds?: string | number; nanos?: number } };
+
+/**
  * Whether the conversation is private: a Slack DM, or a non-platform web/
  * playground session (no platformContext, inherently 1:1). Connect links must
  * only be handed out here — in a shared channel anyone could click one within
@@ -278,19 +330,51 @@ export class AdaMessagingAdapter implements AgentAdapter {
       return { prompt, injected: false };
     }
 
+    // ORDER: sorted here, not assumed.
+    //
+    // Nothing in adapter-core 0.10 specifies one. `getThreadHistory` is typed
+    // `(maxMessages?) => Promise<ThreadMessage[]>` with no ordering in its
+    // contract, and the bridge hands back the sidecar's array untouched
+    // (`fetchThreadHistory` -> `response.messages ?? []`), so the direction is
+    // whatever the platform server chose and can change without a type change.
+    // `ThreadMessage.timestamp` is required, so we can simply not depend on it.
+    //
+    // Only when EVERY message carries a usable timestamp: a comparator that
+    // returns 0 for the missing ones is not transitive, and feeding that to
+    // `sort` can reshuffle a partially-stamped array rather than leaving it
+    // alone. All-or-nothing degrades cleanly instead — with no timestamps
+    // (an older sidecar, or a test fake) we keep the platform's order.
+    //
+    // WHICH 40 we get is a separate question, and one we cannot answer here:
+    // `maxMessages` bounds the count, but the slice direction isn't specified
+    // either, and `ThreadHistoryResponse.isComplete` — the truncation flag —
+    // is dropped by `getThreadHistory` before it reaches us. We assume the
+    // platform returns the most recent N. If it ever returns the OLDEST N of a
+    // long thread, the block below is still internally consistent (and still
+    // trims to the newest it was given), but the newest messages in the thread
+    // will be missing and nothing in this signature would tell us.
+    const ordered = messages.every(hasUsableTimestamp)
+      ? [...messages].sort(compareByTimestamp)
+      : messages;
+
     const botUserId = options.platformContext?.botUserId;
     const triggerId = options.platformContext?.messageId;
     const lines: string[] = [];
-    for (const m of messages) {
+    for (const m of ordered) {
       // Ada's own replies are already in the Flue conversation, and the
       // triggering message is the prompt — including either would just be the
       // model reading itself back.
       if (botUserId && m.user?.id === botUserId) continue;
       if (triggerId && m.messageId === triggerId) continue;
       if (m.isDeleted) continue;
-      const text = (m.content ?? "").trim();
+      // Sanitized BEFORE the clip, so the budget counts the escaped form and a
+      // truncation can never sever an escape back into a live delimiter.
+      const text = neutralizeThreadTags((m.content ?? "").trim());
       if (!text) continue;
-      const who = m.user?.username || m.user?.id || "someone";
+      // The display name is untrusted too — it lands on the same line, so a
+      // delimiter typed into a Slack profile escapes exactly as one typed into
+      // a message would.
+      const who = neutralizeThreadTags(m.user?.username || m.user?.id || "someone");
       const clipped =
         text.length > THREAD_CONTEXT_MAX_MESSAGE_CHARS
           ? `${text.slice(0, THREAD_CONTEXT_MAX_MESSAGE_CHARS)}… [truncated]`

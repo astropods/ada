@@ -541,6 +541,15 @@ picked up — Ada only receives messages addressed to it. The block is capped
 the end of a thread is what a mention usually refers back to. If the platform
 can't hydrate the thread, the turn runs on the user's message alone.
 
+Thread text is untrusted, and treated that way. A participant who types
+`</thread>` in a message (or in their display name) would otherwise close the
+block early and have everything after it read as a top-level instruction, so
+those delimiters are escaped rather than dropped — the message still says what
+the person typed. Ordering is not assumed either: adapter-core specifies none
+for `getThreadHistory`, so the messages are sorted oldest-first on the protobuf
+`timestamp` they all carry, and fall back to the platform's order only when
+none is supplied.
+
 **One thread = one task = one repo.** In a thread, bind the repo once:
 
 ```
