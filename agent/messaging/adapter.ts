@@ -38,6 +38,30 @@ import { getServerSecret, buildConnectUrl } from "../auth/connect.ts";
 
 const HINT_NS = "gh_connect_hint"; // conversationId -> "1" once the connect hint has been shown
 const REPO_NS = "conv_repo"; // conversationId -> { owner, repo } bound to this thread
+const THREAD_CTX_NS = "conv_thread_ctx"; // conversationId -> {done} | {attempts}
+
+/**
+ * How many times a conversation may look for thread context before giving up.
+ *
+ * Not a single one-shot flag, because the FIRST mention is frequently the one
+ * that opens the thread — "Ada, can you look at this?" posted at top level has
+ * nothing above it. Recording the read as spent there meant the very next
+ * message, the one pasting the actual error, was never picked up: the flow this
+ * feature exists for was the flow it failed on.
+ *
+ * So EVERY look costs an attempt, and only a look whose block reached a turn
+ * that actually finished is terminal. The bound is what keeps a genuinely empty
+ * thread — or one whose turns keep dying — from re-asking the platform on every
+ * turn forever.
+ */
+const THREAD_CONTEXT_MAX_ATTEMPTS = 3;
+
+/** Most thread messages to read in, oldest first. */
+const THREAD_CONTEXT_MAX_MESSAGES = 40;
+/** Ceiling on the rendered block, so a long thread cannot dominate the turn. */
+const THREAD_CONTEXT_MAX_CHARS = 4000;
+/** Any single message longer than this is clipped before the block budget applies. */
+const THREAD_CONTEXT_MAX_MESSAGE_CHARS = 600;
 
 /**
  * What the sidecar advertises about this agent. Mirrors what `useSandbox()`
@@ -78,6 +102,58 @@ function parseDirective(prompt: string): Directive | null {
   if (/^\/?work(\s+on)?\s*$/i.test(t)) return { kind: "work", spec: null }; // usage
   return null;
 }
+
+/**
+ * Anything that could pass for the delimiter wrapping the thread block.
+ *
+ * Optional whitespace inside the tag and either slash position, because
+ * `< / THREAD >` closes an XML-ish block for a reader as surely as `</thread>`
+ * does. Deliberately NOT permissive about attributes — the block Ada emits is
+ * exactly `<thread>`, and a looser pattern would start eating legitimate prose
+ * that merely mentions a thread.
+ */
+const THREAD_TAG = /<\s*\/?\s*thread\s*>/gi;
+
+/**
+ * Neutralize a delimiter a thread participant typed, so it cannot close the
+ * block early.
+ *
+ * The thread is UNTRUSTED text pasted into Ada's prompt. Someone who writes
+ * `</thread>` mid-message would otherwise end the block where Ada's own framing
+ * says the untrusted region stops, and everything after it reads as top-level
+ * instruction — the classic delimiter escape. Escaping the angle brackets keeps
+ * the message readable and says what the person actually typed, where dropping
+ * the text would quietly rewrite them.
+ *
+ * This closes the DELIMITER hole specifically. It is not a defence against
+ * instructions written in plain prose ("ignore the above and…") — nothing at
+ * this layer can be, which is why the block tells the model what it is reading.
+ */
+function neutralizeThreadTags(text: string): string {
+  return text.replace(THREAD_TAG, (tag) => `&lt;${tag.slice(1, -1)}&gt;`);
+}
+
+/**
+ * Order two thread messages oldest-first by their platform timestamp.
+ *
+ * `ThreadMessage.timestamp` is a protobuf Timestamp (`{ seconds: string;
+ * nanos: number }`), so seconds is an int64 AS A STRING and the two fields are
+ * compared in turn — folding them into one number (`seconds * 1e9 + nanos`)
+ * overflows 2^53 for any real epoch and silently loses the nanos.
+ */
+function compareByTimestamp(a: ThreadMessageLike, b: ThreadMessageLike): number {
+  const sa = Number(a.timestamp?.seconds);
+  const sb = Number(b.timestamp?.seconds);
+  if (sa !== sb) return sa - sb;
+  return (a.timestamp?.nanos ?? 0) - (b.timestamp?.nanos ?? 0);
+}
+
+/** A message we can order: both timestamp halves present and finite. */
+function hasUsableTimestamp(m: ThreadMessageLike): boolean {
+  return Number.isFinite(Number(m.timestamp?.seconds));
+}
+
+type ThreadMessageLike = { timestamp?: { seconds?: string | number; nanos?: number } };
 
 /**
  * Whether the conversation is private: a Slack DM, or a non-platform web/
@@ -199,6 +275,157 @@ export class AdaMessagingAdapter implements AgentAdapter {
     );
   }
 
+  /**
+   * Prepend the Slack thread Ada was pinged into, so a bare "Ada fix this"
+   * resolves.
+   *
+   * The sidecar delivers only the message that triggered the turn. Someone
+   * @-mentioning Ada halfway down a thread has usually said everything that
+   * matters ABOVE the mention — the error, the link, the decision — and the
+   * mention itself is a pronoun. Without the thread, Ada has to ask what "this"
+   * is, which is exactly the friction the mention was meant to avoid.
+   *
+   * ONCE PER SETTLED TURN, recorded durably in the store like the connect hint
+   * and the repo binding. A Slack thread IS a Flue instance, so once a turn
+   * carrying the block has finished, the conversation history already has it;
+   * re-reading it every turn would resend the same messages and spend the budget
+   * twice. The trade is that humans talking to each other in the thread BETWEEN
+   * Ada's turns are not picked up — Ada only receives messages addressed to it.
+   * That is worth knowing and not worth the duplication to fix.
+   *
+   * SETTLED is the operative word. This reports whether it injected; `stream`
+   * commits `done` only after the turn finishes. Writing `done` here instead
+   * meant a turn that then threw, or was superseded by the next message, left
+   * the conversation marked read with nothing in its history to show for it —
+   * and the first-turn failure is exactly the case this feature exists for.
+   *
+   * Best-effort throughout. `getThreadHistory` is optional (an older sidecar, or
+   * the web playground, simply does not have it), and a thread that cannot be
+   * read must degrade to today's behaviour rather than fail the turn — the
+   * message the user actually sent is still there.
+   */
+  private async withThreadContext(
+    prompt: string,
+    options: StreamOptions,
+  ): Promise<{ prompt: string; injected: boolean }> {
+    if (!options.getThreadHistory) return { prompt, injected: false };
+
+    const raw = await this.store.kvGet(THREAD_CTX_NS, options.conversationId);
+    // Legacy one-shot flag, written before this became a bounded counter. A
+    // conversation that already had its context injected is done.
+    if (raw === "1") return { prompt, injected: false };
+    const state = (raw ?? {}) as { done?: boolean; attempts?: number };
+    if (state.done) return { prompt, injected: false };
+    const attempts = state.attempts ?? 0;
+    if (attempts >= THREAD_CONTEXT_MAX_ATTEMPTS) return { prompt, injected: false };
+
+    let messages: Awaited<ReturnType<NonNullable<StreamOptions["getThreadHistory"]>>>;
+    try {
+      messages = await options.getThreadHistory(THREAD_CONTEXT_MAX_MESSAGES);
+    } catch {
+      // The platform could not hydrate the thread. Costs an attempt so a
+      // persistently failing platform is not re-asked every turn, and carries
+      // on: the message the user actually sent is still there.
+      await this.spendThreadAttempt(options.conversationId, attempts);
+      return { prompt, injected: false };
+    }
+
+    // ORDER: sorted here, not assumed.
+    //
+    // Nothing in adapter-core 0.10 specifies one. `getThreadHistory` is typed
+    // `(maxMessages?) => Promise<ThreadMessage[]>` with no ordering in its
+    // contract, and the bridge hands back the sidecar's array untouched
+    // (`fetchThreadHistory` -> `response.messages ?? []`), so the direction is
+    // whatever the platform server chose and can change without a type change.
+    // `ThreadMessage.timestamp` is required, so we can simply not depend on it.
+    //
+    // Only when EVERY message carries a usable timestamp: a comparator that
+    // returns 0 for the missing ones is not transitive, and feeding that to
+    // `sort` can reshuffle a partially-stamped array rather than leaving it
+    // alone. All-or-nothing degrades cleanly instead — with no timestamps
+    // (an older sidecar, or a test fake) we keep the platform's order.
+    //
+    // WHICH 40 we get is a separate question, and one we cannot answer here:
+    // `maxMessages` bounds the count, but the slice direction isn't specified
+    // either, and `ThreadHistoryResponse.isComplete` — the truncation flag —
+    // is dropped by `getThreadHistory` before it reaches us. We assume the
+    // platform returns the most recent N. If it ever returns the OLDEST N of a
+    // long thread, the block below is still internally consistent (and still
+    // trims to the newest it was given), but the newest messages in the thread
+    // will be missing and nothing in this signature would tell us.
+    const ordered = messages.every(hasUsableTimestamp)
+      ? [...messages].sort(compareByTimestamp)
+      : messages;
+
+    const botUserId = options.platformContext?.botUserId;
+    const triggerId = options.platformContext?.messageId;
+    const lines: string[] = [];
+    for (const m of ordered) {
+      // Ada's own replies are already in the Flue conversation, and the
+      // triggering message is the prompt — including either would just be the
+      // model reading itself back.
+      if (botUserId && m.user?.id === botUserId) continue;
+      if (triggerId && m.messageId === triggerId) continue;
+      if (m.isDeleted) continue;
+      // Sanitized BEFORE the clip, so the budget counts the escaped form and a
+      // truncation can never sever an escape back into a live delimiter.
+      const text = neutralizeThreadTags((m.content ?? "").trim());
+      if (!text) continue;
+      // The display name is untrusted too — it lands on the same line, so a
+      // delimiter typed into a Slack profile escapes exactly as one typed into
+      // a message would.
+      const who = neutralizeThreadTags(m.user?.username || m.user?.id || "someone");
+      const clipped =
+        text.length > THREAD_CONTEXT_MAX_MESSAGE_CHARS
+          ? `${text.slice(0, THREAD_CONTEXT_MAX_MESSAGE_CHARS)}… [truncated]`
+          : text;
+      lines.push(`${who}: ${clipped}`);
+    }
+    if (lines.length === 0) {
+      // Nothing usable YET — most often because this mention opened the thread.
+      // Spend an attempt, not the budget, so the next message in the thread can
+      // still be read.
+      await this.spendThreadAttempt(options.conversationId, attempts);
+      return { prompt, injected: false };
+    }
+
+    // Keep the NEWEST messages when trimming: the end of a thread is what a
+    // mention usually refers back to, and the top is often stale setup.
+    let block = lines.join("\n");
+    if (block.length > THREAD_CONTEXT_MAX_CHARS) {
+      while (lines.length > 1 && lines.join("\n").length > THREAD_CONTEXT_MAX_CHARS) lines.shift();
+      block = `[…earlier messages omitted]\n${lines.join("\n")}`;
+    }
+
+    // An attempt, NOT `done`: the turn carrying this block has not run yet, and
+    // if it dies the thread still needs reading. `stream` commits `done` once it
+    // settles. Spending the attempt here is what bounds that retry — a
+    // conversation whose turns keep failing stops re-fetching, rather than
+    // re-reading the thread on every message forever.
+    await this.spendThreadAttempt(options.conversationId, attempts);
+
+    return {
+      injected: true,
+      prompt:
+        "<thread>\n" +
+        "You were mentioned partway through this conversation. It is the context for " +
+        "the request below — a bare \"fix this\" or \"take a look\" almost certainly " +
+        "refers to something in here. Oldest first; your own replies are omitted.\n\n" +
+        `${block}\n` +
+        "</thread>\n\n" +
+        prompt,
+    };
+  }
+
+  /** Record one unproductive look at the thread, best-effort. */
+  private async spendThreadAttempt(conversationId: string, attempts: number): Promise<void> {
+    await this.store
+      .kvPut(THREAD_CTX_NS, conversationId, { attempts: attempts + 1 })
+      // A store failure must not cost the user their turn; the worst case is
+      // one more look at the thread next time.
+      .catch(() => {});
+  }
+
   async stream(prompt: string, hooks: StreamHooks, options: StreamOptions): Promise<void> {
     // Already superseded/stopped before we began — nothing to do.
     if (options.signal?.aborted) {
@@ -212,6 +439,10 @@ export class AdaMessagingAdapter implements AgentAdapter {
       return;
     }
 
+    // "Ada fix this" only means something if Ada can see what "this" is.
+    const { prompt: contextualPrompt, injected: threadContextInjected } =
+      await this.withThreadContext(prompt, options);
+
     const repo = await this.boundRepo(options.conversationId);
 
     // GitHub is available but this user hasn't connected: show a one-time hint.
@@ -224,10 +455,25 @@ export class AdaMessagingAdapter implements AgentAdapter {
       hintUrl = buildConnectUrl(options.userId, await getServerSecret(this.store));
     }
 
+    // The thread read is only spent once the turn it fed has actually settled;
+    // awaited before `stream` returns so the next message in the thread sees it.
+    let threadContextCommitted: Promise<void> | undefined;
+    const commitThreadContext = () => {
+      // A superseded turn has not delivered the block to anyone — the successor
+      // the sidecar is already driving needs to read the thread in again.
+      if (!threadContextInjected || threadContextCommitted || options.signal?.aborted) return;
+      threadContextCommitted = this.store
+        .kvPut(THREAD_CTX_NS, options.conversationId, { done: true })
+        // A store failure must not cost the user their turn; the worst case is
+        // one more look at the thread next time, and attempts still bound that.
+        .catch(() => {});
+    };
+
     let settled = false;
     const finish = () => {
       if (settled) return;
       settled = true;
+      commitThreadContext();
       if (hintUrl) {
         hooks.onChunk(
           `\n\n---\n💡 Tip: install me on your GitHub repos so I can read, push, and open PRs — ${hintUrl}`,
@@ -246,7 +492,7 @@ export class AdaMessagingAdapter implements AgentAdapter {
       await this.runner.continueSession(
         options.conversationId,
         {
-          prompt,
+          prompt: contextualPrompt,
           // The sidecar's userId is the key GitHub tokens are stored under and
           // the identity the run's trace is attributed to.
           userKey: options.userId,
@@ -256,6 +502,9 @@ export class AdaMessagingAdapter implements AgentAdapter {
             kind: "slack",
             userId: options.userId,
             repo: repo ? `${repo.owner}/${repo.repo}` : undefined,
+            // The user's own words, deliberately — titling a conversation with
+            // the injected thread block would make every mention look alike in
+            // the review list.
             title: prompt.slice(0, 80),
           },
         },
@@ -301,8 +550,14 @@ export class AdaMessagingAdapter implements AgentAdapter {
       }
       fail(e as Error);
       return;
+    } finally {
+      // Defensive: settle even if the run produced no terminal AG-UI event. A
+      // turn that failed or was superseded is already settled, so this is a
+      // no-op there — and no `done` is committed for it.
+      finish();
+      // Don't let the `done` write race the sidecar's next message: reading it
+      // is what stops the block being sent a second time.
+      await threadContextCommitted;
     }
-    // Defensive: settle even if the run produced no terminal AG-UI event.
-    finish();
   }
 }
