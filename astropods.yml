@@ -98,6 +98,27 @@ inputs:
     description: "Run an independent code-reviewer pass on substantive changes. Can be toggled per conversation by asking Ada."
     display-as: select
     options: ["true", "false"]
+  # The base URL a BROWSER uses to reach this agent. Normally derived and left
+  # unset; set it when the derivation cannot work.
+  #
+  # It cannot work for a link Ada hands to a CHAT user. The derivation trusts
+  # the current request's Host (loopback only, since that header is
+  # client-controlled and feeds an OAuth redirect_uri), but a Slack connect
+  # link is built from a chat message, where there is no request at all — so it
+  # falls back to the container's own PORT and offers the user a port that is
+  # only reachable inside the container. Under `ast project start` that is
+  # 8080 internally while the browser reaches the agent on the mapped host
+  # port, and nothing inside the container can see that mapping.
+  #
+  # A deployment sets ASTRO_EXTERNAL_AGENT_URL, so this is for local runs and
+  # for a custom domain. The OAuth callback must ALSO be registered with the
+  # GitHub App, or GitHub rejects a redirect_uri it does not know.
+  PUBLIC_BASE_URL:
+    name: PUBLIC_BASE_URL
+    datatype: string
+    optional: true
+    description: "Base URL a browser uses to reach this agent, e.g. http://localhost:3200. Leave empty to derive it; required for GitHub connect links sent to chat."
+    display-as: short-text
   # WHICH SANDBOX runs the model's commands. `auto` keeps the behaviour every
   # deployment had before there was a choice: the platform container when one is
   # injected, in-process otherwise. `astro` moves to a platform MicroVM per

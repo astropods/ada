@@ -15,10 +15,18 @@
  *
  * Previously each of those computed `ASTRO_EXTERNAL_AGENT_URL ?? localhost:$PORT`
  * for itself. That is correct when deployed (the env var is set) but wrong under
- * `ast project start`: the container sets PORT=80, so the manifest registered
- * `http://localhost:80/...` while the frontend is actually mapped to 8080 on the
- * host. GitHub then sent the browser to port 80, where the agent isn't
- * listening — the reported 404.
+ * `ast project start`, which maps the container's port to a different one on the
+ * host: the manifest registered the container's own port while the browser
+ * reaches the agent on the mapped one. GitHub then sent the browser to a port
+ * where the agent isn't listening — the reported 404.
+ *
+ * STEP 2 CANNOT SAVE A LINK SENT TO CHAT, which is the remaining gap. Deriving
+ * from the request works for a developer's own browser because there IS a
+ * request; a Slack connect link is built from a chat message, so it falls
+ * through to step 3 and offers a port only reachable inside the container.
+ * Nothing in here can fix that — a container cannot see its own host port
+ * mapping — so `PUBLIC_BASE_URL` is declared as an input and is the answer for
+ * any deployment that hands links to chat users.
  *
  * Resolution order:
  *   1. `PUBLIC_BASE_URL`, then `ASTRO_EXTERNAL_AGENT_URL` — explicit config wins.
