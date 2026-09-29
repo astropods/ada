@@ -13,6 +13,7 @@
  */
 
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { tokenKind } from "./authz.ts";
 import type { GithubAppCreds } from "./app-config.ts";
 import { resolveBaseUrl } from "./base-url.ts";
 
@@ -35,16 +36,43 @@ function isPublicApp(env: NodeJS.ProcessEnv): boolean {
 }
 
 /**
- * Whether a verified email is on the admin allowlist (ADMIN_EMAILS).
+ * Whether the caller is an admin: on the allowlist (ADMIN_EMAILS), or running
+ * off a deployment at all.
  * Email is the admin key because it's the only human-knowable identity the
  * platform gives us — the opaque platform user id isn't something a deployer can
  * put in config ahead of time. Comparison is case-insensitive. Only the web
  * surface has a verified email (from the ALB); chat can't check admin (no email).
  */
 export function isAdmin(email: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  if (localAdmin(env)) return true;
   const want = (email ?? "").trim().toLowerCase();
   if (!want) return false;
   return parseAdminEmails(env).includes(want);
+}
+
+/**
+ * Whether this run treats its operator as an admin without checking an email.
+ *
+ * The email `isAdmin` matches is supplied by the ALB in front of a deployment
+ * and by nothing else, so off a deployment it is always empty and the
+ * allowlist can only ever DENY. Setting ADMIN_EMAILS to grant yourself admin
+ * locally did the opposite: it flipped `mayViewOthers` from "no list, so open"
+ * to "a list, and nothing can match it", hiding the Slack conversations it was
+ * meant to reveal.
+ *
+ * Nothing is widened by defaulting this on. With no deploy token there is no
+ * ALB identity to check and `Authorizer` is not gating web access either — so
+ * this makes the admin surface agree with the authorization surface rather
+ * than being stricter than a boundary that is already absent.
+ *
+ * `ADA_LOCAL_ADMIN=0` turns it off, which the test suite sets: those tests
+ * forge ALB headers to exercise a DEPLOYMENT's rules, and a non-admin caller
+ * there is modelled as one with no verified email — indistinguishable from a
+ * local browser, so it has to be said explicitly rather than inferred.
+ */
+function localAdmin(env: NodeJS.ProcessEnv): boolean {
+  if (tokenKind(env) === "deploy") return false;
+  return !/^(0|false|no)$/i.test((env.ADA_LOCAL_ADMIN ?? "").trim());
 }
 
 /** True when an explicit admin allowlist is configured (ADMIN_EMAILS non-empty). */

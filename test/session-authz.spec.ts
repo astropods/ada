@@ -52,6 +52,12 @@ test.beforeAll(async () => {
       PORT: String(PORT),
       ADA_TEST_HOOKS: "1",
       ADMIN_EMAILS: ADMIN,
+      // This suite forges the ALB's identity headers to exercise a
+      // DEPLOYMENT's rules, so it declines the local-admin default. Its
+      // non-admin caller is modelled as one with no verified email, which is
+      // indistinguishable from a local browser — the distinction has to be
+      // stated here rather than inferred from the request.
+      ADA_LOCAL_ADMIN: "0",
       // Keep this server's SQLite database out of the default workspace root so
       // it cannot interfere with the shared dev server's state.
       WORKSPACE_ROOT: join(ROOT, "test-results", "authz-workspace"),
@@ -277,4 +283,53 @@ test("the startup line never contains the token", async () => {
   const { Authorizer } = await import("../agent/auth/authz.ts");
   const secret = token({ iss: "https://astropods.com", sub: "dep_1" });
   expect(new Authorizer({ ASTRO_AUTHZ_TOKEN: secret } as NodeJS.ProcessEnv).describe()).not.toContain(secret);
+});
+
+/* ── Admin off a deployment ────────────────────────────────────────────── */
+
+/**
+ * `isAdmin` matches a verified email the ALB supplies, and only a deployment
+ * has an ALB. So off one the email is always empty and ADMIN_EMAILS can only
+ * ever deny — setting it to grant yourself admin locally did the opposite,
+ * flipping `mayViewOthers` from "no list, so open" to "a list, and nothing can
+ * match it".
+ */
+test("local development is admin, even with an allowlist set", async () => {
+  const { isAdmin, adminListConfigured } = await import("../agent/auth/setup.ts");
+  const local = { ADMIN_EMAILS: "simon@example.com" } as NodeJS.ProcessEnv;
+  // The allowlist is still configured — that is what used to close the gate.
+  expect(adminListConfigured(local)).toBe(true);
+  expect(isAdmin("", local), "no ALB, so no email to match").toBe(true);
+});
+
+test("local admin can be declined, which is how this suite tests a deployment", async () => {
+  const { isAdmin } = await import("../agent/auth/setup.ts");
+  // Not inferable: a non-admin caller here is modelled as one with no verified
+  // email, which looks exactly like a local browser.
+  const off = { ADMIN_EMAILS: "simon@example.com", ADA_LOCAL_ADMIN: "0" } as NodeJS.ProcessEnv;
+  expect(isAdmin("", off)).toBe(false);
+  expect(isAdmin("simon@example.com", off), "the allowlist still works").toBe(true);
+});
+
+test("a dev-session token is still local, not a deployment", async () => {
+  const { isAdmin } = await import("../agent/auth/setup.ts");
+  const dev = {
+    ADMIN_EMAILS: "simon@example.com",
+    ASTRO_AUTHZ_TOKEN: token({ iss: "https://astropods.com", sub: "sess_1", typ: "dev" }),
+  } as NodeJS.ProcessEnv;
+  // `ast project start` injects one of these for sandbox attach; it does not
+  // make the run a deployment.
+  expect(isAdmin("", dev)).toBe(true);
+});
+
+test("a real deployment still enforces the allowlist", async () => {
+  const { isAdmin } = await import("../agent/auth/setup.ts");
+  const deployed = {
+    ADMIN_EMAILS: "simon@example.com",
+    ASTRO_AUTHZ_TOKEN: token({ iss: "https://astropods.com", sub: "dep_1" }),
+  } as NodeJS.ProcessEnv;
+  expect(isAdmin("simon@example.com", deployed), "on the list").toBe(true);
+  expect(isAdmin("SIMON@EXAMPLE.COM", deployed), "case-insensitive").toBe(true);
+  expect(isAdmin("someone@else.com", deployed), "not on the list").toBe(false);
+  expect(isAdmin("", deployed), "no verified email is not an admin").toBe(false);
 });

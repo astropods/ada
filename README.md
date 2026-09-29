@@ -691,6 +691,17 @@ otherwise. So a deployment moves onto the MicroVM and back off again by
 changing one value, and startup prints which boundary is live, marking it
 `(auto)` when it was inferred (`[ada] sandbox: …`).
 
+**Local runs are admin.** `isAdmin` matches a verified email, and only the ALB
+in front of a deployment supplies one — so off a deployment the email is always
+empty and `ADMIN_EMAILS` can only ever *deny*. Setting it to grant yourself
+admin locally did the opposite: it flipped `mayViewOthers` from "no list, so
+open" to "a list, and nothing can match it", hiding the Slack conversations it
+was meant to reveal. Nothing is widened by this default — with no deploy token
+there is no identity to check and web access is not gated either, so the admin
+surface now agrees with the authorization surface instead of being stricter
+than a boundary that is already absent. `ADA_LOCAL_ADMIN=0` declines it, which
+is how `test/session-authz.spec.ts` exercises a deployment's rules.
+
 `ADA_SANDBOX=astro` with no `ASTRO_AUTHZ_TOKEN` does **not** fall back. Falling
 back would run the model's commands in the control-plane process, which holds
 the database credentials, the GitHub App secret and the HMAC signing key — a
