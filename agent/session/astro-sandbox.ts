@@ -40,7 +40,13 @@
 
 import { sandboxFromDriver } from "@flue/runtime";
 import type { FileStat, Sandbox, SandboxDriver, SandboxFactory, ShellResult } from "@flue/runtime";
-import { SandboxClient, SandboxRequestError } from "@astropods/adapter-core";
+import {
+  SandboxClient,
+  SandboxNotEnabledError,
+  SandboxRequestError,
+  SandboxUnavailableError,
+} from "@astropods/adapter-core";
+import { tokenKind } from "../auth/authz.ts";
 
 /**
  * The sandbox's working directory.
@@ -141,6 +147,70 @@ function stripUndefined(env: Record<string, string | undefined>): Record<string,
   return Object.fromEntries(Object.entries(env).filter(([, v]) => v != null)) as Record<string, string>;
 }
 
+/**
+ * Turn a sandbox refusal into a sentence that names the cause and the lever.
+ *
+ * Returns null for anything unrecognised, so a caller keeps whatever it had.
+ *
+ * WHY THIS EXISTS AT ALL. A cap refusal reached the user as
+ * `Agent run failed (submission sub_…) (code: AGENT_ERROR)` and the log as
+ * `SandboxRequestError: Limit reached (HTTP 402)`. Neither says which limit,
+ * that a conversation holds a sandbox for its lifetime, or what to do — and
+ * there are THREE different caps behind that one status.
+ *
+ * The platform does send the detail. Its 402 body carries `usage`, `limit` and
+ * a `details` string, but the client's `errorMessage()` keeps only `error`, so
+ * "Limit reached" is genuinely all that survives the wire. The numbers cannot
+ * be recovered here; the token kind can, and it decides which cap applies.
+ */
+export function explainSandboxFailure(e: unknown, env: NodeJS.ProcessEnv = process.env): string | null {
+  // Flue wraps a turn failure, so the useful error is usually a `cause` down.
+  for (let link: unknown = e, depth = 0; link && depth < 8; depth++) {
+    const explained = explainOne(link, env);
+    if (explained) return explained;
+    link = (link as { cause?: unknown }).cause;
+  }
+  return null;
+}
+
+function explainOne(e: unknown, env: NodeJS.ProcessEnv): string | null {
+  if (e instanceof SandboxNotEnabledError) {
+    return (
+      "This agent has no execution sandbox: the platform reports none is available for it. " +
+      "Check that astropods.yml still declares a `sandbox:` section and that the server has a sandbox image."
+    );
+  }
+  if (e instanceof SandboxUnavailableError) {
+    return "Could not reach the platform to start an execution sandbox. The control plane may be unreachable from here.";
+  }
+  if (!(e instanceof SandboxRequestError)) return null;
+
+  switch (e.status) {
+    case 402:
+      // Which cap depends on who is attaching, and the response cannot say.
+      return tokenKind(env) === "dev"
+        ? "Out of execution sandboxes for this local dev session. One conversation holds one sandbox for as " +
+            "long as it lives, and a local session is capped well below the account " +
+            "(SANDBOX_MAX_PER_DEV_SESSION, 3 by default) so local work cannot take a deployed agent's slots. " +
+            "End a conversation, run `ast project stop` to release them all, or ask for the dev-session cap to be raised."
+        : "Out of execution sandboxes for this deployment. One conversation holds one sandbox for as long as it " +
+            "lives, so concurrent conversations are bounded by SANDBOX_MAX_PER_DEPLOYMENT (20 by default) and by " +
+            "the account's sandbox quota. Ask for whichever is binding to be raised.";
+    case 401:
+    case 403:
+      return tokenKind(env) === "dev"
+        ? "The platform rejected this agent's sandbox credentials. A local dev session is revoked by " +
+            "`ast project stop` and expires on its own, so restart `ast project start` to mint a new one."
+        : "The platform rejected this deployment's sandbox credentials.";
+    case 404:
+      return "The platform has no sandbox by that name, and would not create one.";
+    default:
+      return e.status >= 500
+        ? `The platform failed to start an execution sandbox (HTTP ${e.status}). This is usually transient.`
+        : null;
+  }
+}
+
 export interface AstroSandboxOptions {
   /** Instance id — one sandbox per conversation. */
   id: string;
@@ -194,7 +264,11 @@ class AstroSandboxDriver implements SandboxDriver {
           await this.client.attach(this.name);
           return;
         } catch (e) {
-          if (!isEdgeFailure(e) || Date.now() + this.retry.delayMs >= deadline) throw e;
+          if (!isEdgeFailure(e) || Date.now() + this.retry.delayMs >= deadline) {
+            const why = explainSandboxFailure(e);
+            if (why) console.error(`[sandbox] ${this.name}: ${why}`);
+            throw e;
+          }
           console.warn(
             `[sandbox] ${this.name}: attach attempt ${attempt} hit a gateway error ` +
               `(${(e as SandboxRequestError).status}) — the declaration is probably still installing; retrying`,

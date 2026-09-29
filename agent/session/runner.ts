@@ -35,7 +35,7 @@ import {
   remoteSandboxDriver,
   sandboxHost,
 } from "./remote-sandbox.ts";
-import { astroSandboxDriver } from "./astro-sandbox.ts";
+import { astroSandboxDriver, explainSandboxFailure } from "./astro-sandbox.ts";
 import { sandboxMode } from "./sandbox-mode.ts";
 import type { SandboxDriver } from "@flue/runtime";
 import {
@@ -332,7 +332,12 @@ export class SessionRunner {
       // Report ONCE, here, whatever stage failed — then rethrow so an awaiting
       // caller (messaging) still sees it. The background caller swallows it,
       // having already had it delivered over the stream.
-      this.failTurn(instanceId, (e as Error).message);
+      //
+      // Prefer an explained sandbox refusal over the top-level message. Flue
+      // wraps a turn failure, so `e.message` is `Agent run failed (submission
+      // …)` and the reason sits in a `cause` — which is how a hit sandbox cap
+      // reached a user as `AGENT_ERROR` and told them nothing.
+      this.failTurn(instanceId, explainSandboxFailure(e) ?? (e as Error).message);
       throw e;
     }
   }

@@ -94,6 +94,19 @@ export function oidcEmail(req: HeaderBearing): string {
   return claims.email_verified ? ((claims.email as string) ?? "") : "";
 }
 
+/**
+ * Which credential the platform injected, if any.
+ *
+ * Shared with the sandbox code because the two token kinds carry different
+ * sandbox caps, and a refusal is only actionable if the message names the cap
+ * that was actually hit.
+ */
+export function tokenKind(env: NodeJS.ProcessEnv = process.env): "dev" | "deploy" | "none" {
+  const token = env.ASTRO_AUTHZ_TOKEN;
+  if (!token) return "none";
+  return decodeJwtPayload(token)?.typ === "dev" ? "dev" : "deploy";
+}
+
 export class Authorizer {
   private readonly token: string;
   private readonly issuer: string;

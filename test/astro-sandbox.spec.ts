@@ -384,3 +384,72 @@ test("giving up on attach does not poison the driver for later turns", async () 
   f.failAttaches(0);
   await expect(driver.exec("true")).resolves.toMatchObject({ exitCode: 0 });
 });
+
+/* ── Making a refusal legible ──────────────────────────────────────────── */
+
+/**
+ * A hit sandbox cap reached the user as `Agent run failed (submission sub_…)
+ * (code: AGENT_ERROR)` and the log as `SandboxRequestError: Limit reached
+ * (HTTP 402)`. Neither named which of the three caps was hit, that a
+ * conversation holds a sandbox for its lifetime, or what to do about it.
+ */
+const devEnv = env({ ASTRO_AUTHZ_TOKEN: `h.${Buffer.from(JSON.stringify({ iss: "https://x", typ: "dev" })).toString("base64url")}.s` });
+const deployEnv = env({ ASTRO_AUTHZ_TOKEN: `h.${Buffer.from(JSON.stringify({ iss: "https://x" })).toString("base64url")}.s` });
+
+test("a cap refusal names the cap that actually applies, which depends on the token", async () => {
+  const { explainSandboxFailure } = await import("../agent/session/astro-sandbox.ts");
+  const { SandboxRequestError } = await import("@astropods/adapter-core");
+  const capped = new SandboxRequestError(402, "Limit reached");
+
+  // The response cannot say which cap; the token kind can.
+  const dev = explainSandboxFailure(capped, devEnv)!;
+  expect(dev).toContain("SANDBOX_MAX_PER_DEV_SESSION");
+  expect(dev).toContain("ast project stop");
+  expect(dev, "and why one conversation costs one slot").toContain("one sandbox");
+
+  const deployed = explainSandboxFailure(capped, deployEnv)!;
+  expect(deployed).toContain("SANDBOX_MAX_PER_DEPLOYMENT");
+  expect(deployed).not.toContain("ast project stop");
+});
+
+test("the reason is found through Flue's wrapper, not just at the top", async () => {
+  const { explainSandboxFailure } = await import("../agent/session/astro-sandbox.ts");
+  const { SandboxRequestError } = await import("@astropods/adapter-core");
+  // This nesting is exactly what reached the user as AGENT_ERROR.
+  const wrapped = new Error("[flue] Agent run failed (submission sub_01M3QHX2)", {
+    cause: new SandboxRequestError(402, "Limit reached"),
+  });
+  expect(explainSandboxFailure(wrapped, devEnv)).toContain("Out of execution sandboxes");
+});
+
+test("a revoked dev session says how to get another one", async () => {
+  const { explainSandboxFailure } = await import("../agent/session/astro-sandbox.ts");
+  const { SandboxRequestError } = await import("@astropods/adapter-core");
+  // `ast project stop` revokes the session, and it expires on its own.
+  expect(explainSandboxFailure(new SandboxRequestError(401, "unauthorized"), devEnv)).toContain("ast project start");
+});
+
+test("a missing declaration is not reported as a capacity problem", async () => {
+  const { explainSandboxFailure } = await import("../agent/session/astro-sandbox.ts");
+  const { SandboxNotEnabledError, SandboxUnavailableError } = await import("@astropods/adapter-core");
+  expect(explainSandboxFailure(new SandboxNotEnabledError("nope"), devEnv)).toContain("`sandbox:` section");
+  expect(explainSandboxFailure(new SandboxUnavailableError(new Error("econnrefused")), devEnv)).toContain("Could not reach");
+});
+
+test("an unrecognised failure is left alone, so the caller keeps its own message", async () => {
+  const { explainSandboxFailure } = await import("../agent/session/astro-sandbox.ts");
+  const { SandboxRequestError } = await import("@astropods/adapter-core");
+  // Overriding here would replace a precise message with a vaguer one.
+  expect(explainSandboxFailure(new Error("something else entirely"), devEnv)).toBeNull();
+  expect(explainSandboxFailure(new SandboxRequestError(400, "bad request"), devEnv)).toBeNull();
+  // A cause chain that goes nowhere must terminate rather than spin.
+  const loop: { cause?: unknown } = {};
+  loop.cause = loop;
+  expect(explainSandboxFailure(loop, devEnv)).toBeNull();
+});
+
+test("a gateway failure reads as transient, since the retry already gave up on it", async () => {
+  const { explainSandboxFailure } = await import("../agent/session/astro-sandbox.ts");
+  const { SandboxRequestError } = await import("@astropods/adapter-core");
+  expect(explainSandboxFailure(new SandboxRequestError(502, "gateway"), devEnv)).toContain("transient");
+});
