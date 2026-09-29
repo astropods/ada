@@ -61,14 +61,7 @@ type SessionEnvRemote = NonNullable<SessionEnv["remote"]>;
 
 export interface TurnOpts {
   prompt: string;
-  /**
-   * Files the user attached to this turn, unrouted.
-   *
-   * Routing happens in the runner rather than at the HTTP edge because it is
-   * the runner that knows which sandbox this session has: a non-image upload
-   * has to be written where the agent's tools will look for it, and that path
-   * is only settled once the workspace (local dir vs remote subdir) is.
-   */
+  /** Files the user attached to this turn, unrouted. */
   uploads?: UploadInput[];
   /** Key the GitHub token is stored under (resolved platform id, or bridge_uid). */
   userKey: string;
@@ -325,8 +318,10 @@ export class SessionRunner {
     let sandboxCwd = cwd;
     let remote: SessionEnvRemote | undefined;
 
-    // Routed here, not at the HTTP edge: only now is it settled where a
-    // non-image upload has to land for the agent's tools to find it.
+    // Routed here, not at the HTTP edge, because only the runner knows which
+    // sandbox this session has — and a non-image upload has to be written
+    // where the agent's tools will look for it, which the branches below
+    // settle (local dir vs remote subdir).
     const routedUploads = opts.uploads?.length ? routeUploads(opts.uploads) : null;
 
     if (baseUrl) {

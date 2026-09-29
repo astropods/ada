@@ -420,8 +420,9 @@ async function readTurnRequest(
     (f): f is File => typeof f === "object" && f !== null && "arrayBuffer" in f,
   );
   if (list.length > MAX_UPLOAD_FILES) {
-    // Checked before reading any bytes: the point of a count limit is to avoid
-    // buffering an unbounded batch into memory, which reading first would do.
+    // Rejected before the parts are copied into our own buffers. Note this is
+    // not a memory guard: `parseBody` has already read the whole body, so the
+    // real ceiling on an oversized request is whatever fronts this process.
     return { error: `too many files — ${list.length} attached, limit is ${MAX_UPLOAD_FILES}` };
   }
 

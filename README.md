@@ -194,7 +194,9 @@ workspace and remote runs at the workspace subdir.
 The filename arrives from the browser, is joined onto a sandbox path, and is
 interpolated into the prompt line naming the file — so it is reduced to a
 `[A-Za-z0-9._-]` basename before any of that, and names that collide after
-sanitizing are suffixed rather than allowed to overwrite each other. Limits (10
+sanitizing are suffixed rather than allowed to overwrite each other. The MIME
+type is browser-supplied too and shares that prompt line, so it is reduced the
+same way. Limits (10
 files, 5MB an image, 25MB a file, 50MB a message) are refused with a message
 rather than silently trimmed: dropping the oversized attachment would have the
 agent answer confidently about a file it never received.

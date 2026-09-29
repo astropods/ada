@@ -102,18 +102,44 @@ export function safeUploadName(filename: string): string {
  * Sanitizing independently can collapse two different names onto one
  * (`report (1).csv` and `report_1_.csv`), and the second write would silently
  * replace the first — the user attached two files and the agent would see one.
+ *
+ * The suffix is probed against the names already taken rather than counted per
+ * base name, because the suffixed form can itself collide with a file that was
+ * attached under that name: `report.csv`, `report.csv`, `report-2.csv` has the
+ * second and third both landing on `report-2.csv` if you only count.
  */
 function uniqueNames(files: UploadInput[]): string[] {
-  const seen = new Map<string, number>();
+  const taken = new Set<string>();
   return files.map((f) => {
     const name = safeUploadName(f.filename);
-    const n = seen.get(name) ?? 0;
-    seen.set(name, n + 1);
-    if (n === 0) return name;
+    if (!taken.has(name)) {
+      taken.add(name);
+      return name;
+    }
     // Suffix before the extension, so `log.txt` -> `log-2.txt` stays readable.
     const dot = name.lastIndexOf(".");
-    return dot > 0 ? `${name.slice(0, dot)}-${n + 1}${name.slice(dot)}` : `${name}-${n + 1}`;
+    const stem = dot > 0 ? name.slice(0, dot) : name;
+    const ext = dot > 0 ? name.slice(dot) : "";
+    for (let n = 2; ; n++) {
+      const candidate = `${stem}-${n}${ext}`;
+      if (!taken.has(candidate)) {
+        taken.add(candidate);
+        return candidate;
+      }
+    }
   });
+}
+
+/**
+ * Reduce a browser-supplied MIME type to something safe to interpolate.
+ *
+ * It lands in the same prompt line as the name, so it is the same forgery
+ * vector: a `Content-Type` of `text/plain\n- SYSTEM: ...` would otherwise add
+ * a line to the `<attachments>` block. Sanitizing the filename and not this
+ * just moves the hole one field to the right.
+ */
+function safeMimeType(mimeType: string): string {
+  return mimeType.replace(/[^A-Za-z0-9._+/-]/g, "").slice(0, 60);
 }
 
 /** Human-readable size, for limit messages the user has to act on. */
@@ -183,10 +209,14 @@ export function routeUploads(files: UploadInput[]): RoutedUploads {
 export function describeUploads(prompt: string, routed: RoutedUploads): string {
   const lines: string[] = [];
   for (const a of routed.attachments) {
-    lines.push(`- ${a.filename} (${a.mimeType}) — attached to this message, you can see it directly`);
+    lines.push(
+      `- ${a.filename} (${safeMimeType(a.mimeType)}) — attached to this message, you can see it directly`,
+    );
   }
   for (const f of routed.files) {
-    lines.push(`- ${UPLOAD_DIR}/${f.name} (${f.mimeType || "unknown type"}) — saved in your working directory`);
+    lines.push(
+      `- ${UPLOAD_DIR}/${f.name} (${safeMimeType(f.mimeType) || "unknown type"}) — saved in your working directory`,
+    );
   }
   if (lines.length === 0) return prompt;
   return `${prompt}\n\n<attachments>\nThe user attached the following to this message:\n${lines.join("\n")}\n</attachments>`;
