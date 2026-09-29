@@ -49,6 +49,18 @@ export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 export const MAX_FILE_BYTES = 25 * 1024 * 1024;
 export const MAX_TOTAL_BYTES = 50 * 1024 * 1024;
 
+/**
+ * The ceiling the HTTP layer refuses on, before it parses anything.
+ *
+ * Every limit above is checked on parsed bytes, which means the body is already
+ * in memory by the time they can speak. This one is enforced on the request
+ * itself, and sits ABOVE `MAX_TOTAL_BYTES` on purpose: a batch that busts the
+ * real limit should still get the message naming the file to drop, not a bare
+ * 413. The headroom covers multipart framing and the prompt field, so only a
+ * request too big to be worth reading at all is refused here.
+ */
+export const MAX_REQUEST_BYTES = MAX_TOTAL_BYTES + 8 * 1024 * 1024;
+
 /** One file as it arrived from the browser, before routing. */
 export interface UploadInput {
   filename: string;

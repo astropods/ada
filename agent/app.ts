@@ -48,10 +48,16 @@ import type { FlueEvent } from "@flue/runtime";
 import { Ada } from "./agents/ada.ts";
 import { Translator } from "./translate/translator.ts";
 import { describeAuth } from "./config/model.ts";
+import { bodyLimit } from "hono/body-limit";
 import { SessionRegistry } from "./session/registry.ts";
 import { SessionRunner } from "./session/runner.ts";
 import { startWorkspaceGc } from "./session/workspace.ts";
-import { checkUploadLimits, MAX_UPLOAD_FILES, type UploadInput } from "./session/uploads.ts";
+import {
+  checkUploadLimits,
+  MAX_REQUEST_BYTES,
+  MAX_UPLOAD_FILES,
+  type UploadInput,
+} from "./session/uploads.ts";
 import { installTelemetry } from "./telemetry/otel.ts";
 import { InMemoryResultStore } from "./persistence/results.ts";
 import { createStore, type Store } from "./store/index.ts";
@@ -439,7 +445,24 @@ async function readTurnRequest(
   return { prompt, uploads };
 }
 
-app.post("/sessions", async (c) => {
+/**
+ * Outer ceiling on a turn request, ahead of any parsing.
+ *
+ * `checkUploadLimits` is the friendly limit — it names the file and the cap, so
+ * the user can act on it — but it cannot run until `parseBody` has already
+ * pulled the whole body into memory. This refuses on `Content-Length`, or by
+ * counting the stream when there isn't one, before that happens.
+ *
+ * Deliberately ABOVE the per-message total, so a batch that busts the real
+ * limit still gets the message that explains which file to drop rather than a
+ * bare 413. Only a request too big to be worth reading at all lands here.
+ */
+const turnBodyLimit = bodyLimit({
+  maxSize: MAX_REQUEST_BYTES,
+  onError: (c) => c.text("attachments too large", 413),
+});
+
+app.post("/sessions", turnBodyLimit, async (c) => {
   // Resolve + authorize the caller the same way the sidecar does; the GitHub
   // token is keyed by the resolved platform id so git/gh act as the same
   // identity the user connected in chat.
@@ -468,7 +491,7 @@ app.post("/sessions", async (c) => {
   }
 });
 
-app.post("/sessions/:id/messages", async (c) => {
+app.post("/sessions/:id/messages", turnBodyLimit, async (c) => {
   const sessionId = c.req.param("id");
   // AUTHORIZATION FIRST, before anything that reveals the session's state.
   // Driving another user's conversation is at least as serious as reading it:
@@ -489,9 +512,17 @@ app.post("/sessions/:id/messages", async (c) => {
   // relies on 409 to keep its own turn state coherent — so keep refusing here.
   // Ahead of the body read for the same reason as the authorization gate: a
   // turn we are going to refuse should not cost us the upload first.
-  if (runner.busy(sessionId)) return c.text("session busy", 409);
+  //
+  // CLAIMED, not probed. The body read below takes real time for a multipart
+  // turn, and a plain `busy()` test would let a second follow-up through that
+  // window — both would dispatch and neither would see a 409.
+  const release = runner.reserveTurn(sessionId);
+  if (!release) return c.text("session busy", 409);
   const req = await readTurnRequest(c);
-  if ("error" in req) return c.text(req.error, 400);
+  if ("error" in req) {
+    release();
+    return c.text(req.error, 400);
+  }
   try {
     await runner.continueSession(sessionId, {
       prompt: req.prompt,
@@ -505,6 +536,7 @@ app.post("/sessions/:id/messages", async (c) => {
     // The follow-up turn streams over the session's already-open SSE.
     return c.json({ sessionId }, 202);
   } catch (e) {
+    release();
     return c.text(`run failed: ${(e as Error).message}`, 500);
   }
 });

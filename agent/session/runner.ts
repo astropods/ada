@@ -203,6 +203,40 @@ export class SessionRunner {
     return status === "running" || status === "starting";
   }
 
+  /**
+   * Claim the one turn slot for a session, or report it already taken.
+   *
+   * `busy()` alone is only a probe, and a caller cannot dispatch straight after
+   * it — an HTTP handler still has a request body to read, which for a
+   * multipart turn is tens of megabytes and many milliseconds during which a
+   * second follow-up passes the same probe. Both would then dispatch, and the
+   * 409 the AG-UI client relies on to keep its turn state coherent never
+   * happens.
+   *
+   * Reserving flips the status in the SAME tick as the test, so of two racing
+   * turns exactly one wins. Nothing subscribes to the status event, so the
+   * early "starting" is visible only to `busy()` and the session list.
+   *
+   * Returns a function that gives the slot back, for a turn abandoned before
+   * dispatch (a malformed body, a busted limit, a failed dispatch) — without it
+   * the session would sit at "starting" with nothing running and refuse every
+   * later turn with a 409.
+   */
+  reserveTurn(instanceId: string): (() => void) | null {
+    if (this.busy(instanceId)) return null;
+    const previous = this.registry.has(instanceId) ? this.registry.status(instanceId) : null;
+    this.registry.ensure(instanceId);
+    this.registry.setStatus(instanceId, "starting");
+    let released = false;
+    return () => {
+      // Only ever undoes OUR reservation: once the turn has started, its own
+      // status transitions own the slot and must not be rolled back.
+      if (released || this.registry.status(instanceId) !== "starting") return;
+      released = true;
+      if (previous) this.registry.setStatus(instanceId, previous);
+    };
+  }
+
   has(instanceId: string): boolean {
     return this.registry.has(instanceId);
   }

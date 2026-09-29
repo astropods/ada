@@ -199,7 +199,16 @@ type is browser-supplied too and shares that prompt line, so it is reduced the
 same way. Limits (10
 files, 5MB an image, 25MB a file, 50MB a message) are refused with a message
 rather than silently trimmed: dropping the oversized attachment would have the
-agent answer confidently about a file it never received.
+agent answer confidently about a file it never received. Those checks read
+parsed bytes, so a `bodyLimit` of 58MB refuses on the request itself first —
+above the real limit on purpose, so a batch that busts it still gets the
+message naming the file to drop rather than a bare 413.
+
+A follow-up turn CLAIMS the session's single turn slot before its body is read,
+rather than probing `busy()` and dispatching afterwards — for a multipart turn
+the read is long enough that two concurrent follow-ups would both pass a probe,
+and neither would get the 409 the AG-UI client relies on. The slot is handed
+back if the turn is abandoned before dispatch.
 
 Only one turn runs at a time per session — an overlapping `POST .../messages`
 returns `409 busy`. (Flue serializes concurrent deliveries to one instance

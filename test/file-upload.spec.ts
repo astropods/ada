@@ -10,9 +10,15 @@ import {
   writeUploadsLocal,
   writeUploadsRemote,
   MAX_IMAGE_BYTES,
+  MAX_REQUEST_BYTES,
+  MAX_TOTAL_BYTES,
   MAX_UPLOAD_FILES,
   type UploadInput,
 } from "../agent/session/uploads.ts";
+import { SessionRegistry } from "../agent/session/registry.ts";
+import { SessionRunner } from "../agent/session/runner.ts";
+import { InMemoryResultStore } from "../agent/persistence/results.ts";
+import type { Store } from "../agent/store/index.ts";
 
 /**
  * Attaching files to a turn from the web UI.
@@ -201,6 +207,53 @@ test("remote uploads are written under the same subdir the agent is rooted at", 
   expect(mkdirs).toEqual([]);
 });
 
+/* ── The turn slot ─────────────────────────────────────────────────────── */
+
+// `reserveTurn` only touches the registry, so the store and result store it
+// never reaches can be absent rather than faked.
+const testRunner = () => {
+  const registry = new SessionRegistry();
+  const runner = new SessionRunner(registry, {} as Store, new InMemoryResultStore());
+  return { registry, runner };
+};
+
+test("the turn slot is claimed in one tick, so two racing turns cannot both win", () => {
+  const { registry, runner } = testRunner();
+  registry.ensure("sess_race");
+  registry.setStatus("sess_race", "finished");
+
+  // A probe would leave the window open across the caller's body read — for a
+  // multipart turn, tens of megabytes of it.
+  const release = runner.reserveTurn("sess_race");
+  expect(release, "an idle session hands out its slot").not.toBeNull();
+  expect(runner.reserveTurn("sess_race"), "the second turn is refused, and gets the 409").toBeNull();
+});
+
+test("a turn abandoned before dispatch gives the slot back", () => {
+  const { registry, runner } = testRunner();
+  registry.ensure("sess_release");
+  registry.setStatus("sess_release", "finished");
+
+  // A malformed body or a busted limit answers 4xx without ever dispatching;
+  // holding the slot would leave the session refusing every later turn.
+  runner.reserveTurn("sess_release")!();
+  expect(registry.status("sess_release"), "restored to where it was").toBe("finished");
+  expect(runner.reserveTurn("sess_release"), "and claimable again").not.toBeNull();
+});
+
+test("releasing does not disturb a turn that has already started", () => {
+  const { registry, runner } = testRunner();
+  registry.ensure("sess_live");
+  registry.setStatus("sess_live", "finished");
+
+  const release = runner.reserveTurn("sess_live")!;
+  registry.setStatus("sess_live", "running");
+  // A late or duplicated release must not hand away a live turn's slot.
+  release();
+  expect(registry.status("sess_live")).toBe("running");
+  expect(runner.reserveTurn("sess_live")).toBeNull();
+});
+
 /* ── The HTTP edge ─────────────────────────────────────────────────────── */
 
 test("the turn endpoints still speak plain JSON", async ({ request }) => {
@@ -293,6 +346,29 @@ test("attaching a file shows a chip, and sending posts it as multipart", async (
   await expect(page.locator(".attach-chip")).toHaveCount(0);
   // …and the transcript records that a file was part of the question.
   await expect(page.locator(".bubble.user .attached span")).toHaveText("🖼 shot.png");
+});
+
+test("the outer ceiling sits above the friendly one", () => {
+  // A batch that busts the real limit has to reach `checkUploadLimits`, which
+  // names the file to drop. Only a request too big to be worth parsing at all
+  // should hit the 413.
+  expect(MAX_REQUEST_BYTES).toBeGreaterThan(MAX_TOTAL_BYTES);
+});
+
+test("a request too big to parse is refused before it is buffered", async ({ request }) => {
+  // `checkUploadLimits` cannot speak until `parseBody` has pulled the whole
+  // body into memory, so the ceiling here is enforced on the request itself.
+  const res = await request.post("/sessions", {
+    multipart: {
+      prompt: "look at this",
+      files: {
+        name: "enormous.bin",
+        mimeType: "application/octet-stream",
+        buffer: Buffer.alloc(MAX_REQUEST_BYTES + 1024),
+      },
+    },
+  });
+  expect(res.status()).toBe(413);
 });
 
 test("a plain prompt is still sent as JSON", async ({ page }) => {
