@@ -69,7 +69,13 @@ import { githubConfigured, getAppCreds, saveAppCreds, loadAppCreds } from "./aut
 import {
   verifyState, buildManifest, convertManifestCode, renderManifestForm,
   isAdmin, adminListConfigured, canProvision, describeAdmin } from "./auth/setup.ts";
-import { getServerSecret, mintLink, verifyLink } from "./auth/connect.ts";
+import {
+  getServerSecret,
+  mintLink,
+  verifyLink,
+  verifyLinkClaims,
+  WATCH_TTL_MS,
+} from "./auth/connect.ts";
 import { resolveBaseUrl } from "./auth/base-url.ts";
 import { Authorizer, oidcIdentity, oidcEmail, type AuthzResult } from "./auth/authz.ts";
 import { SSE_HEADERS, frameLogged, sseHeartbeat, parseLastEventId } from "./transport/sse.ts";
@@ -375,13 +381,50 @@ app.route("/agents/ada", createAgentRouter(Ada));
 
 /* ---------------- static client ---------------- */
 
+const WATCH_COOKIE = "ada_watch";
+
+/**
+ * The conversation this browser holds a watch grant for, if any.
+ *
+ * The token IS the authority: signed, expiring, and scoped to one conversation
+ * and one user. So a holder needs no platform identity — which is the point,
+ * since a chat user clicking through from Slack has none in the browser.
+ *
+ * Read-only by construction: only `GET /` and the event stream consult this.
+ * Driving or deleting a session never does, so a grant cannot do either.
+ */
+async function watchGrant(c: Ctx, sessionId?: string): Promise<boolean> {
+  const claims = verifyLinkClaims(getCookie(c, WATCH_COOKIE), "watch", await getServerSecret(store));
+  if (!claims?.sessionId) return false;
+  return sessionId === undefined || claims.sessionId === sessionId;
+}
+
+/**
+ * Follow a turn from chat. Trades the link for a cookie and opens the client.
+ *
+ * The cookie carries the same token, so the grant survives a reload without
+ * leaving a bearer token in the address bar for the rest of the session.
+ */
+app.get("/watch", async (c) => {
+  const token = c.req.query("link") ?? "";
+  const claims = verifyLinkClaims(token, "watch", await getServerSecret(store));
+  if (!claims?.sessionId) return c.html(render401(), 401);
+  setCookie(c, WATCH_COOKIE, token, {
+    httpOnly: true,
+    path: "/",
+    sameSite: "Lax",
+    maxAge: Math.floor(WATCH_TTL_MS / 1000),
+  });
+  return c.redirect(`/?watch=${encodeURIComponent(claims.sessionId)}`);
+});
+
 app.get("/", async (c) => {
   ensureUid(c); // establish client identity on first load
   // Gate the UI itself: a request the grants table denies never sees the app
   // shell — it gets the themed 401 instead. Local dev / anonymous-with-`anyone`
   // resolve as allowed, so they still load normally.
   const { allowed } = await resolveIdentity(c);
-  if (!allowed) return c.html(render401(), 401);
+  if (!allowed && !(await watchGrant(c))) return c.html(render401(), 401);
   try {
     return c.html(readFileSync(join(PUBLIC_DIR, "index.html"), "utf8"));
   } catch {
@@ -573,7 +616,12 @@ app.get("/sessions/:id/events", async (c) => {
   // thing separating them. maySession keeps the Slack rule exactly as it was
   // and adds the ownership check for browser sessions, so this can only refuse
   // more than before, never less.
-  if (!maySession(sessionId, await resolveIdentity(c))) return c.text("forbidden", 403);
+  // A watch grant stands in for identity, but only for THIS conversation: the
+  // token names it, so a chat user following their own turn needs no platform
+  // identity in the browser — and cannot reach anything else with it.
+  if (!(await watchGrant(c, sessionId)) && !maySession(sessionId, await resolveIdentity(c))) {
+    return c.text("forbidden", 403);
+  }
 
   // Prefer the browser's Last-Event-ID header over the URL query param. On an
   // automatic EventSource reconnect the URL is unchanged (it may still carry

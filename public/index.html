@@ -500,6 +500,18 @@ function openConversation(c){
   note(`Reviewing ${c.kind === "slack" ? "Slack" : "web"} conversation${c.repo ? " on " + c.repo : ""}${c.userId ? " · user " + c.userId : ""} — read-only`);
   connect(-1); // replay the whole conversation from the server buffer
 }
+/* A `?watch=<id>` link from chat opens that conversation read-only. The server
+   has already traded the signed link for a grant cookie, so the replay and the
+   live tail both authorize on it. */
+function openWatchFromUrl(){
+  const id = new URLSearchParams(location.search).get("watch");
+  if (!id) return false;
+  history.replaceState(null, "", location.pathname);
+  openConversation({ sessionId: id, kind: "slack" });
+  note("Following this run — read-only. It updates as Ada works.");
+  return true;
+}
+
 $("review-btn").addEventListener("click", (e) => {
   e.stopPropagation();
   const menu = $("review-menu");
@@ -511,7 +523,9 @@ document.addEventListener("click", (e) => {
 });
 initReview();
 
-renderWelcome();  // show the ASCII banner on first load (cleared once a turn starts)
+// A watch link takes precedence over the welcome banner: the whole point is to
+// land straight on the run.
+if (!openWatchFromUrl()) renderWelcome();
 
 // ---- Token / cost display ---------------------------------------------------
 function fmtTokens(n){

@@ -35,7 +35,7 @@ import type { SessionRunner } from "../session/runner.ts";
 import { checkUploadLimits } from "../session/uploads.ts";
 import type { Store } from "../store/store.ts";
 import { githubConfigured } from "../auth/app-config.ts";
-import { getServerSecret, buildConnectUrl } from "../auth/connect.ts";
+import { getServerSecret, buildConnectUrl, buildWatchUrl } from "../auth/connect.ts";
 import { readAttachments } from "./attachments.ts";
 
 const HINT_NS = "gh_connect_hint"; // conversationId -> "1" once the connect hint has been shown
@@ -505,6 +505,21 @@ export class AdaMessagingAdapter implements AgentAdapter {
       settled = true;
       hooks.onError(err);
     };
+
+    // Posted BEFORE the turn runs, and as a chunk rather than a status: a status
+    // is edited in place by the next one, and a link that vanishes on the first
+    // tool call is no use for following along.
+    try {
+      const watchUrl = buildWatchUrl(
+        options.userId,
+        options.conversationId,
+        await getServerSecret(this.store),
+      );
+      hooks.onChunk(`\u{1F440} Follow along: ${watchUrl}\n\n`);
+    } catch {
+      // No base URL configured, so no link can be built. A turn must not fail
+      // for want of a convenience.
+    }
 
     try {
       await this.runner.continueSession(
