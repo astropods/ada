@@ -276,6 +276,18 @@ test("selection still follows what the platform injected, when nothing asks othe
   expect(sandboxMode(env({ ADA_SANDBOX: "microvm", KNOWLEDGE_SANDBOX_HOST: "sandbox" }))).toBe("container");
 });
 
+test("`auto` — the value the spec actually defaults to — resolves as injected", async () => {
+  const { sandboxMode, describeSandbox } = await import("../agent/session/sandbox-mode.ts");
+  // ADA_SANDBOX is declared as an input, so a deployment gets "auto" rather
+  // than an unset variable. It has to mean the same thing as unset.
+  expect(sandboxMode(env({ ADA_SANDBOX: "auto", KNOWLEDGE_SANDBOX_HOST: "sandbox" }))).toBe("container");
+  expect(sandboxMode(env({ ADA_SANDBOX: "auto" }))).toBe("local");
+  // And the log says it was inferred, so `auto` in the config and "container"
+  // in the log are visibly the same decision.
+  expect(describeSandbox(env({ ADA_SANDBOX: "auto", KNOWLEDGE_SANDBOX_HOST: "sandbox" }))).toContain("(auto)");
+  expect(describeSandbox(env({ ADA_SANDBOX: "astro", ASTRO_AUTHZ_TOKEN: "t" }))).not.toContain("(auto)");
+});
+
 test("the platform sandbox is opt-in, so a rollout can be reversed without a revert", async () => {
   const { sandboxMode } = await import("../agent/session/sandbox-mode.ts");
   expect(sandboxMode(env({ ADA_SANDBOX: "astro", ASTRO_AUTHZ_TOKEN: "t" }))).toBe("astro");
@@ -304,6 +316,7 @@ test("startup names the boundary, in the words an operator needs", async () => {
   const { describeSandbox } = await import("../agent/session/sandbox-mode.ts");
   expect(describeSandbox(env({ ADA_SANDBOX: "astro", ASTRO_AUTHZ_TOKEN: "t" }))).toContain("MicroVM");
   expect(describeSandbox(env({ KNOWLEDGE_SANDBOX_HOST: "sandbox" }))).toContain("container at http://sandbox");
+  expect(describeSandbox(env({ ADA_SANDBOX: "container", KNOWLEDGE_SANDBOX_HOST: "sandbox" }))).not.toContain("(auto)");
   expect(describeSandbox(env({})), "local is not a boundary and should not read like one")
     .toContain("not an isolation boundary");
 });

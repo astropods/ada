@@ -35,8 +35,11 @@ export function sandboxMode(env: NodeJS.ProcessEnv = process.env): SandboxMode {
     case "local":
       return "local";
   }
-  // Unset, or set to something unrecognised: fall through to what the platform
-  // injected, which is how every deployment behaved before this switch existed.
+  // `auto` — the declared default — plus unset and anything unrecognised. All
+  // fall through to what the platform injected, which is how every deployment
+  // behaved before this switch existed. `auto` is spelled out in the spec
+  // rather than left as an empty default, because a select with a blank option
+  // reads like a missing value instead of a deliberate one.
   return sandboxHost(env) ? "container" : "local";
 }
 
@@ -48,6 +51,10 @@ export function describeSandbox(env: NodeJS.ProcessEnv = process.env): string {
       ? "astro (platform MicroVM per conversation)"
       : "astro — NO ASTRO_AUTHZ_TOKEN, so every turn will fail to attach";
   }
-  if (mode === "container") return `container at ${sandboxHost(env)}`;
-  return "local (in-process; not an isolation boundary)";
+  const asked = env.ADA_SANDBOX?.trim().toLowerCase();
+  // Name the resolution when it was inferred, so `auto` in the deploy config
+  // and "container" in the log are visibly the same decision.
+  const via = !asked || asked === "auto" ? " (auto)" : "";
+  if (mode === "container") return `container at ${sandboxHost(env)}${via}`;
+  return `local (in-process; not an isolation boundary)${via}`;
 }

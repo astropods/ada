@@ -681,13 +681,15 @@ The switch is automatic. The platform injects `KNOWLEDGE_SANDBOX_HOST` when
 execution there; with no sandbox service, Ada falls back to Flue's in-process
 `local()` sandbox, which is how `node agent/index.ts` and `flue run` work.
 
-**Three modes, while the platform sandbox is being proven.** `ADA_SANDBOX`
-picks one explicitly — `astro` for a platform MicroVM per conversation
+**Three modes, while the platform sandbox is being proven.** `ADA_SANDBOX` is a
+declared input, so it is settable per deployment without a code change:
+`astro` for a platform MicroVM per conversation
 (`agent/session/astro-sandbox.ts`), `container` for the service above, `local`
-for in-process. Unset, the behaviour is exactly as it was: container when the
-platform injected one, local otherwise. So a deployment moves onto the MicroVM
-and back off again by changing one variable, and startup prints which boundary
-is live (`[ada] sandbox: …`).
+for in-process. It defaults to `auto`, which is the behaviour every deployment
+had before there was a choice — container when the platform injected one, local
+otherwise. So a deployment moves onto the MicroVM and back off again by
+changing one value, and startup prints which boundary is live, marking it
+`(auto)` when it was inferred (`[ada] sandbox: …`).
 
 `ADA_SANDBOX=astro` with no `ASTRO_AUTHZ_TOKEN` does **not** fall back. Falling
 back would run the model's commands in the control-plane process, which holds

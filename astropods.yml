@@ -98,6 +98,26 @@ inputs:
     description: "Run an independent code-reviewer pass on substantive changes. Can be toggled per conversation by asking Ada."
     display-as: select
     options: ["true", "false"]
+  # WHICH SANDBOX runs the model's commands. `auto` keeps the behaviour every
+  # deployment had before there was a choice: the platform container when one is
+  # injected, in-process otherwise. `astro` moves to a platform MicroVM per
+  # conversation — opt-in while it is proven, and reversible by setting this
+  # back, with no redeploy of code.
+  #
+  # `local` runs commands IN THE CONTROL PLANE, which holds the database
+  # credentials, the GitHub App secret and the HMAC signing key. It is here
+  # because forcing it is occasionally useful in development, not because it is
+  # a deployment option. Neither remote mode falls back to it: a misconfigured
+  # `astro` or `container` fails the turn instead of quietly switching the
+  # isolation boundary off.
+  ADA_SANDBOX:
+    name: ADA_SANDBOX
+    datatype: string
+    optional: true
+    default: "auto"
+    description: "Where the model's commands run. auto = as injected (container, else in-process); astro = a platform MicroVM per conversation; local = in-process, NOT isolated."
+    display-as: select
+    options: ["auto", "astro", "container", "local"]
   # GitHub App visibility. Default PRIVATE (single-tenant): only the account that
   # created the App can install it — right when one user/org runs their own Ada.
   # Set "true" for MULTI-TENANT: a PUBLIC App any teammate can install on THEIR
