@@ -146,16 +146,24 @@ sandbox:
   env:
     # Never let git stop for a credential prompt; there is no terminal.
     GIT_TERMINAL_PROMPT: "0"
-    # INHERITED FROM THE CONTAINER, and due a re-tune rather than a copy.
-    # These numbers were fitted to the execution container's fixed memory
-    # budget (see `fix(sandbox): fit the execution container's fixed memory
-    # budget`), and a MicroVM's baseline is not that container's. They are
-    # carried over unchanged on purpose: moving the runtime and the resource
-    # limits in one step makes an OOM impossible to attribute. Re-tune once a
-    # real workload has run.
-    GOMEMLIMIT: "600MiB"
+    # SIZED TO THE MICROVM: 2048 MiB and one vCPU (arm64). The VM is one
+    # compute unit at the platform's 2 GiB-per-vCPU ratio, so the two halves of
+    # this block are tuned in OPPOSITE directions from the container's numbers.
+    #
+    # MEMORY GOES UP. The container was fitted to a ~600 MiB budget (see
+    # `fix(sandbox): fit the execution container's fixed memory budget`) and
+    # that budget is the thing that made builds fall over. 2 GiB is ~3.4x it,
+    # so keeping 384 MB of Node heap would waste most of the VM and reproduce
+    # the same failure. The heap cap stays under half of RAM rather than
+    # tracking it: a sandbox may hold more than one process, and this is a hard
+    # per-process ceiling, whereas GOMEMLIMIT is a soft limit that only brings
+    # GC forward and can sit higher safely.
+    GOMEMLIMIT: "1536MiB"
+    NODE_OPTIONS: "--max-old-space-size=1024"
+    # CONCURRENCY STAYS AT ONE, and is now right for a better reason. These
+    # were memory rationing on the container; on a one-vCPU VM they simply
+    # match the hardware, so there is nothing to reclaim by raising them.
     GOMAXPROCS: "1"
-    NODE_OPTIONS: "--max-old-space-size=384"
     UV_THREADPOOL_SIZE: "2"
     MAKEFLAGS: "-j1"
     JOBS: "1"
