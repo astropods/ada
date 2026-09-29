@@ -118,3 +118,34 @@ test("the follow-along link is posted, and before the answer", async () => {
   await new AdaMessagingAdapter(new InMemoryStore(), scriptedRunner(RUN)).stream("fix this", cap.hooks, opts());
   expect(cap.chunks[0], "so it is there while the run is still going").toContain("/watch?link=");
 });
+
+test("a slow sandbox says so, instead of leaving the thread silent", async () => {
+  // A first attach installs the declaration and takes minutes. Without this the
+  // user watches an idle thread for all of it.
+  const cap = capture();
+  const warming = [
+    {
+      type: "CUSTOM",
+      name: "sandbox_warming",
+      value: { message: "Starting your sandbox — a first run installs its toolchain." },
+    },
+    ...text("m1", "Done."),
+    { type: "RUN_FINISHED" },
+  ] as unknown as AguiEvent[];
+  await new AdaMessagingAdapter(new InMemoryStore(), scriptedRunner(warming)).stream("hi", cap.hooks, opts());
+
+  expect(cap.statuses.some((s) => s.includes("Starting your sandbox"))).toBe(true);
+  // A status, not a chunk: it is progress, and the next one replaces it.
+  expect(cap.said()).not.toContain("Starting your sandbox");
+});
+
+test("an unrecognised custom event is ignored rather than rendered", async () => {
+  const cap = capture();
+  const noisy = [
+    { type: "CUSTOM", name: "something_else", value: { message: "internal" } },
+    ...text("m1", "Done."),
+    { type: "RUN_FINISHED" },
+  ] as unknown as AguiEvent[];
+  await new AdaMessagingAdapter(new InMemoryStore(), scriptedRunner(noisy)).stream("hi", cap.hooks, opts());
+  expect(cap.statuses.some((s) => s.includes("internal"))).toBe(false);
+});

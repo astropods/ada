@@ -35,7 +35,10 @@ import {
   remoteSandboxDriver,
   sandboxHost,
 } from "./remote-sandbox.ts";
-import { astroSandboxDriver, explainSandboxFailure } from "./astro-sandbox.ts";
+import { astroSandboxDriver, explainSandboxFailure, type AstroDriver } from "./astro-sandbox.ts";
+
+/** How long a sandbox may take to come up before the user is told about it. */
+const SANDBOX_WARMING_NOTICE_MS = Number(process.env.ADA_SANDBOX_NOTICE_MS ?? 4_000);
 import { sandboxMode } from "./sandbox-mode.ts";
 import type { SandboxDriver } from "@flue/runtime";
 import {
@@ -382,6 +385,13 @@ export class SessionRunner {
           ? remoteSandboxDriver({ baseUrl: containerUrl, id: instanceId, token, env })
           : astroSandboxDriver({ id: instanceId, env }));
 
+      // Attach BEFORE the turn rather than letting Flue do it on the first tool
+      // call, so a slow one can be reported while it happens. A first attach
+      // installs the declaration, which takes minutes, and the user would
+      // otherwise watch an idle thread for all of it. Flue's own attach later
+      // is a cache hit inside the client, keyed by sandbox name.
+      if (!containerUrl) await this.warmSandbox(instanceId, astroSandboxDriver({ id: instanceId, env }));
+
       let subdir: string | undefined;
       if (opts.repo) {
         subdir = (await ensureRepoInSandbox(sandboxDriver(), opts.repo, { githubToken })).dir;
@@ -477,6 +487,34 @@ export class SessionRunner {
       }
     }
     this.registry.setStatus(instanceId, "errored");
+  }
+
+  /**
+   * Wait for the sandbox, telling the user if it is taking a while.
+   *
+   * Silent when the sandbox is already up, which is the common case — the
+   * notice only fires if attach is still going after a few seconds, so a warm
+   * conversation says nothing.
+   */
+  private async warmSandbox(instanceId: string, driver: AstroDriver): Promise<void> {
+    const notify = setTimeout(() => {
+      this.emit(instanceId, {
+        type: "CUSTOM",
+        name: "sandbox_warming",
+        value: { message: "Starting your sandbox — a first run installs its toolchain, so this takes a few minutes." },
+      });
+    }, SANDBOX_WARMING_NOTICE_MS);
+    try {
+      await driver.attach();
+    } finally {
+      clearTimeout(notify);
+    }
+  }
+
+  /** Record an event and hand it to the live listener, as the failure path does. */
+  private emit(instanceId: string, event: AguiEvent): void {
+    this.registry.append(instanceId, event);
+    this.sessions.get(instanceId)?.hooks?.onAguiEvent?.(event);
   }
 
   /** Emit a terminal AG-UI event if the delivery did not produce one itself. */

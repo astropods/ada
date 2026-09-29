@@ -170,6 +170,11 @@ class AstroSandboxDriver implements SandboxDriver {
    * rather than each paying the edge timeout. The client attaches implicitly
    * too; doing it here is what puts the retry in the path.
    */
+  /** Public face of `ensureAttached`, for a caller that wants to wait up front. */
+  async attach(): Promise<void> {
+    return this.ensureAttached();
+  }
+
   private async ensureAttached(): Promise<void> {
     this.attached ??= (async () => {
       const deadline = Date.now() + this.retry.timeoutMs;
@@ -326,8 +331,11 @@ class AstroSandboxDriver implements SandboxDriver {
   }
 }
 
+/** Attaches lazily on first use; `attach()` lets a caller wait on it up front. */
+export type AstroDriver = SandboxDriver & { attach(): Promise<void> };
+
 /** A driver for one conversation — also used directly by the runner to clone. */
-export function astroSandboxDriver(opts: AstroSandboxOptions): SandboxDriver {
+export function astroSandboxDriver(opts: AstroSandboxOptions): AstroDriver {
   return new AstroSandboxDriver(opts);
 }
 

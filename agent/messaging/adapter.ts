@@ -591,6 +591,18 @@ export class AdaMessagingAdapter implements AgentAdapter {
                 }
                 message = "";
                 break;
+              case EventType.CUSTOM:
+                // The runner's own progress signals — a sandbox still coming up
+                // is the one that matters, because it is minutes of silence
+                // before any tool call gives the user something to look at.
+                if (e.name === "sandbox_warming") {
+                  hooks.onStatusUpdate?.({
+                    status: "PROCESSING",
+                    customMessage: String((e.value as { message?: string })?.message ?? "Starting your sandbox…"),
+                    emoji: "📦",
+                  });
+                }
+                break;
               case EventType.TOOL_CALL_START:
                 hooks.onStatusUpdate?.({
                   status: "PROCESSING",
