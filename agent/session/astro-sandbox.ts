@@ -40,7 +40,7 @@
 
 import { sandboxFromDriver } from "@flue/runtime";
 import type { FileStat, Sandbox, SandboxDriver, SandboxFactory, ShellResult } from "@flue/runtime";
-import { SandboxClient } from "@astropods/adapter-core";
+import { SandboxClient, SandboxRequestError } from "@astropods/adapter-core";
 
 /**
  * The sandbox's working directory.
@@ -54,6 +54,37 @@ export const SANDBOX_ROOT = "/workspace";
 
 /** Ceiling on one command, matching the container's `SANDBOX_MAX_TIMEOUT_MS`. */
 const MAX_TIMEOUT_MS = Number(process.env.ASTRO_SANDBOX_MAX_TIMEOUT_MS ?? 15 * 60 * 1000);
+
+/**
+ * How long to keep re-attaching while the platform installs the declaration.
+ *
+ * A FIRST attach installs the declaration, which takes minutes. The client is
+ * built to wait that out — but only on the server's own `202 preparing`
+ * (`SandboxPreparingError`); every other failure is fatal. In front of the
+ * control plane sits an edge proxy with its own origin timeout, and it answers
+ * a long-running attach with a 502 HTML error page well before the server gets
+ * to say "preparing". So the client throws, the turn dies, and the install it
+ * started carries on without it — which is exactly what happened on this
+ * project's first ever conversation.
+ *
+ * Retrying is safe rather than hopeful: `PUT /api/v1/sandboxes/{name}` is
+ * documented as idempotent per name and safe to call on every turn, and the
+ * server settles concurrent first calls onto one sandbox.
+ *
+ * Under the client's own 900s prepare budget, so whichever gives up first
+ * gives up for a reason it can explain.
+ */
+const ATTACH_TIMEOUT_MS = Number(process.env.ASTRO_SANDBOX_ATTACH_TIMEOUT_MS ?? 10 * 60 * 1000);
+const ATTACH_RETRY_MS = Number(process.env.ASTRO_SANDBOX_ATTACH_RETRY_MS ?? 5_000);
+
+/**
+ * A failure that says "the edge gave up on the origin", not "the request was
+ * wrong". Only these are retried; a 4xx is a real refusal (no declaration, a
+ * quota, an unknown name) and retrying it would just delay the error.
+ */
+function isEdgeFailure(e: unknown): boolean {
+  return e instanceof SandboxRequestError && [502, 503, 504].includes(e.status);
+}
 
 /** Whether the platform (or `ast` locally) gave this process an identity. */
 export function astroSandboxEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -120,17 +151,64 @@ export interface AstroSandboxOptions {
    */
   env?: Record<string, string | undefined>;
   client?: SandboxClient;
+  /**
+   * Attach retry budget. Exposed for tests, which cannot afford real backoff,
+   * and for tuning a deployment whose edge timeout differs.
+   */
+  attachRetry?: { timeoutMs?: number; delayMs?: number };
 }
 
 class AstroSandboxDriver implements SandboxDriver {
   private readonly name: string;
   private readonly client: SandboxClient;
   private readonly env: Record<string, string>;
+  private readonly retry: { timeoutMs: number; delayMs: number };
+  private attached: Promise<void> | null = null;
 
   constructor(opts: AstroSandboxOptions) {
     this.name = sandboxNameFor(opts.id);
     this.client = opts.client ?? sharedClient();
     this.env = stripUndefined(opts.env ?? {});
+    this.retry = {
+      timeoutMs: opts.attachRetry?.timeoutMs ?? ATTACH_TIMEOUT_MS,
+      delayMs: opts.attachRetry?.delayMs ?? ATTACH_RETRY_MS,
+    };
+  }
+
+  /**
+   * Attach before the first operation, riding out an installing declaration.
+   *
+   * Memoized on the PROMISE, not a boolean, so concurrent first operations
+   * wait on one attach instead of racing several — the server would settle
+   * them onto one sandbox anyway, but each racing call would separately pay
+   * the edge timeout.
+   *
+   * The client attaches implicitly too; doing it here first is what puts the
+   * retry in the path, and it is a cache hit inside the client afterwards.
+   */
+  private async ensureAttached(): Promise<void> {
+    this.attached ??= (async () => {
+      const deadline = Date.now() + this.retry.timeoutMs;
+      for (let attempt = 1; ; attempt++) {
+        try {
+          await this.client.attach(this.name);
+          return;
+        } catch (e) {
+          if (!isEdgeFailure(e) || Date.now() + this.retry.delayMs >= deadline) throw e;
+          console.warn(
+            `[sandbox] ${this.name}: attach attempt ${attempt} hit a gateway error ` +
+              `(${(e as SandboxRequestError).status}) — the declaration is probably still installing; retrying`,
+          );
+          await new Promise((r) => setTimeout(r, this.retry.delayMs));
+        }
+      }
+    })().catch((e) => {
+      // Not sticky: a later turn on this driver should be allowed to try again
+      // rather than replay a failure the platform may since have resolved.
+      this.attached = null;
+      throw e;
+    });
+    return this.attached;
   }
 
   /**
@@ -141,6 +219,7 @@ class AstroSandboxDriver implements SandboxDriver {
    * way it always was, and nothing here depends on bash being installed.
    */
   private async sh(script: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+    await this.ensureAttached();
     return this.client.exec(this.name, { command: ["/bin/sh", "-c", script] });
   }
 
@@ -160,6 +239,7 @@ class AstroSandboxDriver implements SandboxDriver {
     command: string,
     options: { cwd?: string; env?: Record<string, string>; timeoutMs?: number; signal?: AbortSignal } = {},
   ): Promise<ShellResult> {
+    await this.ensureAttached();
     const timeoutMs = Math.min(Number(options.timeoutMs ?? MAX_TIMEOUT_MS) || MAX_TIMEOUT_MS, MAX_TIMEOUT_MS);
     // Session env first so a per-call value can override it.
     const env = { ...this.env, ...(options.env ?? {}) };
@@ -201,6 +281,7 @@ class AstroSandboxDriver implements SandboxDriver {
   // chained onto it is never attached and the error escapes untranslated.
   async readFile(path: string): Promise<string> {
     try {
+      await this.ensureAttached();
       return await this.client.readFile(this.name, path);
     } catch (e) {
       throw this.readError(path, e);
@@ -209,6 +290,7 @@ class AstroSandboxDriver implements SandboxDriver {
 
   async readFileBuffer(path: string): Promise<Uint8Array> {
     try {
+      await this.ensureAttached();
       return await this.client.readFileBytes(this.name, path);
     } catch (e) {
       throw this.readError(path, e);
@@ -233,6 +315,7 @@ class AstroSandboxDriver implements SandboxDriver {
   }
 
   async writeFile(path: string, content: string | Uint8Array): Promise<void> {
+    await this.ensureAttached();
     if (typeof content === "string") return this.client.writeFile(this.name, path, content);
     return this.client.writeFileBytes(this.name, path, content);
   }
@@ -259,6 +342,7 @@ class AstroSandboxDriver implements SandboxDriver {
   }
 
   async readdir(path: string): Promise<string[]> {
+    await this.ensureAttached();
     return (await this.client.listDir(this.name, path)).map((e) => e.name);
   }
 

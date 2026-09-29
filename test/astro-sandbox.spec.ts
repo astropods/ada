@@ -35,7 +35,17 @@ function fakeClient(
   const runs: Recorded[] = [];
   const writes: { path: string; kind: "text" | "bytes"; size: number }[] = [];
   const mkdirs: string[] = [];
+  const attaches: number[] = [];
+  let attachFailures = 0;
   const client = {
+    async attach(name: string) {
+      attaches.push(Date.now());
+      if (attachFailures-- > 0) {
+        const { SandboxRequestError } = await import("@astropods/adapter-core");
+        throw new SandboxRequestError(502, "gateway");
+      }
+      return { name, class: "default", state: "running", endpoint: "http://x", headers: {}, expiresAt: "" };
+    },
     async exec(name: string, req: Recorded) {
       execs.push({ ...req, name });
       const script = req.command[2] ?? "";
@@ -64,7 +74,11 @@ function fakeClient(
     async writeFileBytes(_n: string, path: string, c: Uint8Array) { writes.push({ path, kind: "bytes", size: c.byteLength }); },
     async listDir() { return [{ name: "a.ts", isDirectory: false }, { name: "src", isDirectory: true }]; },
   } as unknown as SandboxClient;
-  return { client, execs, runs, writes, mkdirs, script: () => execs.at(-1)?.command[2] ?? "" };
+  return {
+    client, execs, runs, writes, mkdirs, attaches,
+    failAttaches: (n: number) => { attachFailures = n; },
+    script: () => execs.at(-1)?.command[2] ?? "",
+  };
 }
 
 const driverWith = (f: ReturnType<typeof fakeClient>) => astroSandboxDriver({ id: "sess_1", client: f.client });
@@ -319,4 +333,54 @@ test("startup names the boundary, in the words an operator needs", async () => {
   expect(describeSandbox(env({ ADA_SANDBOX: "container", KNOWLEDGE_SANDBOX_HOST: "sandbox" }))).not.toContain("(auto)");
   expect(describeSandbox(env({})), "local is not a boundary and should not read like one")
     .toContain("not an isolation boundary");
+});
+
+/* ── Riding out an installing declaration ──────────────────────────────── */
+
+const fastRetry = { timeoutMs: 5_000, delayMs: 1 };
+
+test("a gateway error during attach is retried, because a first install outruns the edge", async () => {
+  // The platform installs the declaration on first attach, which takes
+  // minutes; the edge in front of the control plane answers a long-running
+  // attach with a 502 before the server can say "preparing". The client only
+  // retries the server's own 202s, so without this the first ever conversation
+  // dies while the install it started carries on.
+  const f = fakeClient();
+  f.failAttaches(2);
+  const driver = astroSandboxDriver({ id: "sess_1", client: f.client, attachRetry: fastRetry });
+  await driver.exec("true");
+  expect(f.attaches.length, "two refusals then a success").toBe(3);
+});
+
+test("attach happens once for many operations, not once per call", async () => {
+  const f = fakeClient();
+  const driver = astroSandboxDriver({ id: "sess_1", client: f.client, attachRetry: fastRetry });
+  await Promise.all([driver.exists("/a"), driver.exec("true"), driver.readdir("/"), driver.mkdir("/b")]);
+  // Memoized on the promise, so concurrent first operations wait on one attach
+  // rather than each paying the edge timeout separately.
+  expect(f.attaches.length).toBe(1);
+});
+
+test("a refusal that is not the edge giving up is not retried", async () => {
+  // A 4xx is a real answer — no declaration, a quota, an unknown name — and
+  // retrying it would only delay the error.
+  const { SandboxRequestError } = await import("@astropods/adapter-core");
+  const f = fakeClient();
+  (f.client as unknown as { attach: () => Promise<never> }).attach = async () => {
+    throw new SandboxRequestError(402, "sandbox limit reached");
+  };
+  const driver = astroSandboxDriver({ id: "sess_1", client: f.client, attachRetry: fastRetry });
+  await expect(driver.exec("true")).rejects.toThrow(/limit reached/);
+});
+
+test("giving up on attach does not poison the driver for later turns", async () => {
+  const f = fakeClient();
+  // More failures than the budget allows, so this attach gives up.
+  f.failAttaches(99);
+  const driver = astroSandboxDriver({ id: "sess_1", client: f.client, attachRetry: { timeoutMs: 3, delayMs: 1 } });
+  await expect(driver.exec("true")).rejects.toThrow();
+  // The platform may have finished installing since. Replaying the cached
+  // failure would strand the conversation on a problem that no longer exists.
+  f.failAttaches(0);
+  await expect(driver.exec("true")).resolves.toMatchObject({ exitCode: 0 });
 });
