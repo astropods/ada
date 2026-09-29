@@ -371,6 +371,35 @@ test("a request too big to parse is refused before it is buffered", async ({ req
   expect(res.status()).toBe(413);
 });
 
+test("a refused attachment does not wedge the session", async ({ request }) => {
+  // The reserved turn slot has to come back on every 4xx. A leaked one is
+  // permanent: the session stays "starting", `busy()` reads that as busy, and
+  // every later turn on it answers 409 forever.
+  const started = await request.post("/sessions", { data: { prompt: "hello" } });
+  const { sessionId } = await started.json();
+
+  // Turn 1 has to settle before turn 2 can be the one under test — otherwise a
+  // 409 here would be correct rather than the bug.
+  await expect
+    .poll(async () => {
+      const list = await (await request.get("/conversations")).json();
+      return list.conversations.find((c: { sessionId: string }) => c.sessionId === sessionId)?.status;
+    })
+    .not.toMatch(/starting|running/);
+
+  const refused = await request.post(`/sessions/${sessionId}/messages`, {
+    multipart: {
+      prompt: "look at this",
+      files: { name: "huge.png", mimeType: "image/png", buffer: Buffer.alloc(MAX_IMAGE_BYTES + 1024) },
+    },
+  });
+  expect(refused.status()).toBe(400);
+
+  // The session must still accept a turn. A 409 here is the wedge.
+  const after = await request.post(`/sessions/${sessionId}/messages`, { data: { prompt: "still there?" } });
+  expect(after.status(), "the refused turn gave its slot back").toBe(202);
+});
+
 test("a plain prompt is still sent as JSON", async ({ page }) => {
   // Multipart appears only when there is a file: the JSON body is the contract
   // every other client speaks, and a prompt-only turn must not change shape.

@@ -518,12 +518,18 @@ app.post("/sessions/:id/messages", turnBodyLimit, async (c) => {
   // window — both would dispatch and neither would see a 409.
   const release = runner.reserveTurn(sessionId);
   if (!release) return c.text("session busy", 409);
-  const req = await readTurnRequest(c);
-  if ("error" in req) {
-    release();
-    return c.text(req.error, 400);
-  }
+  // EVERY path from here has to reach `release()`, including a throw. The body
+  // read is not exception-free — `arrayBuffer()` on a part is unguarded, and a
+  // client that disconnects mid-upload throws right there — and a reservation
+  // leaked that way is permanent: the session stays "starting", which `busy()`
+  // reads as busy, so every later turn on it answers 409 forever. Hence one
+  // try around the read AND the dispatch rather than only the dispatch.
   try {
+    const req = await readTurnRequest(c);
+    if ("error" in req) {
+      release();
+      return c.text(req.error, 400);
+    }
     await runner.continueSession(sessionId, {
       prompt: req.prompt,
       uploads: req.uploads,
@@ -536,8 +542,10 @@ app.post("/sessions/:id/messages", turnBodyLimit, async (c) => {
     // The follow-up turn streams over the session's already-open SSE.
     return c.json({ sessionId }, 202);
   } catch (e) {
+    // Safe after a successful dispatch too: `release` only rolls back a slot
+    // still sitting at "starting", so it cannot take a live turn's.
     release();
-    return c.text(`run failed: ${(e as Error).message}`, 500);
+    return c.text(`turn failed: ${(e as Error).message}`, 500);
   }
 });
 
