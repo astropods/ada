@@ -54,7 +54,30 @@
   body.debug #side { display:block; }
   .chip-debug { display:none; }            /* debug-only chips (e.g. lastEventId) — shown with ?debug */
   body.debug .chip-debug { display:inline; }
-  form { flex:0 0 auto; display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line); background:var(--panel); }
+  form { flex:0 0 auto; display:flex; flex-direction:column; gap:8px; padding:12px 16px; border-top:1px solid var(--line); background:var(--panel); }
+  .composer-row { display:flex; gap:8px; align-items:center; }
+  .icon-btn { display:inline-flex; align-items:center; justify-content:center; padding:8px 10px; color:var(--muted); }
+  .icon-btn:hover:not(:disabled) { color:var(--fg); border-color:var(--accent); }
+  #attachments { display:flex; flex-wrap:wrap; gap:6px; }
+  #attachments[hidden] { display:none; }
+  .attach-chip { display:inline-flex; align-items:center; gap:6px; max-width:260px;
+    background:var(--code); border:1px solid var(--line); border-radius:99px; padding:3px 6px 3px 10px; font-size:12px; }
+  .attach-chip .nm { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .attach-chip .sz { color:var(--muted); flex:0 0 auto; }
+  .attach-chip .rm { background:none; border:none; color:var(--muted); cursor:pointer; font:inherit;
+    line-height:1; padding:2px 4px; border-radius:99px; }
+  .attach-chip .rm:hover { color:var(--err); }
+  .attach-chip.image { border-color:var(--accent); }
+  /* Attachments echoed under the user's own bubble, so the transcript shows
+     what was sent rather than just what was typed. */
+  .bubble .attached { margin-top:6px; display:flex; flex-wrap:wrap; gap:6px; }
+  .bubble .attached span { font-size:11px; color:var(--muted); border:1px solid var(--line);
+    border-radius:99px; padding:1px 8px; }
+  #dropzone { position:fixed; inset:0; z-index:30; display:flex; align-items:center; justify-content:center;
+    background:rgba(11,9,18,.82); border:2px dashed var(--accent); }
+  #dropzone[hidden] { display:none; }
+  #dropzone div { color:var(--fg); font-size:16px; border:1px solid var(--line); border-radius:12px;
+    padding:18px 26px; background:var(--panel); }
   input[type=text] { flex:1; background:var(--panel); border:1px solid var(--line); color:var(--fg); border-radius:8px; padding:8px 10px; font:inherit; }
   button { background:var(--panel); border:1px solid var(--line); color:var(--fg); border-radius:8px; padding:8px 12px; cursor:pointer; font:inherit; }
   button:hover { border-color:var(--accent); }
@@ -205,9 +228,19 @@
 </main>
 
 <form id="composer">
-  <input id="prompt" type="text" placeholder="Prompt (e.g. bump retries in config.json)" autocomplete="off" />
-  <button id="send" type="submit">Send</button>
+  <!-- The chip strip sits ABOVE the input row and is empty until something is
+       attached, so the composer keeps its usual height for a plain prompt. -->
+  <div id="attachments" hidden></div>
+  <div class="composer-row">
+    <input id="file-input" type="file" multiple hidden />
+    <button id="attach" type="button" class="icon-btn" title="Attach files" aria-label="Attach files">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
+    </button>
+    <input id="prompt" type="text" placeholder="Prompt (e.g. bump retries in config.json)" autocomplete="off" />
+    <button id="send" type="submit">Send</button>
+  </div>
 </form>
+<div id="dropzone" hidden><div>Drop files to attach</div></div>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -573,6 +606,7 @@ function renderMarkdown(src){
 function setComposerEnabled(on){
   $("prompt").disabled = !on;
   $("send").disabled = !on;
+  $("attach").disabled = !on;
   $("send").textContent = on ? "Send" : "Working…";
   if (on) $("prompt").focus();
 }
@@ -653,7 +687,22 @@ function connect(fromSeq){
 
 // Each turn's user bubble needs a unique id (a session now has many turns).
 let turnSeq = 0;
-function addUserBubble(text){ messageBubble("user-" + (++turnSeq), "user").body.textContent = text; }
+function addUserBubble(text, files){
+  const m = messageBubble("user-" + (++turnSeq), "user");
+  m.body.textContent = text;
+  if (files && files.length){
+    // What was sent, not just what was typed — otherwise a scrolled-back
+    // transcript gives no sign a file was ever part of the question.
+    const row = document.createElement("div");
+    row.className = "attached";
+    for (const f of files){
+      const tag = document.createElement("span");
+      tag.textContent = (isImage(f) ? "🖼 " : "📎 ") + f.name;
+      row.appendChild(tag);
+    }
+    m.body.appendChild(row);
+  }
+}
 function showPending(text){
   clearPending();
   pendingEl = document.createElement("div");
@@ -662,11 +711,96 @@ function showPending(text){
   timeline.appendChild(pendingEl); scroll();
 }
 
+/* ── Attachments ──────────────────────────────────────────────────────────
+   Mirrors the server's routing so the UI can say, before you send, what will
+   happen to each file: an image the model will SEE, anything else a file the
+   agent will find at uploads/<name>. Limits are duplicated here to fail fast
+   with a message rather than after a 25MB round-trip — the server still
+   enforces them, since nothing here is trustworthy. */
+const MODEL_IMAGE_TYPES = ["image/png","image/jpeg","image/gif","image/webp"];
+const LIMITS = { files:10, image:5*1024*1024, file:25*1024*1024, total:50*1024*1024 };
+let attached = [];
+
+const isImage = (f) => MODEL_IMAGE_TYPES.includes(f.type);
+const fmtSize = (n) => n < 1024 ? n + "B"
+  : n < 1024*1024 ? Math.round(n/1024) + "KB"
+  : (Math.round(n/(1024*1024)*10)/10) + "MB";
+
+function attachFiles(list){
+  const incoming = Array.from(list || []);
+  if (!incoming.length) return;
+  for (const f of incoming){
+    if (attached.length >= LIMITS.files){ note(`at most ${LIMITS.files} files per message`); break; }
+    const cap = isImage(f) ? LIMITS.image : LIMITS.file;
+    if (f.size > cap){ note(`${f.name} is ${fmtSize(f.size)} — the limit is ${fmtSize(cap)}`); continue; }
+    if (attached.reduce((n,x) => n + x.size, 0) + f.size > LIMITS.total){
+      note(`attachments would exceed ${fmtSize(LIMITS.total)} for one message`); break;
+    }
+    attached.push(f);
+  }
+  renderAttachments();
+}
+
+function renderAttachments(){
+  const box = $("attachments");
+  box.innerHTML = "";
+  box.hidden = attached.length === 0;
+  attached.forEach((f, i) => {
+    const chip = document.createElement("span");
+    chip.className = "attach-chip" + (isImage(f) ? " image" : "");
+    chip.title = isImage(f) ? "Image — Ada can see this" : `File — Ada will find it at uploads/${f.name}`;
+    const nm = document.createElement("span"); nm.className = "nm"; nm.textContent = f.name;
+    const sz = document.createElement("span"); sz.className = "sz"; sz.textContent = fmtSize(f.size);
+    const rm = document.createElement("button");
+    rm.type = "button"; rm.className = "rm"; rm.textContent = "✕";
+    rm.title = "Remove"; rm.setAttribute("aria-label", `Remove ${f.name}`);
+    rm.addEventListener("click", () => { attached.splice(i, 1); renderAttachments(); });
+    chip.append(nm, sz, rm);
+    box.appendChild(chip);
+  });
+}
+
+$("attach").addEventListener("click", () => $("file-input").click());
+$("file-input").addEventListener("change", (e) => {
+  attachFiles(e.target.files);
+  // Reset, so picking the SAME file again still fires a change event.
+  e.target.value = "";
+});
+
+// Paste an image straight from the clipboard — the common case is a screenshot,
+// which otherwise means saving to disk first just to attach it back.
+$("prompt").addEventListener("paste", (e) => {
+  const files = Array.from(e.clipboardData?.files || []);
+  if (files.length){ e.preventDefault(); attachFiles(files); }
+});
+
+// Drag and drop anywhere on the window. The counter is what makes the overlay
+// survive dragging over a child element: dragleave fires on every boundary
+// crossing, so a plain show/hide flickers the overlay away mid-drag.
+let dragDepth = 0;
+const dragHasFiles = (e) => Array.from(e.dataTransfer?.types || []).includes("Files");
+window.addEventListener("dragenter", (e) => {
+  if (!dragHasFiles(e)) return;
+  e.preventDefault(); dragDepth++; $("dropzone").hidden = false;
+});
+window.addEventListener("dragover", (e) => { if (dragHasFiles(e)) e.preventDefault(); });
+window.addEventListener("dragleave", () => { if (--dragDepth <= 0){ dragDepth = 0; $("dropzone").hidden = true; } });
+window.addEventListener("drop", (e) => {
+  if (!dragHasFiles(e)) return;
+  e.preventDefault(); dragDepth = 0; $("dropzone").hidden = true;
+  attachFiles(e.dataTransfer.files);
+});
+
 $("composer").addEventListener("submit", async (e) => {
   e.preventDefault();
-  const prompt = $("prompt").value.trim();
+  const typed = $("prompt").value.trim();
+  // A files-only send is a real intent ("here, look at this"), but the prompt
+  // is what titles the session and what the model reads first, so give it
+  // words rather than dispatching an empty turn.
+  const prompt = typed || (attached.length ? "Take a look at the attached file(s)." : "");
   if (!prompt) return;
   if (reviewing){ note("read-only review — open the session ▾ menu → New session to chat"); return; }
+  const files = attached;
 
   // With an active session a prompt is a FOLLOW-UP turn on it; otherwise it
   // starts a NEW session. Only a new session clears the timeline + usage.
@@ -675,18 +809,32 @@ $("composer").addEventListener("submit", async (e) => {
     timeline.innerHTML = ""; rawlog.innerHTML = ""; messages.clear(); tools.clear(); lastEventId = null; renderedSeqs.clear(); stickToBottom = true;
     resetUsage();
   }
-  addUserBubble(prompt);
+  addUserBubble(prompt, files);
   $("prompt").value = "";
+  // Cleared BEFORE the request: the body is already built below, and leaving
+  // the chips up through an in-flight turn invites a double-send of the same
+  // files on the next message.
+  attached = [];
+  renderAttachments();
   setComposerEnabled(false);
   setStatus("starting");
   showPending(following ? "Claude is thinking…" : "starting Claude… (spawning; first tokens can take a few seconds)");
 
+  // JSON stays the shape for a plain prompt — it is the contract every other
+  // client speaks. Multipart appears only when there is actually a file, and
+  // the Content-Type is left to the browser so it can set the boundary.
+  const req = files.length
+    ? (() => {
+        const fd = new FormData();
+        fd.append("prompt", prompt);
+        for (const f of files) fd.append("files", f, f.name);
+        return { body: fd };
+      })()
+    : { headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt }) };
+
   try {
     if (following){
-      const res = await fetch(`/sessions/${sessionId}/messages`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
-      });
+      const res = await fetch(`/sessions/${sessionId}/messages`, { method: "POST", ...req });
       if (!res.ok){ clearPending(); note("failed to continue session: " + await res.text()); setComposerEnabled(true); }
       // Don't trust the existing SSE to still be live: a proxy can silently drop
       // an idle stream half-open (readyState stays OPEN, so EventSource never
@@ -696,10 +844,7 @@ $("composer").addEventListener("submit", async (e) => {
       // dedupe keeps it gap-free), so this turn is guaranteed a live connection.
       else connect(lastEventId != null ? Number(lastEventId) : -1);
     } else {
-      const res = await fetch("/sessions", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
-      });
+      const res = await fetch("/sessions", { method: "POST", ...req });
       if (!res.ok){ clearPending(); note("failed to start session: " + await res.text()); setComposerEnabled(true); return; }
       ({ sessionId } = await res.json());
       $("sid").textContent = sessionId.slice(0, 14);

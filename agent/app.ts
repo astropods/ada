@@ -4,6 +4,7 @@
  *   GET  /                         -> built-in AG-UI test client (public/index.html)
  *   POST /sessions {prompt,...}    -> {sessionId} (starts a new multi-turn session)
  *   POST /sessions/:id/messages    -> continue a session with a follow-up turn
+ *                                     (both take JSON, or multipart with files)
  *   DELETE /sessions/:id           -> drop a session (log, workspace, Flue state)
  *   GET  /sessions/:id/events      -> SSE AG-UI stream; honours Last-Event-ID
  *   GET  /conversations            -> list handled conversations (admin-gated)
@@ -47,9 +48,16 @@ import type { FlueEvent } from "@flue/runtime";
 import { Ada } from "./agents/ada.ts";
 import { Translator } from "./translate/translator.ts";
 import { describeAuth } from "./config/model.ts";
+import { bodyLimit } from "hono/body-limit";
 import { SessionRegistry } from "./session/registry.ts";
 import { SessionRunner } from "./session/runner.ts";
 import { startWorkspaceGc } from "./session/workspace.ts";
+import {
+  checkUploadLimits,
+  MAX_REQUEST_BYTES,
+  MAX_UPLOAD_FILES,
+  type UploadInput,
+} from "./session/uploads.ts";
 import { installTelemetry } from "./telemetry/otel.ts";
 import { InMemoryResultStore } from "./persistence/results.ts";
 import { createStore, type Store } from "./store/index.ts";
@@ -381,20 +389,97 @@ app.get("/index.html", (c) => c.redirect("/"));
 
 const DEFAULT_TITLE_LEN = 80;
 
-app.post("/sessions", async (c) => {
-  const body = await c.req.json<{ prompt?: string }>().catch(() => ({}) as { prompt?: string });
-  if (!body.prompt) return c.text("prompt required", 400);
+/**
+ * Read `{ prompt, uploads }` from a turn request, in either encoding.
+ *
+ * JSON stays the contract for a plain prompt — the messaging adapter, external
+ * AG-UI clients and every existing test speak it, and a turn with no files must
+ * keep producing byte-identical requests. Multipart is added ALONGSIDE it,
+ * chosen by content-type, purely so the browser can attach files without
+ * base64-inflating them by a third into a JSON body.
+ *
+ * Returns an error string instead of throwing: every caller turns it straight
+ * into a 4xx, and the limit messages are written to be shown to the user.
+ */
+async function readTurnRequest(
+  c: Context,
+): Promise<{ prompt: string; uploads: UploadInput[] } | { error: string }> {
+  const contentType = c.req.header("content-type") ?? "";
+
+  if (!contentType.includes("multipart/form-data")) {
+    const body = await c.req.json<{ prompt?: string }>().catch(() => ({}) as { prompt?: string });
+    if (!body.prompt) return { error: "prompt required" };
+    return { prompt: body.prompt, uploads: [] };
+  }
+
+  // `all: true` so repeated `files` parts arrive as an array rather than the
+  // last one winning — attaching three files and silently sending one is the
+  // failure this flag exists to avoid.
+  const form = await c.req.parseBody({ all: true }).catch(() => null);
+  if (!form) return { error: "malformed multipart body" };
+
+  const prompt = typeof form.prompt === "string" ? form.prompt : "";
+  if (!prompt) return { error: "prompt required" };
+
+  const parts = form.files;
+  const list = (Array.isArray(parts) ? parts : parts ? [parts] : []).filter(
+    (f): f is File => typeof f === "object" && f !== null && "arrayBuffer" in f,
+  );
+  if (list.length > MAX_UPLOAD_FILES) {
+    // Rejected before the parts are copied into our own buffers. Note this is
+    // not a memory guard: `parseBody` has already read the whole body, so the
+    // real ceiling on an oversized request is whatever fronts this process.
+    return { error: `too many files — ${list.length} attached, limit is ${MAX_UPLOAD_FILES}` };
+  }
+
+  const uploads: UploadInput[] = [];
+  for (const f of list) {
+    uploads.push({
+      filename: f.name,
+      mimeType: f.type,
+      bytes: new Uint8Array(await f.arrayBuffer()),
+    });
+  }
+  const limit = checkUploadLimits(uploads);
+  if (limit) return { error: limit };
+  return { prompt, uploads };
+}
+
+/**
+ * Outer ceiling on a turn request, ahead of any parsing.
+ *
+ * `checkUploadLimits` is the friendly limit — it names the file and the cap, so
+ * the user can act on it — but it cannot run until `parseBody` has already
+ * pulled the whole body into memory. This refuses on `Content-Length`, or by
+ * counting the stream when there isn't one, before that happens.
+ *
+ * Deliberately ABOVE the per-message total, so a batch that busts the real
+ * limit still gets the message that explains which file to drop rather than a
+ * bare 413. Only a request too big to be worth reading at all lands here.
+ */
+const turnBodyLimit = bodyLimit({
+  maxSize: MAX_REQUEST_BYTES,
+  onError: (c) => c.text("attachments too large", 413),
+});
+
+app.post("/sessions", turnBodyLimit, async (c) => {
   // Resolve + authorize the caller the same way the sidecar does; the GitHub
   // token is keyed by the resolved platform id so git/gh act as the same
   // identity the user connected in chat.
+  //
+  // BEFORE the body is read, so an unauthorized caller cannot make us buffer
+  // 50MB of attachments to be told no.
   const id = await resolveIdentity(c);
   if (!id.allowed) return c.text("forbidden", 403);
+  const req = await readTurnRequest(c);
+  if ("error" in req) return c.text(req.error, 400);
   try {
     const sessionId = await runner.startSession({
-      prompt: body.prompt,
+      prompt: req.prompt,
+      uploads: req.uploads,
       userKey: id.userKey,
       userId: id.userId ?? undefined,
-      meta: { kind: "browser", userId: id.userKey, title: body.prompt.slice(0, DEFAULT_TITLE_LEN) },
+      meta: { kind: "browser", userId: id.userKey, title: req.prompt.slice(0, DEFAULT_TITLE_LEN) },
       // Answer as soon as the session exists; the turn streams over SSE. This
       // used to await the whole turn, so the client only got its id once there
       // was nothing left to stream and replayed a finished turn in one block.
@@ -406,7 +491,7 @@ app.post("/sessions", async (c) => {
   }
 });
 
-app.post("/sessions/:id/messages", async (c) => {
+app.post("/sessions/:id/messages", turnBodyLimit, async (c) => {
   const sessionId = c.req.param("id");
   // AUTHORIZATION FIRST, before anything that reveals the session's state.
   // Driving another user's conversation is at least as serious as reading it:
@@ -423,14 +508,31 @@ app.post("/sessions/:id/messages", async (c) => {
   if (!id.allowed) return c.text("forbidden", 403);
   if (!maySession(sessionId, id)) return c.text("forbidden", 403);
   if (!runner.has(sessionId)) return c.text("unknown session", 404);
-  const body = await c.req.json<{ prompt?: string }>().catch(() => ({}) as { prompt?: string });
-  if (!body.prompt) return c.text("prompt required", 400);
   // Flue serializes concurrent deliveries to one instance, but the AG-UI client
   // relies on 409 to keep its own turn state coherent — so keep refusing here.
-  if (runner.busy(sessionId)) return c.text("session busy", 409);
+  // Ahead of the body read for the same reason as the authorization gate: a
+  // turn we are going to refuse should not cost us the upload first.
+  //
+  // CLAIMED, not probed. The body read below takes real time for a multipart
+  // turn, and a plain `busy()` test would let a second follow-up through that
+  // window — both would dispatch and neither would see a 409.
+  const release = runner.reserveTurn(sessionId);
+  if (!release) return c.text("session busy", 409);
+  // EVERY path from here has to reach `release()`, including a throw. The body
+  // read is not exception-free — `arrayBuffer()` on a part is unguarded, and a
+  // client that disconnects mid-upload throws right there — and a reservation
+  // leaked that way is permanent: the session stays "starting", which `busy()`
+  // reads as busy, so every later turn on it answers 409 forever. Hence one
+  // try around the read AND the dispatch rather than only the dispatch.
   try {
+    const req = await readTurnRequest(c);
+    if ("error" in req) {
+      release();
+      return c.text(req.error, 400);
+    }
     await runner.continueSession(sessionId, {
-      prompt: body.prompt,
+      prompt: req.prompt,
+      uploads: req.uploads,
       userKey: id.userKey,
       userId: id.userId ?? undefined,
       // Same reasoning as POST /sessions: a follow-up turn is just as long, and
@@ -440,7 +542,10 @@ app.post("/sessions/:id/messages", async (c) => {
     // The follow-up turn streams over the session's already-open SSE.
     return c.json({ sessionId }, 202);
   } catch (e) {
-    return c.text(`run failed: ${(e as Error).message}`, 500);
+    // Safe after a successful dispatch too: `release` only rolls back a slot
+    // still sitting at "starting", so it cannot take a live turn's.
+    release();
+    return c.text(`turn failed: ${(e as Error).message}`, 500);
   }
 });
 

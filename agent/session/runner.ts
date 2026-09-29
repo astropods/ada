@@ -35,6 +35,13 @@ import {
   remoteSandboxDriver,
   sandboxHost,
 } from "./remote-sandbox.ts";
+import {
+  describeUploads,
+  routeUploads,
+  writeUploadsLocal,
+  writeUploadsRemote,
+  type UploadInput,
+} from "./uploads.ts";
 import { resolveModel, sandboxEnv } from "../config/model.ts";
 import { githubConfigured } from "../auth/app-config.ts";
 import { getValidToken } from "../auth/github-app.ts";
@@ -54,6 +61,8 @@ type SessionEnvRemote = NonNullable<SessionEnv["remote"]>;
 
 export interface TurnOpts {
   prompt: string;
+  /** Files the user attached to this turn, unrouted. */
+  uploads?: UploadInput[];
   /** Key the GitHub token is stored under (resolved platform id, or bridge_uid). */
   userKey: string;
   /** Resolved platform id for tracing (undefined in local dev → "anonymous"). */
@@ -194,6 +203,40 @@ export class SessionRunner {
     return status === "running" || status === "starting";
   }
 
+  /**
+   * Claim the one turn slot for a session, or report it already taken.
+   *
+   * `busy()` alone is only a probe, and a caller cannot dispatch straight after
+   * it — an HTTP handler still has a request body to read, which for a
+   * multipart turn is tens of megabytes and many milliseconds during which a
+   * second follow-up passes the same probe. Both would then dispatch, and the
+   * 409 the AG-UI client relies on to keep its turn state coherent never
+   * happens.
+   *
+   * Reserving flips the status in the SAME tick as the test, so of two racing
+   * turns exactly one wins. Nothing subscribes to the status event, so the
+   * early "starting" is visible only to `busy()` and the session list.
+   *
+   * Returns a function that gives the slot back, for a turn abandoned before
+   * dispatch (a malformed body, a busted limit, a failed dispatch) — without it
+   * the session would sit at "starting" with nothing running and refuse every
+   * later turn with a 409.
+   */
+  reserveTurn(instanceId: string): (() => void) | null {
+    if (this.busy(instanceId)) return null;
+    const previous = this.registry.has(instanceId) ? this.registry.status(instanceId) : null;
+    this.registry.ensure(instanceId);
+    this.registry.setStatus(instanceId, "starting");
+    let released = false;
+    return () => {
+      // Only ever undoes OUR reservation: once the turn has started, its own
+      // status transitions own the slot and must not be rolled back.
+      if (released || this.registry.status(instanceId) !== "starting") return;
+      released = true;
+      if (previous) this.registry.setStatus(instanceId, previous);
+    };
+  }
+
   has(instanceId: string): boolean {
     return this.registry.has(instanceId);
   }
@@ -309,18 +352,29 @@ export class SessionRunner {
     let sandboxCwd = cwd;
     let remote: SessionEnvRemote | undefined;
 
+    // Routed here, not at the HTTP edge, because only the runner knows which
+    // sandbox this session has — and a non-image upload has to be written
+    // where the agent's tools will look for it, which the branches below
+    // settle (local dir vs remote subdir).
+    const routedUploads = opts.uploads?.length ? routeUploads(opts.uploads) : null;
+
     if (baseUrl) {
       // Isolated execution: the checkout lives in the sandbox container, and
       // every path the agent sees is relative to its own workspace there.
       const token = process.env.SANDBOX_TOKEN;
       let subdir: string | undefined;
+      let driver: ReturnType<typeof remoteSandboxDriver> | undefined;
       if (opts.repo) {
-        const driver = remoteSandboxDriver({ baseUrl, id: instanceId, token, env: sandboxEnv({ githubToken }) });
+        driver = remoteSandboxDriver({ baseUrl, id: instanceId, token, env: sandboxEnv({ githubToken }) });
         subdir = (await ensureRepoInSandbox(driver, opts.repo, { githubToken })).dir;
       } else {
         // A repo the agent cloned itself on an earlier turn, so the next turn
         // is rooted inside it and Flue's AGENTS.md discovery sees the project.
         subdir = getCheckoutDir(instanceId);
+      }
+      if (routedUploads?.files.length) {
+        driver ??= remoteSandboxDriver({ baseUrl, id: instanceId, token, env: sandboxEnv({ githubToken }) });
+        await writeUploadsRemote(driver, routedUploads.files, subdir);
       }
       remote = { baseUrl, token, subdir };
     } else if (opts.repo) {
@@ -331,6 +385,13 @@ export class SessionRunner {
       // control-plane path.
       const checkout = getCheckoutDir(instanceId);
       if (checkout) sandboxCwd = ensureWorkspace(join(cwd, checkout));
+    }
+
+    // After the local branches above have settled sandboxCwd, so the files land
+    // in the directory the agent is actually rooted at (the checkout when there
+    // is one, the workspace otherwise) and `uploads/<name>` resolves for it.
+    if (!baseUrl && routedUploads?.files.length) {
+      writeUploadsLocal(sandboxCwd, routedUploads.files);
     }
 
     setSessionEnv(instanceId, {
@@ -355,7 +416,20 @@ export class SessionRunner {
       const onAbort = () => void handle.abort().catch(() => {});
       hooks?.signal?.addEventListener("abort", onAbort, { once: true });
       try {
-        const receipt = await handle.dispatch(opts.prompt);
+        // A bare string stays a bare string: Flue treats it as
+        // `{ kind: 'user', body }`, and a turn with no attachments must produce
+        // exactly the delivery it always did.
+        const receipt = await handle.dispatch(
+          routedUploads
+            ? {
+                message: {
+                  kind: "user",
+                  body: describeUploads(opts.prompt, routedUploads),
+                  attachments: routedUploads.attachments,
+                },
+              }
+            : opts.prompt,
+        );
         await handle.read(receipt, { signal: hooks?.signal });
         // Belt and braces: if `submission_settled` never reached the observer,
         // close the AG-UI run here rather than leaving a client waiting on a
