@@ -168,6 +168,12 @@ function isPrivate(options: StreamOptions): boolean {
   return !ctx || ctx.eventKind === "EVENT_KIND_DM";
 }
 
+/** A status line from a narration message: its first sentence, bounded. */
+function firstLine(text: string, max = 80): string {
+  const line = text.trim().split("\n").find((l) => l.trim()) ?? "";
+  return line.length > max ? `${line.slice(0, max - 1).trimEnd()}…` : line;
+}
+
 export class AdaMessagingAdapter implements AgentAdapter {
   readonly name = "Ada";
 
@@ -487,10 +493,20 @@ export class AdaMessagingAdapter implements AgentAdapter {
         .catch(() => {});
     };
 
+    // The assistant message being accumulated, and the last COMPLETE one —
+    // which is the answer. Keeping the last non-empty rather than simply the
+    // last means a run that ends on an empty message still replies.
+    let message = "";
+    let reply = "";
+
     let settled = false;
     const finish = () => {
       if (settled) return;
       settled = true;
+      // An unterminated message (no TEXT_MESSAGE_END before the run closed)
+      // is still the answer if it is all there is.
+      if (message.trim()) reply = message;
+      if (reply.trim()) hooks.onChunk(reply);
       commitThreadContext();
       if (hintUrl) {
         hooks.onChunk(
@@ -556,7 +572,24 @@ export class AdaMessagingAdapter implements AgentAdapter {
             if (settled) return;
             switch (e.type) {
               case EventType.TEXT_MESSAGE_CONTENT:
-                hooks.onChunk(e.delta);
+                message += e.delta;
+                break;
+              case EventType.TEXT_MESSAGE_END:
+                // Every assistant message except the last one is narration
+                // between tool calls. Streaming those into the thread is what
+                // buried the actual answer under "Let me read the ticket…",
+                // "Let me find…", "Now let me check…" for the length of a run.
+                // They become a transient status instead, which the next one
+                // replaces, and the reply keeps only the final message.
+                if (message.trim()) {
+                  reply = message;
+                  hooks.onStatusUpdate?.({
+                    status: "PROCESSING",
+                    customMessage: firstLine(message),
+                    emoji: "💭",
+                  });
+                }
+                message = "";
                 break;
               case EventType.TOOL_CALL_START:
                 hooks.onStatusUpdate?.({

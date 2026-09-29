@@ -77,7 +77,7 @@ import {
   WATCH_TTL_MS,
 } from "./auth/connect.ts";
 import { resolveBaseUrl } from "./auth/base-url.ts";
-import { Authorizer, oidcIdentity, oidcEmail, type AuthzResult } from "./auth/authz.ts";
+import { Authorizer, oidcIdentity, oidcEmail, tokenKind, type AuthzResult } from "./auth/authz.ts";
 import { SSE_HEADERS, frameLogged, sseHeartbeat, parseLastEventId } from "./transport/sse.ts";
 import { render401, renderPage } from "./transport/pages.ts";
 
@@ -384,11 +384,20 @@ app.route("/agents/ada", createAgentRouter(Ada));
 const WATCH_COOKIE = "ada_watch";
 
 /**
- * The conversation this browser holds a watch grant for, if any.
+ * Whether this browser may watch `sessionId`.
  *
- * The token IS the authority: signed, expiring, and scoped to one conversation
- * and one user. So a holder needs no platform identity — which is the point,
- * since a chat user clicking through from Slack has none in the browser.
+ * TWO THINGS MUST AGREE: a signed token naming the conversation, and a signed-in
+ * platform identity matching the user it was minted for. The token alone is a
+ * bearer credential, and a link posted in a Slack thread is visible to everyone
+ * in it — so the token bounds WHAT a holder can reach and the identity bounds
+ * WHO. Requiring both means a link forwarded to a colleague does nothing for
+ * them; they are sent to sign in, and then refused because it is not theirs.
+ *
+ * The two ids are the same by construction: the authorize call returns the
+ * platform user id the sidecar keys chat on, which is what the token carries.
+ *
+ * Off a deployment there is no ALB and so no identity to match, exactly as with
+ * `isAdmin` — local runs are already ungated, so the token alone stands.
  *
  * Read-only by construction: only `GET /` and the event stream consult this.
  * Driving or deleting a session never does, so a grant cannot do either.
@@ -396,7 +405,14 @@ const WATCH_COOKIE = "ada_watch";
 async function watchGrant(c: Ctx, sessionId?: string): Promise<boolean> {
   const claims = verifyLinkClaims(getCookie(c, WATCH_COOKIE), "watch", await getServerSecret(store));
   if (!claims?.sessionId) return false;
-  return sessionId === undefined || claims.sessionId === sessionId;
+  if (sessionId !== undefined && claims.sessionId !== sessionId) return false;
+  return watcherIsOwner(await resolveIdentity(c), claims.userId);
+}
+
+/** The signed-in viewer is the user a watch token was minted for. */
+function watcherIsOwner(id: Identity, mintedFor: string): boolean {
+  if (tokenKind() !== "deploy") return true;
+  return id.allowed && id.userId === mintedFor;
 }
 
 /**
@@ -409,6 +425,9 @@ app.get("/watch", async (c) => {
   const token = c.req.query("link") ?? "";
   const claims = verifyLinkClaims(token, "watch", await getServerSecret(store));
   if (!claims?.sessionId) return c.html(render401(), 401);
+  // Refuse here as well as at the grant, so someone handed the link is told
+  // now rather than after a redirect into an empty client.
+  if (!watcherIsOwner(await resolveIdentity(c), claims.userId)) return c.html(render401(), 401);
   setCookie(c, WATCH_COOKIE, token, {
     httpOnly: true,
     path: "/",
