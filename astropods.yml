@@ -98,39 +98,24 @@ inputs:
     description: "Run an independent code-reviewer pass on substantive changes. Can be toggled per conversation by asking Ada."
     display-as: select
     options: ["true", "false"]
-  # The base URL a BROWSER uses to reach this agent. Normally derived and left
-  # unset; set it when the derivation cannot work.
-  #
-  # It cannot work for a link Ada hands to a CHAT user. The derivation trusts
-  # the current request's Host (loopback only, since that header is
-  # client-controlled and feeds an OAuth redirect_uri), but a Slack connect
-  # link is built from a chat message, where there is no request at all — so it
-  # falls back to the container's own PORT and offers the user a port that is
-  # only reachable inside the container. Under `ast project start` that is
-  # 8080 internally while the browser reaches the agent on the mapped host
-  # port, and nothing inside the container can see that mapping.
-  #
-  # A deployment sets ASTRO_EXTERNAL_AGENT_URL, so this is for local runs and
-  # for a custom domain. The OAuth callback must ALSO be registered with the
-  # GitHub App, or GitHub rejects a redirect_uri it does not know.
+  # Base URL a BROWSER uses. Normally derived; set it when that cannot work —
+  # a connect link sent to CHAT has no request to derive from, so it falls back
+  # to the container's own port, which nothing outside the container can reach.
+  # A deployment sets ASTRO_EXTERNAL_AGENT_URL instead. The callback must also
+  # be registered with the GitHub App.
   PUBLIC_BASE_URL:
     name: PUBLIC_BASE_URL
     datatype: string
     optional: true
     description: "Base URL a browser uses to reach this agent, e.g. http://localhost:3200. Leave empty to derive it; required for GitHub connect links sent to chat."
     display-as: short-text
-  # WHICH SANDBOX runs the model's commands. `auto` keeps the behaviour every
-  # deployment had before there was a choice: the platform container when one is
-  # injected, in-process otherwise. `astro` moves to a platform MicroVM per
-  # conversation — opt-in while it is proven, and reversible by setting this
-  # back, with no redeploy of code.
+  # Where the model's commands run. `auto` is the behaviour before there was a
+  # choice: the container when injected, in-process otherwise. `astro` is opt-in
+  # while proven, and reversible without a code change.
   #
   # `local` runs commands IN THE CONTROL PLANE, which holds the database
-  # credentials, the GitHub App secret and the HMAC signing key. It is here
-  # because forcing it is occasionally useful in development, not because it is
-  # a deployment option. Neither remote mode falls back to it: a misconfigured
-  # `astro` or `container` fails the turn instead of quietly switching the
-  # isolation boundary off.
+  # credentials, the App secret and the HMAC key — useful in development, not a
+  # deployment option. Neither remote mode falls back to it.
   ADA_SANDBOX:
     name: ADA_SANDBOX
     datatype: string
@@ -153,33 +138,21 @@ inputs:
     display-as: select
     options: ["false", "true"]
 
-# Platform-managed execution sandbox — one Lambda MicroVM per conversation.
+# Platform execution sandbox — one MicroVM per conversation. Declaring this
+# section is the whole switch; there is no local sandbox runtime, so a local run
+# attaches a REAL MicroVM and `ast` must be logged in.
 #
-# Declaring this section is the whole switch: the platform installs the
-# declaration, `ast` injects a dev-session token locally, and the agent attaches
-# by name through the control plane. There is no per-account flag and no local
-# sandbox runtime — a local run attaches a REAL MicroVM, so `ast` must be logged
-# in for sandbox paths to work off a deployment.
+# Replaces knowledge.sandbox below, which stays until this is proven.
 #
-# This replaces `knowledge.sandbox` (the bespoke container in sandbox/), which
-# stays declared below until the new driver is proven. Both can coexist: Ada
-# picks the container while KNOWLEDGE_SANDBOX_HOST is injected.
-#
-# WHAT THE BASE IMAGE ALREADY HAS, so it is absent here: git, git-lfs, jq, tar,
-# gzip, xz, unzip, zip, patch, diffutils, findutils, rsync, openssh-clients,
-# less, procps-ng, sudo, curl-minimal, and coreutils/grep/sed/awk. No language
-# runtime and no compiler — those are exactly what a declaration is for.
+# Already in the base image, so absent here: git, git-lfs, jq, archive tools,
+# patch, diffutils, findutils, rsync, openssh-clients, sudo, curl-minimal,
+# coreutils/grep/sed/awk. No runtime and no compiler — that is what this is for.
 sandbox:
-  # `auto` rather than `always`: the build toolchain is 60 packages whose
-  # closure drags in systemd, for 8 seconds of install time saved. `auto`
-  # installs it only when something declared here actually needs to compile.
+  # Not `always`: that is 60 packages dragging in systemd to save 8s of install.
   toolchain: auto
 
-  # Node runs the agent's own tooling; bun is what sandbox/Dockerfile shipped
-  # and what this project's own checks use. Global npm packages land under
-  # /opt/astropods, which is the environment the platform caches per
-  # declaration and restores into any sandbox — not the per-conversation
-  # workspace.
+  # Global npm packages land in /opt/astropods — the environment the platform
+  # caches per declaration, not the per-conversation workspace.
   node:
     version: "24"
     packages: ["bun@1.3.9"]
@@ -187,23 +160,13 @@ sandbox:
   env:
     # Never let git stop for a credential prompt; there is no terminal.
     GIT_TERMINAL_PROMPT: "0"
-    # SIZED TO THE MICROVM: 2048 MiB and one vCPU (arm64). The VM is one
-    # compute unit at the platform's 2 GiB-per-vCPU ratio, so the two halves of
-    # this block are tuned in OPPOSITE directions from the container's numbers.
-    #
-    # MEMORY GOES UP. The container was fitted to a ~600 MiB budget (see
-    # `fix(sandbox): fit the execution container's fixed memory budget`) and
-    # that budget is the thing that made builds fall over. 2 GiB is ~3.4x it,
-    # so keeping 384 MB of Node heap would waste most of the VM and reproduce
-    # the same failure. The heap cap stays under half of RAM rather than
-    # tracking it: a sandbox may hold more than one process, and this is a hard
-    # per-process ceiling, whereas GOMEMLIMIT is a soft limit that only brings
-    # GC forward and can sit higher safely.
+    # Sized to the MicroVM: 2048 MiB, one vCPU, arm64. Memory goes UP from the
+    # container's ~600 MiB budget, which is what made builds fall over. The heap
+    # cap stays under half of RAM (hard, per-process, and a sandbox may hold
+    # several); GOMEMLIMIT is soft, so it can sit higher.
     GOMEMLIMIT: "1536MiB"
     NODE_OPTIONS: "--max-old-space-size=1024"
-    # CONCURRENCY STAYS AT ONE, and is now right for a better reason. These
-    # were memory rationing on the container; on a one-vCPU VM they simply
-    # match the hardware, so there is nothing to reclaim by raising them.
+    # Still one: memory rationing on the container, now just matching 1 vCPU.
     GOMAXPROCS: "1"
     UV_THREADPOOL_SIZE: "2"
     MAKEFLAGS: "-j1"
@@ -216,29 +179,23 @@ sandbox:
     NX_PARALLEL: "1"
     TURBO_CONCURRENCY: "1"
     PYTHONDONTWRITEBYTECODE: "1"
-    # DELIBERATELY NOT SET: npm_config_cache, BUN_INSTALL_CACHE_DIR,
-    # GOMODCACHE, GOCACHE, PIP_CACHE_DIR, WORKSPACE_ROOT. The container pointed
-    # all of them at its /data volume. The base image already points them into
-    # /opt/astropods, and redirecting them at the workspace would put a package
-    # store in the one place that is per-sandbox rather than per-declaration.
+    # Deliberately unset: the cache dirs and WORKSPACE_ROOT. The container aimed
+    # them at /data; the base image already points them into /opt/astropods, and
+    # the workspace is the one place that is per-sandbox, not per-declaration.
 
   setup:
-    # `gh` is not in the AL2023 package repository, so it arrives as a release
-    # tarball. Pinned, and arm64 because sandboxes run only on Graviton 3/4.
-    # gh is a static Go binary, so the image's glibc 2.34 does not constrain it
-    # — a check that DOES apply to anything else fetched this way.
-    #
-    # Installed into /opt/astropods/bin: already on PATH, and part of the
-    # environment rather than the workspace. Guarded by `command -v` so it is
-    # a no-op whether setup re-runs per sandbox or the environment is restored.
+    # `gh` is not in the AL2023 repo, so: a pinned arm64 release tarball
+    # (sandboxes run only on Graviton). It is a static Go binary, so glibc 2.34
+    # does not bind it — a check that DOES apply to anything else fetched here.
+    # Into /opt/astropods/bin (on PATH, part of the cached environment), and
+    # `command -v`-guarded so it is a no-op if setup re-runs.
     - >-
       command -v gh >/dev/null || {
       curl -fsSL https://github.com/cli/cli/releases/download/v2.101.0/gh_2.101.0_linux_arm64.tar.gz
       | tar xz -C /tmp &&
       install -m 0755 /tmp/gh_2.101.0_linux_arm64/bin/gh /opt/astropods/bin/gh; }
-    # How Ada's git reaches a private repo: the per-command GH_TOKEN the control
-    # plane sends is read by `gh auth git-credential`, so no credential is ever
-    # written to disk here. Idempotent — git config overwrites the key.
+    # The per-command GH_TOKEN is read by `gh auth git-credential`, so nothing
+    # is written to disk. Idempotent.
     - git config --system credential."https://github.com".helper "!gh auth git-credential"
 
 knowledge:

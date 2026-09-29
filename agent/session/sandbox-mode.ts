@@ -1,24 +1,14 @@
 /**
- * Which sandbox this process executes in — resolved once, read everywhere.
+ * Which sandbox runs the model's commands: `astro` (a platform MicroVM per
+ * conversation), `container` (the service in `sandbox/`), or `local` (Flue's
+ * in-process sandbox, which is the control plane itself).
  *
- * Three modes now that the platform has its own:
+ * Unset falls through to what the platform injected, so nothing that predates
+ * this switch changes. `astro` is opt-in while it is proven.
  *
- *  - `astro`     a platform MicroVM per conversation (session/astro-sandbox.ts)
- *  - `container` the bespoke execution service in `sandbox/`
- *  - `local`     Flue's in-process sandbox, which is the control plane itself
- *
- * SELECTION STAYS BY INJECTION, so `node agent/index.ts` and `flue run` keep
- * working with no configuration: a deployment with the sandbox container gets
- * `container`, anything else gets `local`. `astro` is OPT-IN by `ADA_SANDBOX`
- * while it is being proven, which is what lets a deployment move onto it and
- * back off again without a revert.
- *
- * `ADA_SANDBOX=astro` DOES NOT FALL BACK. A deployment that asks for the
- * platform sandbox and has no identity token fails its turns, loudly, on the
- * client's own error. The alternative — quietly dropping to `local` — would
- * run the model's commands in the control-plane process, holding the database
- * credentials, the GitHub App secret and the HMAC key. A misconfiguration must
- * not be able to turn the isolation boundary off.
+ * NEITHER REMOTE MODE FALLS BACK. Dropping to `local` on a misconfiguration
+ * would run the model's commands in the control plane, which holds the
+ * database credentials, the App secret and the HMAC key.
  */
 
 import { astroSandboxEnabled } from "./astro-sandbox.ts";
@@ -35,11 +25,8 @@ export function sandboxMode(env: NodeJS.ProcessEnv = process.env): SandboxMode {
     case "local":
       return "local";
   }
-  // `auto` — the declared default — plus unset and anything unrecognised. All
-  // fall through to what the platform injected, which is how every deployment
-  // behaved before this switch existed. `auto` is spelled out in the spec
-  // rather than left as an empty default, because a select with a blank option
-  // reads like a missing value instead of a deliberate one.
+  // `auto` (the declared default), unset, and anything unrecognised: fall
+  // through to what the platform injected.
   return sandboxHost(env) ? "container" : "local";
 }
 
@@ -52,8 +39,7 @@ export function describeSandbox(env: NodeJS.ProcessEnv = process.env): string {
       : "astro — NO ASTRO_AUTHZ_TOKEN, so every turn will fail to attach";
   }
   const asked = env.ADA_SANDBOX?.trim().toLowerCase();
-  // Name the resolution when it was inferred, so `auto` in the deploy config
-  // and "container" in the log are visibly the same decision.
+  // Mark an inferred mode, so `auto` in the config and this line agree.
   const via = !asked || asked === "auto" ? " (auto)" : "";
   if (mode === "container") return `container at ${sandboxHost(env)}${via}`;
   return `local (in-process; not an isolation boundary)${via}`;

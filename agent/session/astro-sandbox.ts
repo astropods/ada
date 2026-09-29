@@ -1,41 +1,16 @@
 /**
- * Astro sandbox — Flue's `SandboxDriver` over a platform-managed MicroVM.
+ * Astro sandbox — Flue's `SandboxDriver` over a platform MicroVM, one per
+ * conversation. Replaces the container in `sandbox/`.
  *
- * Replaces the bespoke execution service in `sandbox/`: instead of the control
- * plane calling an HTTP container it deployed, the agent attaches a sandbox BY
- * NAME through the control plane and talks to the VM the platform hands back.
- * The direction inverts, which is why no inbound port is needed here.
+ * `SandboxClient` covers four of Flue's nine methods; `stat`, `exists`, `mkdir`
+ * and `rm` are synthesized with quoted shell utilities, as every Flue provider
+ * adapter does.
  *
- * The isolation is the platform's now, and it is strictly stronger than what it
- * replaces: a separate VM with its own kernel per conversation, no inbound
- * network, no platform credential inside, and no route to the agent cluster or
- * to another conversation. The container needed a per-instance uid, a 0700
- * workspace and path confinement to approximate that, and still could not
- * isolate the network at all.
- *
- * SELECTION is by injection, as before, only on a different variable: the
- * platform sets `ASTRO_AUTHZ_TOKEN` (and `ast project start` injects a
- * dev-session token locally). Absent means no sandbox, so `node agent/index.ts`
- * and `flue run` keep working on Flue's in-process `local()`.
- *
- * THE DRIVER IS NOT A PASS-THROUGH. `SandboxClient` covers four of Flue's nine
- * methods; `stat`, `exists`, `mkdir` and `rm` have no equivalent and are
- * synthesized here with quoted shell utilities. That is the same shape every
- * Flue provider adapter takes (see the modal/e2b/daytona adapters), not a
- * shortcut.
- *
- * TWO PLATFORM LIMITS LEAK THROUGH, and callers should know them:
- *
- *  - READS CAP AT ~768 KiB. The client implements `readFile` as `base64 < path`
- *    over `exec`, and exec output is capped at 1 MiB per stream, which base64
- *    reaches at three quarters of that. The container's limit was 16 MiB. A
- *    bigger file has to be read in pieces with `sed -n`/`head`/`tail`, which is
- *    what the error says.
- *
- *  - WRITES ARE CHUNKED AT 36 KiB of file per round-trip, because the client
- *    ships base64 in an argv that Linux caps at 128 KiB. A 25 MB upload is
- *    ~712 sequential `exec` calls. Ada's upload ceilings were sized for a
- *    single HTTP body and want revisiting for this path.
+ * Two platform limits leak through, both worse than the container's:
+ *  - reads cap at ~768 KiB (the client reads via `base64` over `exec`, and exec
+ *    output is capped at 1 MiB per stream). The container allowed 16 MiB.
+ *  - writes chunk at 36 KiB of file per round-trip, so a 25 MB upload is ~712
+ *    sequential calls.
  */
 
 import { sandboxFromDriver } from "@flue/runtime";
@@ -48,46 +23,22 @@ import {
 } from "@astropods/adapter-core";
 import { tokenKind } from "../auth/authz.ts";
 
-/**
- * The sandbox's working directory.
- *
- * Fixed by the platform image, which sets `SANDBOX_WORKDIR=/workspace` and is
- * the same for every sandbox — so unlike the container, there is nothing to ask
- * at startup. That round-trip existed only because the control plane could not
- * see the container's layout, and it took a version-skew fallback with it.
- */
+/** Fixed by the platform image (`SANDBOX_WORKDIR`), so nothing to ask at startup. */
 export const SANDBOX_ROOT = "/workspace";
 
 /** Ceiling on one command, matching the container's `SANDBOX_MAX_TIMEOUT_MS`. */
 const MAX_TIMEOUT_MS = Number(process.env.ASTRO_SANDBOX_MAX_TIMEOUT_MS ?? 15 * 60 * 1000);
 
 /**
- * How long to keep re-attaching while the platform installs the declaration.
- *
- * A FIRST attach installs the declaration, which takes minutes. The client is
- * built to wait that out — but only on the server's own `202 preparing`
- * (`SandboxPreparingError`); every other failure is fatal. In front of the
- * control plane sits an edge proxy with its own origin timeout, and it answers
- * a long-running attach with a 502 HTML error page well before the server gets
- * to say "preparing". So the client throws, the turn dies, and the install it
- * started carries on without it — which is exactly what happened on this
- * project's first ever conversation.
- *
- * Retrying is safe rather than hopeful: `PUT /api/v1/sandboxes/{name}` is
- * documented as idempotent per name and safe to call on every turn, and the
- * server settles concurrent first calls onto one sandbox.
- *
- * Under the client's own 900s prepare budget, so whichever gives up first
- * gives up for a reason it can explain.
+ * A first attach installs the declaration, which takes minutes, and the edge
+ * proxy answers that with a 502 long before the server says "preparing" — which
+ * the client only retries for its own 202s. Safe to retry: attach is idempotent
+ * per name. Kept under the client's own 900s prepare budget.
  */
 const ATTACH_TIMEOUT_MS = Number(process.env.ASTRO_SANDBOX_ATTACH_TIMEOUT_MS ?? 10 * 60 * 1000);
 const ATTACH_RETRY_MS = Number(process.env.ASTRO_SANDBOX_ATTACH_RETRY_MS ?? 5_000);
 
-/**
- * A failure that says "the edge gave up on the origin", not "the request was
- * wrong". Only these are retried; a 4xx is a real refusal (no declaration, a
- * quota, an unknown name) and retrying it would just delay the error.
- */
+/** The edge gave up on the origin. A 4xx is a real refusal, so it is not retried. */
 function isEdgeFailure(e: unknown): boolean {
   return e instanceof SandboxRequestError && [502, 503, 504].includes(e.status);
 }
@@ -98,29 +49,16 @@ export function astroSandboxEnabled(env: NodeJS.ProcessEnv = process.env): boole
 }
 
 /**
- * The sandbox name for a conversation.
- *
- * Same filesystem for the same name, never shared between different ones — so
- * the instance id is exactly the right key, and it is already how every other
- * per-conversation resource here is scoped.
- *
- * Prefixed because names are scoped per deployment rather than per agent, and
- * reduced to the platform's `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`: a Slack
- * thread id is not guaranteed to be within that set, and a name the control
- * plane rejects would fail the turn rather than the validation.
+ * Same name means the same filesystem, so the instance id is the key. Prefixed
+ * because names are scoped per deployment, and reduced to the platform's
+ * `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$` — a Slack thread id need not be in it.
  */
 export function sandboxNameFor(instanceId: string): string {
   const safe = instanceId.replace(/[^A-Za-z0-9._:-]/g, "-");
   return `ada-${safe}`.slice(0, 128);
 }
 
-/**
- * One client per process, not one per conversation.
- *
- * It holds the identity token and the per-sandbox credentials it renews, and
- * those are keyed by sandbox name inside it — so a second client would just
- * duplicate that cache and the renewals feeding it.
- */
+/** One per process: it caches per-sandbox credentials by name and renews them. */
 let shared: SandboxClient | null = null;
 function sharedClient(): SandboxClient {
   shared ??= new SandboxClient();
@@ -132,13 +70,7 @@ export function resetSandboxClient(next: SandboxClient | null = null): void {
   shared = next;
 }
 
-/**
- * Single-quote a value for `/bin/sh -c`.
- *
- * Every synthesized command below interpolates a path, and a path is the one
- * argument here that comes from the model. Only an embedded single quote needs
- * work once the whole value is wrapped.
- */
+/** Quote for `/bin/sh -c`. Paths come from the model, so this is load-bearing. */
 function sq(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
@@ -148,20 +80,12 @@ function stripUndefined(env: Record<string, string | undefined>): Record<string,
 }
 
 /**
- * Turn a sandbox refusal into a sentence that names the cause and the lever.
- *
- * Returns null for anything unrecognised, so a caller keeps whatever it had.
- *
- * WHY THIS EXISTS AT ALL. A cap refusal reached the user as
- * `Agent run failed (submission sub_…) (code: AGENT_ERROR)` and the log as
- * `SandboxRequestError: Limit reached (HTTP 402)`. Neither says which limit,
- * that a conversation holds a sandbox for its lifetime, or what to do — and
- * there are THREE different caps behind that one status.
- *
- * The platform does send the detail. Its 402 body carries `usage`, `limit` and
- * a `details` string, but the client's `errorMessage()` keeps only `error`, so
- * "Limit reached" is genuinely all that survives the wire. The numbers cannot
- * be recovered here; the token kind can, and it decides which cap applies.
+ * Name the cause and the lever; null for anything unrecognised, so the caller
+ * keeps its own message. A cap refusal otherwise reaches the user as
+ * `AGENT_ERROR` and the log as "Limit reached", and three caps share that
+ * status. The platform sends `usage`/`limit`/`details`, but the client keeps
+ * only `error` — so the numbers are unrecoverable here and the token kind,
+ * which decides which cap applies, is not.
  */
 export function explainSandboxFailure(e: unknown, env: NodeJS.ProcessEnv = process.env): string | null {
   // Flue wraps a turn failure, so the useful error is usually a `cause` down.
@@ -215,16 +139,12 @@ export interface AstroSandboxOptions {
   /** Instance id — one sandbox per conversation. */
   id: string;
   /**
-   * Env layered onto every command. Holds the user's GH_TOKEN when connected.
-   * Passed per request, never into the declaration's static `env`, so the
-   * credential lives no longer than the command needing it.
+   * Layered onto every command; holds GH_TOKEN. Per request, never the
+   * declaration's static `env`, so it lives only as long as the command.
    */
   env?: Record<string, string | undefined>;
   client?: SandboxClient;
-  /**
-   * Attach retry budget. Exposed for tests, which cannot afford real backoff,
-   * and for tuning a deployment whose edge timeout differs.
-   */
+  /** Exposed for tests, which cannot afford real backoff. */
   attachRetry?: { timeoutMs?: number; delayMs?: number };
 }
 
@@ -246,15 +166,9 @@ class AstroSandboxDriver implements SandboxDriver {
   }
 
   /**
-   * Attach before the first operation, riding out an installing declaration.
-   *
-   * Memoized on the PROMISE, not a boolean, so concurrent first operations
-   * wait on one attach instead of racing several — the server would settle
-   * them onto one sandbox anyway, but each racing call would separately pay
-   * the edge timeout.
-   *
-   * The client attaches implicitly too; doing it here first is what puts the
-   * retry in the path, and it is a cache hit inside the client afterwards.
+   * Memoized on the PROMISE so concurrent first operations wait on one attach
+   * rather than each paying the edge timeout. The client attaches implicitly
+   * too; doing it here is what puts the retry in the path.
    */
   private async ensureAttached(): Promise<void> {
     this.attached ??= (async () => {
@@ -277,37 +191,23 @@ class AstroSandboxDriver implements SandboxDriver {
         }
       }
     })().catch((e) => {
-      // Not sticky: a later turn on this driver should be allowed to try again
-      // rather than replay a failure the platform may since have resolved.
+      // Not sticky: a later turn may find a platform that has since recovered.
       this.attached = null;
       throw e;
     });
     return this.attached;
   }
 
-  /**
-   * Run a shell snippet for the driver's own use.
-   *
-   * `/bin/sh -c`, which is both what the container spawned and what the client
-   * uses internally — so a command reaching the sandbox is interpreted the same
-   * way it always was, and nothing here depends on bash being installed.
-   */
+  /** `/bin/sh -c`, as the container spawned and the client uses — no bash needed. */
   private async sh(script: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
     await this.ensureAttached();
     return this.client.exec(this.name, { command: ["/bin/sh", "-c", script] });
   }
 
   /**
-   * The model's commands.
-   *
-   * An abort routes through `run()` rather than `exec()`, because only `run()`
-   * takes a signal — and Flue does abort a turn mid-command, which is what its
-   * orphaned-settlement callback exists to observe.
-   *
-   * Truncation and a timeout are reported IN the output. Flue's `ShellResult`
-   * is `{stdout, stderr, exitCode}` with nowhere to put a flag, and a model
-   * handed a silent prefix of a build log will conclude the build said only
-   * that much.
+   * An abort routes through `run()`, the only call taking a signal. Truncation
+   * and timeouts are reported IN stderr: `ShellResult` has nowhere for a flag,
+   * and a model handed a silent prefix will think that was the whole log.
    */
   async exec(
     command: string,
@@ -350,9 +250,8 @@ class AstroSandboxDriver implements SandboxDriver {
     };
   }
 
-  // `try`/`await` rather than `.catch()` on the call: a callee that throws
-  // SYNCHRONOUSLY never gets as far as returning a promise, so a `.catch`
-  // chained onto it is never attached and the error escapes untranslated.
+  // `try`/`await`, not `.catch()`: a synchronous throw returns no promise to
+  // attach a handler to, and the error would escape untranslated.
   async readFile(path: string): Promise<string> {
     try {
       await this.ensureAttached();
@@ -371,14 +270,7 @@ class AstroSandboxDriver implements SandboxDriver {
     }
   }
 
-  /**
-   * Make the read cap actionable rather than a bare 413.
-   *
-   * The client reads through `base64 < path` over `exec`, so the 1 MiB output
-   * cap lands at about 768 KiB of file — far under the container's 16 MiB, and
-   * low enough that ordinary files hit it. The advice is the same the container
-   * gave, because it is still the right advice.
-   */
+  /** The 1 MiB exec cap lands at ~768 KiB of file, low enough that real files hit it. */
   private readError(path: string, e: unknown): Error {
     const msg = (e as Error).message ?? String(e);
     if (!/cap|413/i.test(msg)) return e as Error;
@@ -394,14 +286,7 @@ class AstroSandboxDriver implements SandboxDriver {
     return this.client.writeFileBytes(this.name, path, content);
   }
 
-  /**
-   * `stat`, from the shell, because the client has none.
-   *
-   * One call rather than three: `%F` names the type, and it reports
-   * "symbolic link" for a link because GNU `stat` does not dereference unless
-   * asked. Failure means "no such path" to every caller, and Flue's contract
-   * has no way to say otherwise, so it throws.
-   */
+  /** One call: `%F` names the type, and reports "symbolic link" undereferenced. */
   async stat(path: string): Promise<FileStat> {
     const r = await this.sh(`stat -c '%F|%s|%Y' -- ${sq(path)}`);
     if (r.exitCode !== 0) throw new Error(`stat ${path}: ${(r.stderr || r.stdout).trim() || "no such path"}`);
@@ -420,12 +305,7 @@ class AstroSandboxDriver implements SandboxDriver {
     return (await this.client.listDir(this.name, path)).map((e) => e.name);
   }
 
-  /**
-   * `-e` OR `-L`, so a broken symlink counts as present.
-   *
-   * `-e` follows the link and answers false when the target is gone, which
-   * would have a caller try to create something that is already in the way.
-   */
+  /** `-e` OR `-L`: `-e` alone is false for a broken symlink that is still in the way. */
   async exists(path: string): Promise<boolean> {
     const q = sq(path);
     return (await this.sh(`[ -e ${q} ] || [ -L ${q} ]`)).exitCode === 0;
@@ -452,20 +332,17 @@ export function astroSandboxDriver(opts: AstroSandboxOptions): SandboxDriver {
 }
 
 /**
- * A `SandboxFactory` backed by a platform MicroVM, for `useSandbox()`.
- *
- * `subdir` names a directory inside the workspace (a repo checkout); omit it to
- * sit at the workspace root. The cwd is absolute because Flue resolves every
- * tool path against it, and a relative one normalises `.` to `/`.
+ * `subdir` names a repo checkout inside the workspace; omit for the root. The
+ * cwd must be absolute — Flue resolves tool paths against it, and a relative
+ * one normalises `.` to `/`.
  */
 export function astro(opts: Omit<AstroSandboxOptions, "id"> & { subdir?: string } = {}): SandboxFactory {
   return {
     async createSandbox({ id }): Promise<Sandbox> {
       const driver = astroSandboxDriver({ ...opts, id });
       const cwd = opts.subdir ? `${SANDBOX_ROOT}/${opts.subdir}` : SANDBOX_ROOT;
-      // So a fresh conversation does not fail its first `ls`. This is also the
-      // first call to touch the sandbox, so it is where `attach` happens and
-      // where a first install is waited out.
+      // So a fresh conversation does not fail its first `ls`, and this is where
+      // the attach (and any first install) is waited out.
       await driver.mkdir(cwd, { recursive: true });
       return sandboxFromDriver(driver, cwd, {
         onOrphanSettled: (s) =>

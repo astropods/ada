@@ -226,18 +226,11 @@ test("without an admin list, the documented open posture is unchanged", async ({
 /* ── Which token kind gates the web UI ─────────────────────────────────── */
 
 /**
- * `ASTRO_AUTHZ_TOKEN` carries two different credentials.
- *
- * A DEPLOY token is a deployment's identity, and web requests to it arrive
- * through an ALB that has already established who the caller is — so the grants
- * table is the right authority. A DEV-SESSION token is the developer's own,
- * minted by `ast project start` so a local agent can attach a sandbox. There is
- * no ALB in front of local dev, so every request is anonymous, and asking the
- * grants table about it denies — which failed closed into a themed 401 and
- * locked developers out of their own frontend.
- *
- * The kinds are distinguishable rather than guessable: a dev session carries
- * `typ: "dev"`, a deploy token carries no `typ` (astropods/astro#2724).
+ * `ASTRO_AUTHZ_TOKEN` carries two credentials. A DEPLOY token is a deployment's
+ * identity, with an ALB in front that has already established the caller. A
+ * DEV-SESSION token is the developer's own, so every local request is anonymous
+ * and asking the grants table about it denies — a themed 401 that locked
+ * developers out. Distinguishable by `typ: "dev"` (astropods/astro#2724).
  */
 function token(claims: Record<string, unknown>): string {
   const payload = Buffer.from(JSON.stringify(claims)).toString("base64url");
@@ -288,11 +281,9 @@ test("the startup line never contains the token", async () => {
 /* ── Admin off a deployment ────────────────────────────────────────────── */
 
 /**
- * `isAdmin` matches a verified email the ALB supplies, and only a deployment
- * has an ALB. So off one the email is always empty and ADMIN_EMAILS can only
- * ever deny — setting it to grant yourself admin locally did the opposite,
- * flipping `mayViewOthers` from "no list, so open" to "a list, and nothing can
- * match it".
+ * Only a deployment has an ALB to supply the email `isAdmin` matches, so off one
+ * ADMIN_EMAILS can only deny — setting it to grant yourself admin did the
+ * opposite.
  */
 test("local development is admin, even with an allowlist set", async () => {
   const { isAdmin, adminListConfigured } = await import("../agent/auth/setup.ts");

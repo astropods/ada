@@ -20,13 +20,10 @@
  * reaches the agent on the mapped one. GitHub then sent the browser to a port
  * where the agent isn't listening — the reported 404.
  *
- * STEP 2 CANNOT SAVE A LINK SENT TO CHAT, which is the remaining gap. Deriving
- * from the request works for a developer's own browser because there IS a
- * request; a Slack connect link is built from a chat message, so it falls
- * through to step 3 and offers a port only reachable inside the container.
- * Nothing in here can fix that — a container cannot see its own host port
- * mapping — so `PUBLIC_BASE_URL` is declared as an input and is the answer for
- * any deployment that hands links to chat users.
+ * Step 2 cannot save a link sent to CHAT: there is no request to derive from,
+ * so it falls to step 3 and offers a port only reachable inside the container.
+ * A container cannot see its own port mapping, so `PUBLIC_BASE_URL` is a
+ * declared input and is the answer there.
  *
  * Resolution order:
  *   1. `PUBLIC_BASE_URL`, then `ASTRO_EXTERNAL_AGENT_URL` — explicit config wins.

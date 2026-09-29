@@ -9,12 +9,8 @@ import {
 } from "../agent/session/astro-sandbox.ts";
 
 /**
- * Flue's `SandboxDriver` over a platform MicroVM.
- *
- * The client covers four of the nine methods; `stat`, `exists`, `mkdir` and
- * `rm` are synthesized from shell utilities, so the sharp edges are the quoting
- * of a model-supplied path and the parsing of `stat` output. Both are tested
- * against a recording fake rather than a live sandbox.
+ * The client covers four of Flue's nine methods; the rest are synthesized from
+ * shell utilities, so the sharp edges are path quoting and `stat` parsing.
  */
 
 /** The name pattern the control plane enforces. */
@@ -388,10 +384,8 @@ test("giving up on attach does not poison the driver for later turns", async () 
 /* ── Making a refusal legible ──────────────────────────────────────────── */
 
 /**
- * A hit sandbox cap reached the user as `Agent run failed (submission sub_…)
- * (code: AGENT_ERROR)` and the log as `SandboxRequestError: Limit reached
- * (HTTP 402)`. Neither named which of the three caps was hit, that a
- * conversation holds a sandbox for its lifetime, or what to do about it.
+ * A hit cap reached the user as `AGENT_ERROR` and the log as "Limit reached",
+ * naming none of the three caps behind that status.
  */
 const devEnv = env({ ASTRO_AUTHZ_TOKEN: `h.${Buffer.from(JSON.stringify({ iss: "https://x", typ: "dev" })).toString("base64url")}.s` });
 const deployEnv = env({ ASTRO_AUTHZ_TOKEN: `h.${Buffer.from(JSON.stringify({ iss: "https://x" })).toString("base64url")}.s` });

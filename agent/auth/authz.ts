@@ -20,20 +20,14 @@
  * Local dev: allowed with no userId, so callers fall back to the bridge_uid
  * cookie and devs aren't blocked. See docs.astropods.com/manual-authz.
  *
- * THAT USED TO FOLLOW FROM THE TOKEN BEING ABSENT, and no longer does.
- * Declaring a `sandbox` section makes `ast project start` mint a DEV-SESSION
- * token and inject it as ASTRO_AUTHZ_TOKEN, so the variable is now set locally
- * — and treating it as a deployment credential locked every developer out of
- * the frontend with a themed 401. There is no ALB in front of local dev, so
- * the identity is always anonymous, and the grants table has nothing to say
- * about a request the platform never routed.
+ * That used to follow from the token being absent. Declaring a `sandbox`
+ * section makes `ast project start` inject a DEV-SESSION token, and treating
+ * that as a deployment credential locked developers out with a 401: there is
+ * no ALB locally, so the identity is anonymous and the grants table has
+ * nothing to say about it.
  *
- * The two token kinds are distinguishable, which is what makes this safe to
- * detect rather than guess: a dev session carries `typ: "dev"` and a deploy
- * token carries no `typ` at all (astropods/astro#2724 — `Verify` refuses a
- * token that carries one, `VerifyDevSession` refuses one that does not). So a
- * dev session authenticates THE DEVELOPER for sandbox attach, and is not a
- * deployment credential for authorizing other people's web requests.
+ * The kinds are distinguishable rather than guessable — a dev session carries
+ * `typ: "dev"`, a deploy token carries none (astropods/astro#2724).
  */
 
 /**
@@ -94,13 +88,7 @@ export function oidcEmail(req: HeaderBearing): string {
   return claims.email_verified ? ((claims.email as string) ?? "") : "";
 }
 
-/**
- * Which credential the platform injected, if any.
- *
- * Shared with the sandbox code because the two token kinds carry different
- * sandbox caps, and a refusal is only actionable if the message names the cap
- * that was actually hit.
- */
+/** Which credential the platform injected. The two kinds carry different sandbox caps. */
 export function tokenKind(env: NodeJS.ProcessEnv = process.env): "dev" | "deploy" | "none" {
   const token = env.ASTRO_AUTHZ_TOKEN;
   if (!token) return "none";
@@ -122,12 +110,8 @@ export class Authorizer {
   }
 
   /**
-   * True when the platform injected a DEPLOY token (i.e. a real deployment).
-   *
-   * A dev-session token is deliberately not enough. It is minted for the
-   * developer so their local agent can attach a sandbox, and authorizing web
-   * requests against it asks the grants table about an anonymous caller the
-   * platform never routed — which denies, and fails closed into a 401.
+   * True only for a DEPLOY token. A dev session is minted so a local agent can
+   * attach a sandbox, not to authorize anyone else's web request.
    */
   get enabled(): boolean {
     return Boolean(this.token && this.issuer) && !this.devSession;

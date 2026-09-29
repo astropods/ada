@@ -333,10 +333,8 @@ export class SessionRunner {
       // caller (messaging) still sees it. The background caller swallows it,
       // having already had it delivered over the stream.
       //
-      // Prefer an explained sandbox refusal over the top-level message. Flue
-      // wraps a turn failure, so `e.message` is `Agent run failed (submission
-      // …)` and the reason sits in a `cause` — which is how a hit sandbox cap
-      // reached a user as `AGENT_ERROR` and told them nothing.
+      // Flue wraps a turn failure, so the reason sits in a `cause` — which is
+      // how a hit sandbox cap reached the user as a bare `AGENT_ERROR`.
       this.failTurn(instanceId, explainSandboxFailure(e) ?? (e as Error).message);
       throw e;
     }
@@ -360,18 +358,13 @@ export class SessionRunner {
     let sandboxCwd = cwd;
     let remote: SessionEnvRemote | undefined;
 
-    // Routed here, not at the HTTP edge, because only the runner knows which
-    // sandbox this session has — and a non-image upload has to be written
-    // where the agent's tools will look for it, which the branches below
-    // settle (local dir vs remote subdir).
+    // Routed here, not at the HTTP edge: a non-image upload has to land where
+    // the agent's tools look, which the branches below settle.
     const routedUploads = opts.uploads?.length ? routeUploads(opts.uploads) : null;
 
     if (mode !== "local") {
-      // Isolated execution: the checkout lives outside this process, and every
-      // path the agent sees is relative to its own workspace there.
-      //
-      // A container address doubles as the discriminator below — non-null is
-      // exactly container mode — so the two destinations need no second flag.
+      // The checkout lives outside this process. A container address doubles as
+      // the discriminator below: non-null is exactly container mode.
       const containerUrl = mode === "container" ? sandboxHost() : null;
       if (mode === "container" && !containerUrl) {
         throw new Error(
@@ -382,8 +375,7 @@ export class SessionRunner {
       const token = process.env.SANDBOX_TOKEN;
       const env = sandboxEnv({ githubToken });
 
-      // Built on first need, and once: a turn with no repo and no uploads
-      // never has to touch the sandbox from here at all.
+      // On first need only: a turn with no repo and no uploads never touches it.
       let driver: SandboxDriver | undefined;
       const sandboxDriver = (): SandboxDriver =>
         (driver ??= containerUrl
