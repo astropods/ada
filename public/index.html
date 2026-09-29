@@ -505,11 +505,12 @@ function openConversation(c){
    live tail both authorize on it. */
 function openWatchFromUrl(){
   const id = new URLSearchParams(location.search).get("watch");
-  if (!id) return false;
-  history.replaceState(null, "", location.pathname);
+  if (!id) return;
+  // Strip the id only once the conversation is actually open, so a failure
+  // leaves a reloadable URL rather than a bare frontend.
   openConversation({ sessionId: id, kind: "slack" });
+  history.replaceState(null, "", location.pathname);
   note("Following this run — read-only. It updates as Ada works.");
-  return true;
 }
 
 $("review-btn").addEventListener("click", (e) => {
@@ -523,9 +524,7 @@ document.addEventListener("click", (e) => {
 });
 initReview();
 
-// A watch link takes precedence over the welcome banner: the whole point is to
-// land straight on the run.
-if (!openWatchFromUrl()) renderWelcome();
+renderWelcome();  // show the ASCII banner on first load (cleared once a turn starts)
 
 // ---- Token / cost display ---------------------------------------------------
 function fmtTokens(n){
@@ -872,6 +871,9 @@ $("composer").addEventListener("submit", async (e) => {
 
 $("disconnect").addEventListener("click", () => { if (es){ es.close(); setConn("disconnected"); } });
 $("reconnect").addEventListener("click", () => { if (sessionId) connect(lastEventId != null ? Number(lastEventId) : -1); });
+// Last: `openConversation` touches state declared throughout this script, so a
+// watch link can only be opened once all of it exists.
+openWatchFromUrl();
 </script>
 </body>
 </html>
