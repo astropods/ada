@@ -262,3 +262,48 @@ test("the factory roots the sandbox at the checkout when there is one", async ()
   await astro({ client: root.client }).createSandbox({ id: "sess_1" } as never);
   expect(root.mkdirs).toEqual([`mkdir -p -- '${SANDBOX_ROOT}'`]);
 });
+
+/* ── Which sandbox runs the commands ───────────────────────────────────── */
+
+const env = (o: Record<string, string>) => o as unknown as NodeJS.ProcessEnv;
+
+test("selection still follows what the platform injected, when nothing asks otherwise", async () => {
+  const { sandboxMode } = await import("../agent/session/sandbox-mode.ts");
+  // Unchanged behaviour for every deployment that predates this switch.
+  expect(sandboxMode(env({ KNOWLEDGE_SANDBOX_HOST: "sandbox" }))).toBe("container");
+  expect(sandboxMode(env({}))).toBe("local");
+  // An unrecognised value falls through rather than inventing a fourth mode.
+  expect(sandboxMode(env({ ADA_SANDBOX: "microvm", KNOWLEDGE_SANDBOX_HOST: "sandbox" }))).toBe("container");
+});
+
+test("the platform sandbox is opt-in, so a rollout can be reversed without a revert", async () => {
+  const { sandboxMode } = await import("../agent/session/sandbox-mode.ts");
+  expect(sandboxMode(env({ ADA_SANDBOX: "astro", ASTRO_AUTHZ_TOKEN: "t" }))).toBe("astro");
+  // Set alongside the container, the override wins — that is the whole point.
+  expect(sandboxMode(env({ ADA_SANDBOX: "astro", KNOWLEDGE_SANDBOX_HOST: "sandbox" }))).toBe("astro");
+  expect(sandboxMode(env({ ADA_SANDBOX: "container", KNOWLEDGE_SANDBOX_HOST: "sandbox" }))).toBe("container");
+  expect(sandboxMode(env({ ADA_SANDBOX: " ASTRO ", ASTRO_AUTHZ_TOKEN: "t" })), "case and spacing").toBe("astro");
+});
+
+test("asking for the platform sandbox without a token does NOT fall back to in-process", async () => {
+  const { sandboxMode, describeSandbox } = await import("../agent/session/sandbox-mode.ts");
+  // Falling back would run the model's commands in the control plane, holding
+  // the database credentials, the App secret and the HMAC key. A
+  // misconfiguration must not be able to switch the boundary off — the turn
+  // fails on the client's own error instead.
+  expect(sandboxMode(env({ ADA_SANDBOX: "astro" }))).toBe("astro");
+  expect(describeSandbox(env({ ADA_SANDBOX: "astro" }))).toContain("NO ASTRO_AUTHZ_TOKEN");
+});
+
+test("local can be forced, since that is the one downgrade worth making explicit", async () => {
+  const { sandboxMode } = await import("../agent/session/sandbox-mode.ts");
+  expect(sandboxMode(env({ ADA_SANDBOX: "local", KNOWLEDGE_SANDBOX_HOST: "sandbox" }))).toBe("local");
+});
+
+test("startup names the boundary, in the words an operator needs", async () => {
+  const { describeSandbox } = await import("../agent/session/sandbox-mode.ts");
+  expect(describeSandbox(env({ ADA_SANDBOX: "astro", ASTRO_AUTHZ_TOKEN: "t" }))).toContain("MicroVM");
+  expect(describeSandbox(env({ KNOWLEDGE_SANDBOX_HOST: "sandbox" }))).toContain("container at http://sandbox");
+  expect(describeSandbox(env({})), "local is not a boundary and should not read like one")
+    .toContain("not an isolation boundary");
+});

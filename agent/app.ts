@@ -63,6 +63,7 @@ import { InMemoryResultStore } from "./persistence/results.ts";
 import { createStore, type Store } from "./store/index.ts";
 import { persistenceMode } from "./db.ts";
 import { describePg } from "./store/pg-config.ts";
+import { describeSandbox } from "./session/sandbox-mode.ts";
 import { authorizeUrl, exchangeCode, listConnectedRepos } from "./auth/github-app.ts";
 import { githubConfigured, getAppCreds, saveAppCreds, loadAppCreds } from "./auth/app-config.ts";
 import {
@@ -127,6 +128,10 @@ function boot(): Promise<void> {
     runner.start();
 
     console.log(`[ada] ${describeAuth()}`);
+    // Which sandbox, on the same line as the other boundaries, because "where
+    // do the model's commands actually run" is the first thing to check when a
+    // deployment behaves unexpectedly.
+    console.log(`[ada] sandbox: ${describeSandbox()}`);
     console.log(
       persistenceMode() === "postgres"
         ? `[ada] conversations: postgres ${describePg()} — durable across restarts`

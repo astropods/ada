@@ -38,6 +38,7 @@ import {
 } from "@flue/runtime";
 import { local } from "@flue/runtime/node";
 import { remote } from "../session/remote-sandbox.ts";
+import { astro } from "../session/astro-sandbox.ts";
 import type { AgentProps } from "@flue/runtime";
 import { getSessionEnv } from "./session-env.ts";
 import { checkoutRepo } from "./tools.ts";
@@ -109,10 +110,12 @@ export function Ada({ id }: AgentProps) {
   // Either way the env is scrubbed to an allowlist plus — only when the user
   // has connected — their GH_TOKEN, so `bash` → `env` cannot read the
   // container's AWS/database/gateway credentials.
-  if (env.remote) {
-    // No `cwd` option here: the factory resolves the sandbox's own absolute
-    // workspace path and roots the sandbox there. Passing a second, relative
-    // cwd is what broke every tool with "path escapes the workspace: /".
+  // No `cwd` option on either remote factory: each resolves the sandbox's own
+  // absolute workspace path and roots the sandbox there. Passing a second,
+  // relative cwd is what broke every tool with "path escapes the workspace: /".
+  if (env.remote?.kind === "astro") {
+    useSandbox(astro({ env: env.sandboxEnv, subdir: env.remote.subdir }));
+  } else if (env.remote) {
     useSandbox(remote({
       baseUrl: env.remote.baseUrl,
       token: env.remote.token,

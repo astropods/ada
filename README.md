@@ -681,6 +681,21 @@ The switch is automatic. The platform injects `KNOWLEDGE_SANDBOX_HOST` when
 execution there; with no sandbox service, Ada falls back to Flue's in-process
 `local()` sandbox, which is how `node agent/index.ts` and `flue run` work.
 
+**Three modes, while the platform sandbox is being proven.** `ADA_SANDBOX`
+picks one explicitly — `astro` for a platform MicroVM per conversation
+(`agent/session/astro-sandbox.ts`), `container` for the service above, `local`
+for in-process. Unset, the behaviour is exactly as it was: container when the
+platform injected one, local otherwise. So a deployment moves onto the MicroVM
+and back off again by changing one variable, and startup prints which boundary
+is live (`[ada] sandbox: …`).
+
+`ADA_SANDBOX=astro` with no `ASTRO_AUTHZ_TOKEN` does **not** fall back. Falling
+back would run the model's commands in the control-plane process, which holds
+the database credentials, the GitHub App secret and the HMAC signing key — a
+misconfiguration must not be able to turn the boundary off, so the turn fails
+instead. `ADA_SANDBOX=container` with no host injected refuses for the same
+reason.
+
 **What Flue changed about this.** The pre-rewrite version of the split was a
 Claude Code runner: it took a prompt, spawned `claude -p`, and streamed raw
 stream-json back over SSE — so it had to know about models, credentials, resume
