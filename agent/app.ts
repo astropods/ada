@@ -132,6 +132,7 @@ function boot(): Promise<void> {
     // do the model's commands actually run" is the first thing to check when a
     // deployment behaves unexpectedly.
     console.log(`[ada] sandbox: ${describeSandbox()}`);
+    console.log(`[ada] web authz: ${authorizer.describe()}`);
     console.log(
       persistenceMode() === "postgres"
         ? `[ada] conversations: postgres ${describePg()} — durable across restarts`

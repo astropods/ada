@@ -17,9 +17,23 @@
  *      round-trip per request.
  *   5. Fail closed on error (deny), matching the sidecar.
  *
- * Local dev (`ast project start`): no ASTRO_AUTHZ_TOKEN and no ALB headers, so
- * we return allowed with no userId and let callers fall back to the bridge_uid
- * cookie — devs aren't blocked. See docs.astropods.com/manual-authz.
+ * Local dev: allowed with no userId, so callers fall back to the bridge_uid
+ * cookie and devs aren't blocked. See docs.astropods.com/manual-authz.
+ *
+ * THAT USED TO FOLLOW FROM THE TOKEN BEING ABSENT, and no longer does.
+ * Declaring a `sandbox` section makes `ast project start` mint a DEV-SESSION
+ * token and inject it as ASTRO_AUTHZ_TOKEN, so the variable is now set locally
+ * — and treating it as a deployment credential locked every developer out of
+ * the frontend with a themed 401. There is no ALB in front of local dev, so
+ * the identity is always anonymous, and the grants table has nothing to say
+ * about a request the platform never routed.
+ *
+ * The two token kinds are distinguishable, which is what makes this safe to
+ * detect rather than guess: a dev session carries `typ: "dev"` and a deploy
+ * token carries no `typ` at all (astropods/astro#2724 — `Verify` refuses a
+ * token that carries one, `VerifyDevSession` refuses one that does not). So a
+ * dev session authenticates THE DEVELOPER for sandbox attach, and is not a
+ * deployment credential for authorizing other people's web requests.
  */
 
 /**
@@ -83,17 +97,34 @@ export function oidcEmail(req: HeaderBearing): string {
 export class Authorizer {
   private readonly token: string;
   private readonly issuer: string;
+  /** A `typ: "dev"` token — the developer's own session, not a deployment. */
+  private readonly devSession: boolean;
   private readonly cache = new Map<string, { result: AuthzResult; expires: number }>();
 
   constructor(env: NodeJS.ProcessEnv = process.env) {
     this.token = env.ASTRO_AUTHZ_TOKEN ?? "";
     const payload = this.token ? decodeJwtPayload(this.token) : null;
     this.issuer = (payload?.iss as string) ?? "";
+    this.devSession = payload?.typ === "dev";
   }
 
-  /** True when the platform injected a deploy token (i.e. a real deployment). */
+  /**
+   * True when the platform injected a DEPLOY token (i.e. a real deployment).
+   *
+   * A dev-session token is deliberately not enough. It is minted for the
+   * developer so their local agent can attach a sandbox, and authorizing web
+   * requests against it asks the grants table about an anonymous caller the
+   * platform never routed — which denies, and fails closed into a 401.
+   */
   get enabled(): boolean {
-    return Boolean(this.token && this.issuer);
+    return Boolean(this.token && this.issuer) && !this.devSession;
+  }
+
+  /** Redacted summary for startup logging. Never includes the token. */
+  describe(): string {
+    if (this.enabled) return `enforced via ${this.issuer}`;
+    if (this.devSession) return "dev session — web access NOT gated (local development)";
+    return "not configured — web access NOT gated (local development)";
   }
 
   /**

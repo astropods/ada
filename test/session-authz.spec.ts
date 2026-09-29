@@ -216,3 +216,65 @@ test("without an admin list, the documented open posture is unchanged", async ({
   expect(await statusOn("/agents/ada/sess_whatever", { headers: as("user-a") })).not.toBe(403);
   expect(await statusOn(`/sessions/${theirs}`, { method: "DELETE", headers: as("user-a") })).toBe(204);
 });
+
+/* ── Which token kind gates the web UI ─────────────────────────────────── */
+
+/**
+ * `ASTRO_AUTHZ_TOKEN` carries two different credentials.
+ *
+ * A DEPLOY token is a deployment's identity, and web requests to it arrive
+ * through an ALB that has already established who the caller is — so the grants
+ * table is the right authority. A DEV-SESSION token is the developer's own,
+ * minted by `ast project start` so a local agent can attach a sandbox. There is
+ * no ALB in front of local dev, so every request is anonymous, and asking the
+ * grants table about it denies — which failed closed into a themed 401 and
+ * locked developers out of their own frontend.
+ *
+ * The kinds are distinguishable rather than guessable: a dev session carries
+ * `typ: "dev"`, a deploy token carries no `typ` (astropods/astro#2724).
+ */
+function token(claims: Record<string, unknown>): string {
+  const payload = Buffer.from(JSON.stringify(claims)).toString("base64url");
+  return `h.${payload}.sig`;
+}
+
+test("a deploy token gates the web UI", async () => {
+  const { Authorizer } = await import("../agent/auth/authz.ts");
+  const a = new Authorizer({ ASTRO_AUTHZ_TOKEN: token({ iss: "https://astropods.com", sub: "dep_1" }) } as NodeJS.ProcessEnv);
+  expect(a.enabled).toBe(true);
+  expect(a.describe()).toContain("enforced via https://astropods.com");
+});
+
+test("a dev-session token does NOT gate the web UI", async () => {
+  const { Authorizer } = await import("../agent/auth/authz.ts");
+  const a = new Authorizer({
+    ASTRO_AUTHZ_TOKEN: token({ iss: "https://astropods.com", sub: "sess_1", typ: "dev" }),
+  } as NodeJS.ProcessEnv);
+  // Declaring a `sandbox` section is enough to make this token appear locally,
+  // so treating it as a deployment credential is what broke the frontend.
+  expect(a.enabled).toBe(false);
+  expect(await a.authorize(""), "and the request is allowed, not denied").toMatchObject({ allowed: true });
+  expect(a.describe()).toContain("dev session");
+});
+
+test("no token at all still means ungated, as it always did", async () => {
+  const { Authorizer } = await import("../agent/auth/authz.ts");
+  const a = new Authorizer({} as NodeJS.ProcessEnv);
+  expect(a.enabled).toBe(false);
+  expect(await a.authorize("")).toMatchObject({ allowed: true });
+  expect(a.describe()).toContain("not configured");
+});
+
+test("a token with no issuer cannot gate anything, whatever its kind", async () => {
+  const { Authorizer } = await import("../agent/auth/authz.ts");
+  // `iss` is where the authorize call would be sent; without it there is
+  // nowhere to ask, so enforcing would deny every request with no recourse.
+  const a = new Authorizer({ ASTRO_AUTHZ_TOKEN: token({ sub: "dep_1" }) } as NodeJS.ProcessEnv);
+  expect(a.enabled).toBe(false);
+});
+
+test("the startup line never contains the token", async () => {
+  const { Authorizer } = await import("../agent/auth/authz.ts");
+  const secret = token({ iss: "https://astropods.com", sub: "dep_1" });
+  expect(new Authorizer({ ASTRO_AUTHZ_TOKEN: secret } as NodeJS.ProcessEnv).describe()).not.toContain(secret);
+});
