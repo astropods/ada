@@ -522,15 +522,23 @@ export class AdaMessagingAdapter implements AgentAdapter {
       hooks.onError(err);
     };
 
-    // Posted BEFORE the turn runs, and as a chunk rather than a status: a status
-    // is edited in place by the next one, and a link that vanishes on the first
-    // tool call is no use for following along.
+    // BOTH CHANNELS, deliberately. `onChunk` accumulates into the reply, which
+    // the thread only sees when the turn ends — so a link sent that way alone
+    // arrived exactly when it had stopped being useful. `onStatusUpdate` is the
+    // only hook that shows something WHILE the turn runs, which is the whole
+    // point; but it is edited in place by the next status, so the reply keeps a
+    // copy for anyone arriving after the run.
     try {
       const watchUrl = buildWatchUrl(
         options.userId,
         options.conversationId,
         await getServerSecret(this.store),
       );
+      hooks.onStatusUpdate?.({
+        status: "PROCESSING",
+        customMessage: `Working on it — follow along: ${watchUrl}`,
+        emoji: "\u{1F440}",
+      });
       hooks.onChunk(`\u{1F440} Follow along: ${watchUrl}\n\n`);
     } catch {
       // No base URL configured, so no link can be built. A turn must not fail

@@ -113,10 +113,17 @@ test("a run ending on an empty message falls back to the last real one", async (
   expect(cap.said()).toContain("Here is the answer.");
 });
 
-test("the follow-along link is posted, and before the answer", async () => {
+test("the follow-along link goes out live, not only with the reply", async () => {
+  // `onChunk` accumulates into the reply, which the thread sees only when the
+  // turn ENDS — a link delivered that way alone arrived exactly when it had
+  // stopped being useful. The status hook is the only one that shows during.
   const cap = capture();
   await new AdaMessagingAdapter(new InMemoryStore(), scriptedRunner(RUN)).stream("fix this", cap.hooks, opts());
-  expect(cap.chunks[0], "so it is there while the run is still going").toContain("/watch?link=");
+
+  expect(cap.statuses[0], "first thing the thread hears").toContain("/watch?link=");
+  // And kept in the reply for anyone arriving after the run, since the next
+  // status overwrites the live one.
+  expect(cap.chunks[0]).toContain("/watch?link=");
 });
 
 test("a slow sandbox says so, instead of leaving the thread silent", async () => {
