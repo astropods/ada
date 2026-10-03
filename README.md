@@ -181,8 +181,13 @@ Reads, aborts and attachment fetches over the native router are untouched.
 
 **Attachments split by MIME type, because Flue's delivery contract does.**
 Both turn endpoints take `multipart/form-data` alongside JSON; JSON stays the
-shape for a plain prompt, so the messaging adapter and external AG-UI clients
-are untouched. Images (`png`/`jpeg`/`gif`/`webp`) ride as native Flue
+shape for a plain prompt, so external AG-UI clients are untouched. The
+messaging adapter (Slack/web chat) reaches the same pipeline a different way:
+the sidecar stages non-image files on a shared volume and delivers images
+inline as a data URI, surfaced on `StreamOptions` as `attachments`/`images`
+rather than multipart — `agent/messaging/attachments.ts` converts both into
+the same `UploadInput` shape before handing them to `SessionRunner`. Images
+(`png`/`jpeg`/`gif`/`webp`) ride as native Flue
 attachments and the model *sees* them — that is the only attachment shape Flue
 accepts today. Everything else is written into the session sandbox at
 `uploads/<name>` and named in the prompt, which is both what Flue allows and
