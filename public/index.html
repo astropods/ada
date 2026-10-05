@@ -500,6 +500,19 @@ function openConversation(c){
   note(`Reviewing ${c.kind === "slack" ? "Slack" : "web"} conversation${c.repo ? " on " + c.repo : ""}${c.userId ? " · user " + c.userId : ""} — read-only`);
   connect(-1); // replay the whole conversation from the server buffer
 }
+/* A `?watch=<id>` link from chat opens that conversation read-only. The server
+   has already traded the signed link for a grant cookie, so the replay and the
+   live tail both authorize on it. */
+function openWatchFromUrl(){
+  const id = new URLSearchParams(location.search).get("watch");
+  if (!id) return;
+  // Strip the id only once the conversation is actually open, so a failure
+  // leaves a reloadable URL rather than a bare frontend.
+  openConversation({ sessionId: id, kind: "slack" });
+  history.replaceState(null, "", location.pathname);
+  note("Following this run — read-only. It updates as Ada works.");
+}
+
 $("review-btn").addEventListener("click", (e) => {
   e.stopPropagation();
   const menu = $("review-menu");
@@ -858,6 +871,9 @@ $("composer").addEventListener("submit", async (e) => {
 
 $("disconnect").addEventListener("click", () => { if (es){ es.close(); setConn("disconnected"); } });
 $("reconnect").addEventListener("click", () => { if (sessionId) connect(lastEventId != null ? Number(lastEventId) : -1); });
+// Last: `openConversation` touches state declared throughout this script, so a
+// watch link can only be opened once all of it exists.
+openWatchFromUrl();
 </script>
 </body>
 </html>

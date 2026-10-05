@@ -26,7 +26,13 @@ const SECRET_KEY = "hmac_secret";
 const LINK_TTL_MS = 10 * 60 * 1000;
 
 /** What a signed link authorizes: a per-user connect, or operator App setup. */
-export type LinkKind = "connect" | "setup";
+export type LinkKind = "connect" | "setup" | "watch";
+
+/**
+ * A watch link outlives a chat link because it is followed WHILE a turn runs,
+ * and a turn can take a long time. Still bounded: it is a bearer token.
+ */
+export const WATCH_TTL_MS = 2 * 60 * 60 * 1000;
 
 let cachedSecret: string | null = null;
 
@@ -65,8 +71,15 @@ function safeEqual(a: string, b: string): boolean {
  * than a chat link: that round-trip includes GitHub's install + repo-picker
  * screens, which a user can easily sit on for more than ten minutes.
  */
-export function mintLink(kind: LinkKind, userId: string, secret: string, ttlMs = LINK_TTL_MS): string {
-  const body = b64url(Buffer.from(JSON.stringify({ k: kind, u: userId, e: Date.now() + ttlMs })));
+export function mintLink(
+  kind: LinkKind,
+  userId: string,
+  secret: string,
+  ttlMs = LINK_TTL_MS,
+  sessionId?: string,
+): string {
+  const claims = { k: kind, u: userId, e: Date.now() + ttlMs, ...(sessionId ? { s: sessionId } : {}) };
+  const body = b64url(Buffer.from(JSON.stringify(claims)));
   const mac = b64url(createHmac("sha256", secret).update(body).digest());
   return `${body}.${mac}`;
 }
@@ -77,7 +90,18 @@ export function mintLink(kind: LinkKind, userId: string, secret: string, ttlMs =
  * endpoint (which would let any user provision the App) or vice versa. Returns
  * the bound userId, or null.
  */
-export function verifyLink(token: string | null | undefined, kind: LinkKind, secret: string): string | null {
+export interface LinkClaims {
+  userId: string;
+  /** Present on a link scoped to one conversation, e.g. a watch link. */
+  sessionId?: string;
+}
+
+/** As `verifyLink`, but also returns what the token was scoped to. */
+export function verifyLinkClaims(
+  token: string | null | undefined,
+  kind: LinkKind,
+  secret: string,
+): LinkClaims | null {
   if (!token) return null;
   const dot = token.lastIndexOf(".");
   if (dot < 0) return null;
@@ -86,16 +110,18 @@ export function verifyLink(token: string | null | undefined, kind: LinkKind, sec
   const expected = b64url(createHmac("sha256", secret).update(body).digest());
   if (!safeEqual(mac, expected)) return null;
   try {
-    const { k, u, e } = JSON.parse(Buffer.from(body.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8")) as {
-      k?: string;
-      u?: string;
-      e?: number;
-    };
+    const { k, u, e, s } = JSON.parse(
+      Buffer.from(body.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"),
+    ) as { k?: string; u?: string; e?: number; s?: string };
     if (k !== kind || typeof u !== "string" || typeof e !== "number" || e <= Date.now()) return null;
-    return u;
+    return { userId: u, sessionId: typeof s === "string" ? s : undefined };
   } catch {
     return null;
   }
+}
+
+export function verifyLink(token: string | null | undefined, kind: LinkKind, secret: string): string | null {
+  return verifyLinkClaims(token, kind, secret)?.userId ?? null;
 }
 
 /**
@@ -109,4 +135,21 @@ export function verifyLink(token: string | null | undefined, kind: LinkKind, sec
 export function buildConnectUrl(userId: string, secret: string, baseUrl?: string): string {
   const base = baseUrl ?? resolveBaseUrl();
   return `${base}/auth/github/login?link=${encodeURIComponent(mintLink("connect", userId, secret))}`;
+}
+
+/**
+ * Link a chat user follows to watch their own turn run, read-only.
+ *
+ * Scoped to ONE conversation as well as the user, so a leaked link exposes the
+ * conversation it was minted for and nothing else the user owns.
+ */
+export function buildWatchUrl(
+  userId: string,
+  sessionId: string,
+  secret: string,
+  baseUrl?: string,
+): string {
+  const base = baseUrl ?? resolveBaseUrl();
+  const token = mintLink("watch", userId, secret, WATCH_TTL_MS, sessionId);
+  return `${base}/watch?link=${encodeURIComponent(token)}`;
 }

@@ -35,7 +35,7 @@ import {
   remoteSandboxDriver,
   sandboxHost,
 } from "./remote-sandbox.ts";
-import { astroSandboxDriver, explainSandboxFailure } from "./astro-sandbox.ts";
+import { astroSandboxDriver, explainSandboxFailure, type AstroDriver } from "./astro-sandbox.ts";
 import { sandboxMode } from "./sandbox-mode.ts";
 import type { SandboxDriver } from "@flue/runtime";
 import {
@@ -59,6 +59,9 @@ import {
 import type { Store } from "../store/store.ts";
 import type { AguiEvent } from "../types/agui.ts";
 import type { SessionEnv } from "../agents/session-env.ts";
+
+/** How long a sandbox may take to come up before the user is told about it. */
+const SANDBOX_WARMING_NOTICE_MS = Number(process.env.ADA_SANDBOX_NOTICE_MS ?? 4_000);
 
 type SessionEnvRemote = NonNullable<SessionEnv["remote"]>;
 
@@ -382,13 +385,27 @@ export class SessionRunner {
           ? remoteSandboxDriver({ baseUrl: containerUrl, id: instanceId, token, env })
           : astroSandboxDriver({ id: instanceId, env }));
 
-      let subdir: string | undefined;
+      let subdir: string | undefined = opts.repo ? undefined : getCheckoutDir(instanceId);
+
+      // Attach BEFORE the turn rather than letting Flue do it on the first tool
+      // call, so a slow one can be reported while it happens — a first attach
+      // installs the declaration, which takes minutes, and the thread would
+      // otherwise sit silent for all of it. Flue's own attach later is a cache
+      // hit inside the client, keyed by sandbox name.
+      //
+      // ONLY WHEN THE TURN WILL USE IT. "What is the retry policy?" needs no
+      // sandbox, and making it wait on one — or hold a slot against a cap of
+      // 20 per deployment — would be a cost with nothing bought. A turn that
+      // asks for a repo, carries uploads, or resumes into an existing checkout
+      // is going to touch it; one that does none of those may never, and if it
+      // does, Flue attaches on the first tool call exactly as before.
+      const willUseSandbox = Boolean(opts.repo || routedUploads?.files.length || subdir);
+      if (!containerUrl && willUseSandbox) {
+        await this.warmSandbox(instanceId, astroSandboxDriver({ id: instanceId, env }));
+      }
+
       if (opts.repo) {
         subdir = (await ensureRepoInSandbox(sandboxDriver(), opts.repo, { githubToken })).dir;
-      } else {
-        // A repo the agent cloned itself on an earlier turn, so the next turn
-        // is rooted inside it and Flue's AGENTS.md discovery sees the project.
-        subdir = getCheckoutDir(instanceId);
       }
       if (routedUploads?.files.length) {
         await writeUploadsRemote(sandboxDriver(), routedUploads.files, subdir);
@@ -477,6 +494,34 @@ export class SessionRunner {
       }
     }
     this.registry.setStatus(instanceId, "errored");
+  }
+
+  /**
+   * Wait for the sandbox, telling the user if it is taking a while.
+   *
+   * Silent when the sandbox is already up, which is the common case — the
+   * notice only fires if attach is still going after a few seconds, so a warm
+   * conversation says nothing.
+   */
+  private async warmSandbox(instanceId: string, driver: AstroDriver): Promise<void> {
+    const notify = setTimeout(() => {
+      this.emit(instanceId, {
+        type: "CUSTOM",
+        name: "sandbox_warming",
+        value: { message: "Starting your sandbox — a first run installs its toolchain, so this takes a few minutes." },
+      });
+    }, SANDBOX_WARMING_NOTICE_MS);
+    try {
+      await driver.attach();
+    } finally {
+      clearTimeout(notify);
+    }
+  }
+
+  /** Record an event and hand it to the live listener, as the failure path does. */
+  private emit(instanceId: string, event: AguiEvent): void {
+    this.registry.append(instanceId, event);
+    this.sessions.get(instanceId)?.hooks?.onAguiEvent?.(event);
   }
 
   /** Emit a terminal AG-UI event if the delivery did not produce one itself. */

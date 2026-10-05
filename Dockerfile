@@ -11,7 +11,12 @@ FROM node:24-slim
 # They remain so `node agent/index.ts` works locally with no sandbox service.
 # NOTE: no inline `#` comments inside this RUN — line continuations collapse to
 # one shell line and a `#` would comment out the rest.
+# `upgrade` before anything else: the base image is a snapshot, and a scan sees
+# whatever Debian shipped the day it was cut. Without this, libexpat1,
+# libpcre2 and tzdata stayed on the versions the snapshot froze even though
+# patched ones were in the repository.
 RUN apt-get update \
+ && apt-get upgrade -y \
  && apt-get install -y --no-install-recommends git curl ca-certificates \
  && mkdir -p -m 755 /etc/apt/keyrings \
  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
@@ -41,8 +46,31 @@ ENV NODE_ENV=production \
 # Runtime deps now include the Flue runtime and its model layer, so this is no
 # longer an "only @opentelemetry/api" install. devDeps (typescript, vite,
 # playwright, @ag-ui/core) are still not needed at runtime.
-COPY package.json ./
-RUN npm install --omit=dev --no-audit --no-fund
+# LOCKFILE-DRIVEN, so the image's dependency versions are the ones reviewed
+# here. This previously ran `npm install` from package.json alone — bun.lock
+# was never copied — so every build re-resolved and the deployed versions were
+# whatever npm picked that day. A CVE scan could regress with no commit behind
+# it, and the only way to know what shipped was to build and look inside.
+#
+# bun, because bun.lock is this repo's real lockfile; `--frozen-lockfile` fails
+# the build rather than silently resolving if the two drift apart.
+COPY package.json bun.lock ./
+RUN npm install -g bun@1.3.9 --no-audit --no-fund \
+ && bun install --frozen-lockfile --production \
+ && rm -rf /root/.bun/install/cache \
+ # npm and bun are BUILD-TIME tools: the entrypoint is `node agent/index.ts`,
+ # and the model's commands run in the sandbox, not here. Removing them takes
+ # their bundled dependencies out of the image too — npm's own brace-expansion
+ # has advisories that no released npm has picked up, so upgrading cannot
+ # reach them.
+ #
+ # The cost: a `local()` sandbox in this image can run neither. Production does
+ # not use that path — it is the in-process fallback this project warns is not
+ # an isolation boundary.
+ && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx \
+           /usr/local/lib/node_modules/bun /usr/local/bin/bun /usr/local/bin/bunx \
+           /usr/local/lib/node_modules/corepack /usr/local/bin/corepack \
+           /root/.npm /root/.bun
 
 COPY agent ./agent
 COPY fixtures ./fixtures

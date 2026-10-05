@@ -26,13 +26,16 @@
     "@flue/vite": "2.0.3",
     "@hono/node-server": "^2.1.1",
     "@opentelemetry/api": "^1.9.0",
-    "@opentelemetry/exporter-metrics-otlp-proto": "0.217.0",
-    "@opentelemetry/exporter-trace-otlp-proto": "0.217.0",
+    "@opentelemetry/exporter-metrics-otlp-proto": "0.222.0",
+    "@opentelemetry/exporter-trace-otlp-proto": "0.222.0",
     "@opentelemetry/sdk-metrics": "^2.0.0",
-    "@opentelemetry/sdk-node": "0.217.0",
+    "@opentelemetry/sdk-node": "0.222.0",
     "hono": "^4.13.2",
     "pg": "^8.13.0",
     "valibot": "^1.4.2"
+  },
+  "overrides": {
+    "ip-address": "^10.7.3"
   },
   "devDependencies": {
     "@ag-ui/core": "^0.0.42",
@@ -47,7 +50,7 @@
     "runtime": "Node >=23 runs the .ts sources natively (type stripping), so `npm start` needs no build step. `vite build` produces the optimized Flue Node server for the image.",
     "@earendil-works/pi-ai": "Flue's model layer. Imported DIRECTLY (not just transitively) because agent/config/model.ts builds a custom provider for the Astro AI Gateway with createProvider().",
     "@ag-ui/core": "PINNED reference for validating emitted AG-UI events against the canonical Zod schemas in CI. Local types in agent/types/agui.ts mirror it.",
-    "@astropods/adapter-core": "RANGE-pinned, not \"latest\". The Dockerfile installs from package.json with no lockfile, so \"latest\" resolved fresh at image build while local dev stayed on whatever the lockfile pinned — the container was on 0.10.0 with getThreadHistory() while dev was on 0.8.0 without it. Develop against the same messaging contract you deploy.",
-    "@opentelemetry/api": "Optional at runtime — telemetry degrades to no-op if absent. The OTLP SDK/exporter is provided out-of-process by the astropods telemetry adapter."
+    "@astropods/adapter-core": "RANGE-pinned, not \"latest\". The Dockerfile installs from package.json with no lockfile, so \"latest\" resolved fresh at image build while local dev stayed on whatever the lockfile pinned \u2014 the container was on 0.10.0 with getThreadHistory() while dev was on 0.8.0 without it. Develop against the same messaging contract you deploy.",
+    "@opentelemetry/api": "Optional at runtime \u2014 telemetry degrades to no-op if absent. The OTLP SDK/exporter is provided out-of-process by the astropods telemetry adapter."
   }
 }

@@ -35,7 +35,7 @@ import type { SessionRunner } from "../session/runner.ts";
 import { checkUploadLimits } from "../session/uploads.ts";
 import type { Store } from "../store/store.ts";
 import { githubConfigured } from "../auth/app-config.ts";
-import { getServerSecret, buildConnectUrl } from "../auth/connect.ts";
+import { getServerSecret, buildConnectUrl, buildWatchUrl } from "../auth/connect.ts";
 import { readAttachments } from "./attachments.ts";
 
 const HINT_NS = "gh_connect_hint"; // conversationId -> "1" once the connect hint has been shown
@@ -166,6 +166,12 @@ type ThreadMessageLike = { timestamp?: { seconds?: string | number; nanos?: numb
 function isPrivate(options: StreamOptions): boolean {
   const ctx = options.platformContext as { eventKind?: string } | undefined;
   return !ctx || ctx.eventKind === "EVENT_KIND_DM";
+}
+
+/** A status line from a narration message: its first sentence, bounded. */
+function firstLine(text: string, max = 80): string {
+  const line = text.trim().split("\n").find((l) => l.trim()) ?? "";
+  return line.length > max ? `${line.slice(0, max - 1).trimEnd()}…` : line;
 }
 
 export class AdaMessagingAdapter implements AgentAdapter {
@@ -487,10 +493,20 @@ export class AdaMessagingAdapter implements AgentAdapter {
         .catch(() => {});
     };
 
+    // The assistant message being accumulated, and the last COMPLETE one —
+    // which is the answer. Keeping the last non-empty rather than simply the
+    // last means a run that ends on an empty message still replies.
+    let message = "";
+    let reply = "";
+
     let settled = false;
     const finish = () => {
       if (settled) return;
       settled = true;
+      // An unterminated message (no TEXT_MESSAGE_END before the run closed)
+      // is still the answer if it is all there is.
+      if (message.trim()) reply = message;
+      if (reply.trim()) hooks.onChunk(reply);
       commitThreadContext();
       if (hintUrl) {
         hooks.onChunk(
@@ -505,6 +521,29 @@ export class AdaMessagingAdapter implements AgentAdapter {
       settled = true;
       hooks.onError(err);
     };
+
+    // BOTH CHANNELS, deliberately. `onChunk` accumulates into the reply, which
+    // the thread only sees when the turn ends — so a link sent that way alone
+    // arrived exactly when it had stopped being useful. `onStatusUpdate` is the
+    // only hook that shows something WHILE the turn runs, which is the whole
+    // point; but it is edited in place by the next status, so the reply keeps a
+    // copy for anyone arriving after the run.
+    try {
+      const watchUrl = buildWatchUrl(
+        options.userId,
+        options.conversationId,
+        await getServerSecret(this.store),
+      );
+      hooks.onStatusUpdate?.({
+        status: "PROCESSING",
+        customMessage: `Working on it — follow along: ${watchUrl}`,
+        emoji: "\u{1F440}",
+      });
+      hooks.onChunk(`\u{1F440} Follow along: ${watchUrl}\n\n`);
+    } catch {
+      // No base URL configured, so no link can be built. A turn must not fail
+      // for want of a convenience.
+    }
 
     try {
       await this.runner.continueSession(
@@ -541,7 +580,36 @@ export class AdaMessagingAdapter implements AgentAdapter {
             if (settled) return;
             switch (e.type) {
               case EventType.TEXT_MESSAGE_CONTENT:
-                hooks.onChunk(e.delta);
+                message += e.delta;
+                break;
+              case EventType.TEXT_MESSAGE_END:
+                // Every assistant message except the last one is narration
+                // between tool calls. Streaming those into the thread is what
+                // buried the actual answer under "Let me read the ticket…",
+                // "Let me find…", "Now let me check…" for the length of a run.
+                // They become a transient status instead, which the next one
+                // replaces, and the reply keeps only the final message.
+                if (message.trim()) {
+                  reply = message;
+                  hooks.onStatusUpdate?.({
+                    status: "PROCESSING",
+                    customMessage: firstLine(message),
+                    emoji: "💭",
+                  });
+                }
+                message = "";
+                break;
+              case EventType.CUSTOM:
+                // The runner's own progress signals — a sandbox still coming up
+                // is the one that matters, because it is minutes of silence
+                // before any tool call gives the user something to look at.
+                if (e.name === "sandbox_warming") {
+                  hooks.onStatusUpdate?.({
+                    status: "PROCESSING",
+                    customMessage: String((e.value as { message?: string })?.message ?? "Starting your sandbox…"),
+                    emoji: "📦",
+                  });
+                }
                 break;
               case EventType.TOOL_CALL_START:
                 hooks.onStatusUpdate?.({
