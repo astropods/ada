@@ -324,3 +324,28 @@ test("a real deployment still enforces the allowlist", async () => {
   expect(isAdmin("someone@else.com", deployed), "not on the list").toBe(false);
   expect(isAdmin("", deployed), "no verified email is not an admin").toBe(false);
 });
+
+test("a signed-in caller is judged on the allowlist even without a deploy token", async () => {
+  const { isAdmin } = await import("../agent/auth/setup.ts");
+  // The hardening: only an ALB supplies this email, so its presence is
+  // per-request evidence of a real deployment that does not depend on the
+  // token being there. An exposed deployment that somehow lost its token still
+  // refuses a non-admin, instead of handing admin to everyone.
+  const tokenless = { ADMIN_EMAILS: "simon@example.com" } as NodeJS.ProcessEnv;
+  expect(isAdmin("someone@else.com", tokenless), "presented an identity, so it is judged").toBe(false);
+  expect(isAdmin("simon@example.com", tokenless)).toBe(true);
+  // Only a caller with NO identity at all gets the local default.
+  expect(isAdmin("", tokenless)).toBe(true);
+});
+
+test("startup says so when anyone unauthenticated is admin", async () => {
+  const { describeAdmin } = await import("../agent/auth/setup.ts");
+  expect(describeAdmin({ ADMIN_EMAILS: "a@b.c" } as NodeJS.ProcessEnv)).toContain("ADA_LOCAL_ADMIN=0");
+  expect(
+    describeAdmin({
+      ADMIN_EMAILS: "a@b.c",
+      ASTRO_AUTHZ_TOKEN: token({ iss: "https://astropods.com", sub: "dep_1" }),
+    } as NodeJS.ProcessEnv),
+  ).toContain("ADMIN_EMAILS");
+  expect(describeAdmin({} as NodeJS.ProcessEnv)).toContain("local run");
+});

@@ -68,8 +68,7 @@ import { authorizeUrl, exchangeCode, listConnectedRepos } from "./auth/github-ap
 import { githubConfigured, getAppCreds, saveAppCreds, loadAppCreds } from "./auth/app-config.ts";
 import {
   verifyState, buildManifest, convertManifestCode, renderManifestForm,
-  isAdmin, adminListConfigured, canProvision,
-} from "./auth/setup.ts";
+  isAdmin, adminListConfigured, canProvision, describeAdmin } from "./auth/setup.ts";
 import { getServerSecret, mintLink, verifyLink } from "./auth/connect.ts";
 import { resolveBaseUrl } from "./auth/base-url.ts";
 import { Authorizer, oidcIdentity, oidcEmail, type AuthzResult } from "./auth/authz.ts";
@@ -131,6 +130,8 @@ function boot(): Promise<void> {
     // "Where do the model's commands run" is the first thing to check.
     console.log(`[ada] sandbox: ${describeSandbox()}`);
     console.log(`[ada] web authz: ${authorizer.describe()}`);
+    // Never silent: "anyone unauthenticated is admin here" has to be visible.
+    console.log(`[ada] admin: ${describeAdmin()}`);
     console.log(
       persistenceMode() === "postgres"
         ? `[ada] conversations: postgres ${describePg()} — durable across restarts`
