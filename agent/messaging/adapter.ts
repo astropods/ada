@@ -32,9 +32,11 @@ import type { AgentAdapter, StreamHooks, StreamOptions } from "@astropods/adapte
 import { EventType } from "../types/agui.ts";
 import { parseRepoSpec, type RepoSpec } from "../session/repo.ts";
 import type { SessionRunner } from "../session/runner.ts";
+import { checkUploadLimits } from "../session/uploads.ts";
 import type { Store } from "../store/store.ts";
 import { githubConfigured } from "../auth/app-config.ts";
 import { getServerSecret, buildConnectUrl } from "../auth/connect.ts";
+import { readAttachments } from "./attachments.ts";
 
 const HINT_NS = "gh_connect_hint"; // conversationId -> "1" once the connect hint has been shown
 const REPO_NS = "conv_repo"; // conversationId -> { owner, repo } bound to this thread
@@ -433,6 +435,22 @@ export class AdaMessagingAdapter implements AgentAdapter {
       return;
     }
 
+    // Validated before directive parsing so a file attached to this message
+    // is checked the same way regardless of what the message text says. A
+    // limit violation refuses the WHOLE turn (same tier as runDirective's
+    // informational replies, not hooks.onError — that's for an actual failed
+    // run) rather than silently dropping the offending file: an agent that
+    // answered confidently about an attachment it never got is worse than a
+    // turn that didn't run. A bare directive still validates its attachments,
+    // but discards them if valid — directives never reach continueSession.
+    const uploads = await readAttachments(options.attachments, options.images);
+    const uploadError = checkUploadLimits(uploads);
+    if (uploadError) {
+      hooks.onChunk(uploadError);
+      hooks.onFinish();
+      return;
+    }
+
     const directive = parseDirective(prompt);
     if (directive) {
       await this.runDirective(directive, hooks, options);
@@ -493,6 +511,7 @@ export class AdaMessagingAdapter implements AgentAdapter {
         options.conversationId,
         {
           prompt: contextualPrompt,
+          uploads,
           // The sidecar's userId is the key GitHub tokens are stored under and
           // the identity the run's trace is attributed to.
           userKey: options.userId,
