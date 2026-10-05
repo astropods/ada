@@ -47,6 +47,7 @@ import { githubPromptGuidance } from "../github-guidance.ts";
 import { injectRepoRules } from "./repo-rules.ts";
 import { SECURITY_PRINCIPLES } from "./security/principles.ts";
 import { SECURITY_SKILLS } from "./security/skills.ts";
+import { WORKFLOW_SKILLS } from "./ci-skills.ts";
 import { captureBaseline, runSecurityGates } from "./security/gates.ts";
 import { codeReviewer, reviewerDefault, setReviewMode } from "./security/reviewer.ts";
 
@@ -167,6 +168,9 @@ export function Ada({ id }: AgentProps) {
   useInstruction(SECURITY_PRINCIPLES);
 
   for (const skill of SECURITY_SKILLS) useSkill(skill);
+  // Not security, same economics: one catalog line until a turn is actually
+  // about a failing build.
+  for (const skill of WORKFLOW_SKILLS) useSkill(skill);
 
   /* ---------------- the independent reviewer ----------------
    *
