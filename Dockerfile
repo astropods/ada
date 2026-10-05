@@ -11,7 +11,12 @@ FROM node:24-slim
 # They remain so `node agent/index.ts` works locally with no sandbox service.
 # NOTE: no inline `#` comments inside this RUN — line continuations collapse to
 # one shell line and a `#` would comment out the rest.
+# `upgrade` before anything else: the base image is a snapshot, and a scan sees
+# whatever Debian shipped the day it was cut. Without this, libexpat1,
+# libpcre2 and tzdata stayed on the versions the snapshot froze even though
+# patched ones were in the repository.
 RUN apt-get update \
+ && apt-get upgrade -y \
  && apt-get install -y --no-install-recommends git curl ca-certificates \
  && mkdir -p -m 755 /etc/apt/keyrings \
  && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
@@ -42,7 +47,19 @@ ENV NODE_ENV=production \
 # longer an "only @opentelemetry/api" install. devDeps (typescript, vite,
 # playwright, @ag-ui/core) are still not needed at runtime.
 COPY package.json ./
-RUN npm install --omit=dev --no-audit --no-fund
+# npm is a BUILD-TIME tool: the entrypoint is `node agent/index.ts`, and the
+# model's commands run in the sandbox, not here. Removing it after the install
+# takes its bundled dependencies out of the image with it — npm's own
+# brace-expansion has open advisories that no released npm has picked up yet,
+# so no amount of upgrading reaches them.
+#
+# The cost: a `local()` sandbox in this image could not run npm. Production
+# does not use one — that path is the in-process fallback this project warns
+# is not an isolation boundary.
+RUN npm install --omit=dev --no-audit --no-fund \
+ && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx \
+           /usr/local/lib/node_modules/corepack /usr/local/bin/corepack \
+           /root/.npm
 
 COPY agent ./agent
 COPY fixtures ./fixtures
