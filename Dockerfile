@@ -46,20 +46,31 @@ ENV NODE_ENV=production \
 # Runtime deps now include the Flue runtime and its model layer, so this is no
 # longer an "only @opentelemetry/api" install. devDeps (typescript, vite,
 # playwright, @ag-ui/core) are still not needed at runtime.
-COPY package.json ./
-# npm is a BUILD-TIME tool: the entrypoint is `node agent/index.ts`, and the
-# model's commands run in the sandbox, not here. Removing it after the install
-# takes its bundled dependencies out of the image with it — npm's own
-# brace-expansion has open advisories that no released npm has picked up yet,
-# so no amount of upgrading reaches them.
+# LOCKFILE-DRIVEN, so the image's dependency versions are the ones reviewed
+# here. This previously ran `npm install` from package.json alone — bun.lock
+# was never copied — so every build re-resolved and the deployed versions were
+# whatever npm picked that day. A CVE scan could regress with no commit behind
+# it, and the only way to know what shipped was to build and look inside.
 #
-# The cost: a `local()` sandbox in this image could not run npm. Production
-# does not use one — that path is the in-process fallback this project warns
-# is not an isolation boundary.
-RUN npm install --omit=dev --no-audit --no-fund \
+# bun, because bun.lock is this repo's real lockfile; `--frozen-lockfile` fails
+# the build rather than silently resolving if the two drift apart.
+COPY package.json bun.lock ./
+RUN npm install -g bun@1.3.9 --no-audit --no-fund \
+ && bun install --frozen-lockfile --production \
+ && rm -rf /root/.bun/install/cache \
+ # npm and bun are BUILD-TIME tools: the entrypoint is `node agent/index.ts`,
+ # and the model's commands run in the sandbox, not here. Removing them takes
+ # their bundled dependencies out of the image too — npm's own brace-expansion
+ # has advisories that no released npm has picked up, so upgrading cannot
+ # reach them.
+ #
+ # The cost: a `local()` sandbox in this image can run neither. Production does
+ # not use that path — it is the in-process fallback this project warns is not
+ # an isolation boundary.
  && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx \
+           /usr/local/lib/node_modules/bun /usr/local/bin/bun /usr/local/bin/bunx \
            /usr/local/lib/node_modules/corepack /usr/local/bin/corepack \
-           /root/.npm
+           /root/.npm /root/.bun
 
 COPY agent ./agent
 COPY fixtures ./fixtures

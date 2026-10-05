@@ -70,6 +70,7 @@ import {
   verifyState, buildManifest, convertManifestCode, renderManifestForm,
   isAdmin, adminListConfigured, canProvision, describeAdmin } from "./auth/setup.ts";
 import {
+  buildWatchUrl,
   getServerSecret,
   mintLink,
   verifyLink,
@@ -745,6 +746,22 @@ app.post("/test/github-app", async (c) => {
     slug: body.slug ?? null,
   });
   return c.json({ configured: githubConfigured() });
+});
+
+/**
+ * A watch link for an arbitrary session and user, without running a turn.
+ *
+ * The signing secret is per-process, so a test cannot mint one of these from
+ * outside — and the authorization branches that matter (a token for another
+ * user, a token naming another session) only exist on a DEPLOYMENT, which is
+ * exactly where the browser test cannot reach. Same reasoning as `/test/seed`.
+ */
+app.get("/test/watch-link", async (c) => {
+  if (process.env.ADA_TEST_HOOKS !== "1") return c.text("not found", 404);
+  const sessionId = c.req.query("session") ?? "";
+  const userId = c.req.query("user") ?? "";
+  if (!sessionId || !userId) return c.text("session and user required", 400);
+  return c.json({ url: buildWatchUrl(userId, sessionId, await getServerSecret(store)) });
 });
 
 app.post("/test/seed", async (c) => {
