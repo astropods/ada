@@ -450,6 +450,16 @@ describe the shape of the correct answer rather than one library's API — and
 each names its anti-patterns explicitly, since a labelled wrong example steers a
 model better than an imperative.
 
+Not every skill is about security. `investigate-ci-failure`
+(`agent/agents/ci-skills.ts`) covers finding a failed run from a chat
+notification and reading it: locate it with `gh run list` rather than following
+the "View workflow" button, which is an HTML page behind auth and not a log;
+read `--log-failed` rather than the whole thing, because a real CI log is far
+past the sandbox's ~1 MiB output cap and a full `--log` comes back as a
+truncated prefix of the setup steps; and rule out a pre-existing or
+environmental failure before attributing one to the change. The same economics
+apply — one catalog line until a turn is actually about a failing build.
+
 ### The gates
 
 `useAgentFinish` runs at every would-stop point. Ada diffs against the commit
