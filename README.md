@@ -686,6 +686,34 @@ The switch is automatic. The platform injects `KNOWLEDGE_SANDBOX_HOST` when
 execution there; with no sandbox service, Ada falls back to Flue's in-process
 `local()` sandbox, which is how `node agent/index.ts` and `flue run` work.
 
+**Three modes, while the platform sandbox is being proven.** `ADA_SANDBOX` is a
+declared input, so it is settable per deployment without a code change:
+`astro` for a platform MicroVM per conversation
+(`agent/session/astro-sandbox.ts`), `container` for the service above, `local`
+for in-process. It defaults to `auto`, which is the behaviour every deployment
+had before there was a choice — container when the platform injected one, local
+otherwise. So a deployment moves onto the MicroVM and back off again by
+changing one value, and startup prints which boundary is live, marking it
+`(auto)` when it was inferred (`[ada] sandbox: …`).
+
+**Local runs are admin.** `isAdmin` matches a verified email, and only the ALB
+in front of a deployment supplies one — so off a deployment the email is always
+empty and `ADMIN_EMAILS` can only ever *deny*. Setting it to grant yourself
+admin locally did the opposite: it flipped `mayViewOthers` from "no list, so
+open" to "a list, and nothing can match it", hiding the Slack conversations it
+was meant to reveal. Nothing is widened by this default — with no deploy token
+there is no identity to check and web access is not gated either, so the admin
+surface now agrees with the authorization surface instead of being stricter
+than a boundary that is already absent. `ADA_LOCAL_ADMIN=0` declines it, which
+is how `test/session-authz.spec.ts` exercises a deployment's rules.
+
+`ADA_SANDBOX=astro` with no `ASTRO_AUTHZ_TOKEN` does **not** fall back. Falling
+back would run the model's commands in the control-plane process, which holds
+the database credentials, the GitHub App secret and the HMAC signing key — a
+misconfiguration must not be able to turn the boundary off, so the turn fails
+instead. `ADA_SANDBOX=container` with no host injected refuses for the same
+reason.
+
 **What Flue changed about this.** The pre-rewrite version of the split was a
 Claude Code runner: it took a prompt, spawned `claude -p`, and streamed raw
 stream-json back over SSE — so it had to know about models, credentials, resume

@@ -98,6 +98,32 @@ inputs:
     description: "Run an independent code-reviewer pass on substantive changes. Can be toggled per conversation by asking Ada."
     display-as: select
     options: ["true", "false"]
+  # Base URL a BROWSER uses. Normally derived; set it when that cannot work —
+  # a connect link sent to CHAT has no request to derive from, so it falls back
+  # to the container's own port, which nothing outside the container can reach.
+  # A deployment sets ASTRO_EXTERNAL_AGENT_URL instead. The callback must also
+  # be registered with the GitHub App.
+  PUBLIC_BASE_URL:
+    name: PUBLIC_BASE_URL
+    datatype: string
+    optional: true
+    description: "Base URL a browser uses to reach this agent, e.g. http://localhost:3200. Leave empty to derive it; required for GitHub connect links sent to chat."
+    display-as: short-text
+  # Where the model's commands run. `auto` is the behaviour before there was a
+  # choice: the container when injected, in-process otherwise. `astro` is opt-in
+  # while proven, and reversible without a code change.
+  #
+  # `local` runs commands IN THE CONTROL PLANE, which holds the database
+  # credentials, the App secret and the HMAC key — useful in development, not a
+  # deployment option. Neither remote mode falls back to it.
+  ADA_SANDBOX:
+    name: ADA_SANDBOX
+    datatype: string
+    optional: true
+    default: "auto"
+    description: "Where the model's commands run. auto = as injected (container, else in-process); astro = a platform MicroVM per conversation; local = in-process, NOT isolated."
+    display-as: select
+    options: ["auto", "astro", "container", "local"]
   # GitHub App visibility. Default PRIVATE (single-tenant): only the account that
   # created the App can install it — right when one user/org runs their own Ada.
   # Set "true" for MULTI-TENANT: a PUBLIC App any teammate can install on THEIR
@@ -111,6 +137,66 @@ inputs:
     description: "Provision the GitHub App as public (multi-tenant: installable by other users). Default false = private/single-tenant."
     display-as: select
     options: ["false", "true"]
+
+# Platform execution sandbox — one MicroVM per conversation. Declaring this
+# section is the whole switch; there is no local sandbox runtime, so a local run
+# attaches a REAL MicroVM and `ast` must be logged in.
+#
+# Replaces knowledge.sandbox below, which stays until this is proven.
+#
+# Already in the base image, so absent here: git, git-lfs, jq, archive tools,
+# patch, diffutils, findutils, rsync, openssh-clients, sudo, curl-minimal,
+# coreutils/grep/sed/awk. No runtime and no compiler — that is what this is for.
+sandbox:
+  # Not `always`: that is 60 packages dragging in systemd to save 8s of install.
+  toolchain: auto
+
+  # Global npm packages land in /opt/astropods — the environment the platform
+  # caches per declaration, not the per-conversation workspace.
+  node:
+    version: "24"
+    packages: ["bun@1.3.9"]
+
+  env:
+    # Never let git stop for a credential prompt; there is no terminal.
+    GIT_TERMINAL_PROMPT: "0"
+    # Sized to the MicroVM: 2048 MiB, one vCPU, arm64. Memory goes UP from the
+    # container's ~600 MiB budget, which is what made builds fall over. The heap
+    # cap stays under half of RAM (hard, per-process, and a sandbox may hold
+    # several); GOMEMLIMIT is soft, so it can sit higher.
+    GOMEMLIMIT: "1536MiB"
+    NODE_OPTIONS: "--max-old-space-size=1024"
+    # Still one: memory rationing on the container, now just matching 1 vCPU.
+    GOMAXPROCS: "1"
+    UV_THREADPOOL_SIZE: "2"
+    MAKEFLAGS: "-j1"
+    JOBS: "1"
+    npm_config_jobs: "1"
+    CARGO_BUILD_JOBS: "1"
+    VITEST_MAX_THREADS: "1"
+    VITEST_MIN_THREADS: "1"
+    VITEST_MAX_FORKS: "1"
+    NX_PARALLEL: "1"
+    TURBO_CONCURRENCY: "1"
+    PYTHONDONTWRITEBYTECODE: "1"
+    # Deliberately unset: the cache dirs and WORKSPACE_ROOT. The container aimed
+    # them at /data; the base image already points them into /opt/astropods, and
+    # the workspace is the one place that is per-sandbox, not per-declaration.
+
+  setup:
+    # `gh` is not in the AL2023 repo, so: a pinned arm64 release tarball
+    # (sandboxes run only on Graviton). It is a static Go binary, so glibc 2.34
+    # does not bind it — a check that DOES apply to anything else fetched here.
+    # Into /opt/astropods/bin (on PATH, part of the cached environment), and
+    # `command -v`-guarded so it is a no-op if setup re-runs.
+    - >-
+      command -v gh >/dev/null || {
+      curl -fsSL https://github.com/cli/cli/releases/download/v2.101.0/gh_2.101.0_linux_arm64.tar.gz
+      | tar xz -C /tmp &&
+      install -m 0755 /tmp/gh_2.101.0_linux_arm64/bin/gh /opt/astropods/bin/gh; }
+    # The per-command GH_TOKEN is read by `gh auth git-credential`, so nothing
+    # is written to disk. Idempotent.
+    - git config --system credential."https://github.com".helper "!gh auth git-credential"
 
 knowledge:
   # Platform-managed Postgres, injecting POSTGRES_HOST/PORT/USER/PASSWORD/DB.

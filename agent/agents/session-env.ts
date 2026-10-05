@@ -20,6 +20,7 @@
  */
 
 import { resolveModel, sandboxEnv } from "../config/model.ts";
+import { sandboxMode } from "../session/sandbox-mode.ts";
 import { sandboxHost } from "../session/remote-sandbox.ts";
 import type { RepoSpec } from "../session/repo.ts";
 
@@ -29,15 +30,23 @@ export interface SessionEnv {
   /** Writable workspace that is the sandbox cwd (repo checkout lives inside). */
   cwd: string;
   /**
-   * Set when execution is delegated to the isolated sandbox container.
+   * Set when execution is delegated OUT of this process. Absent means the
+   * in-process `local()` sandbox, keyed on `cwd`.
    *
-   * `subdir` names a directory INSIDE the instance's workspace there (a repo
+   * Tagged, because the two destinations need different things to reach them:
+   * the container is an address this process calls, while an Astro sandbox is
+   * a name the platform resolves. Keeping them in one optional field means
+   * every "is execution remote?" test stays a truthiness check.
+   *
+   * `subdir` names a directory INSIDE the instance's workspace (a repo
    * checkout), or is absent for the workspace root. It is deliberately not a
-   * cwd: the control plane cannot see the container's filesystem layout, so
-   * the absolute path is resolved by asking the container at sandbox creation.
-   * Absent `remote` means the in-process `local()` sandbox, keyed on `cwd`.
+   * cwd. For the container the absolute path is unknowable from here, so the
+   * factory asks at sandbox creation; for Astro the image fixes it at
+   * /workspace, so there is nothing to ask.
    */
-  remote?: { baseUrl: string; token?: string; subdir?: string };
+  remote?:
+    | { kind: "container"; baseUrl: string; token?: string; subdir?: string }
+    | { kind: "astro"; subdir?: string };
   /** Scrubbed env for the local sandbox, incl. GH_TOKEN when connected. */
   sandboxEnv: Record<string, string | undefined>;
   /** Whether the GitHub App is provisioned on this deployment at all. */
@@ -140,11 +149,17 @@ export function clearSessionEnv(instanceId: string): void {
  * commands; it carries no credential, because none is resolved on this path.
  */
 function fallbackEnv(): SessionEnv {
+  const mode = sandboxMode();
   const baseUrl = sandboxHost();
   return {
     modelRef: resolveModel().ref,
     cwd: process.cwd(),
-    remote: baseUrl ? { baseUrl, token: process.env.SANDBOX_TOKEN } : undefined,
+    remote:
+      mode === "astro"
+        ? { kind: "astro" }
+        : mode === "container" && baseUrl
+          ? { kind: "container", baseUrl, token: process.env.SANDBOX_TOKEN }
+          : undefined,
     sandboxEnv: sandboxEnv(),
     githubConfigured: false,
     githubConnected: false,

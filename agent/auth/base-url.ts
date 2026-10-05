@@ -15,10 +15,15 @@
  *
  * Previously each of those computed `ASTRO_EXTERNAL_AGENT_URL ?? localhost:$PORT`
  * for itself. That is correct when deployed (the env var is set) but wrong under
- * `ast project start`: the container sets PORT=80, so the manifest registered
- * `http://localhost:80/...` while the frontend is actually mapped to 8080 on the
- * host. GitHub then sent the browser to port 80, where the agent isn't
- * listening — the reported 404.
+ * `ast project start`, which maps the container's port to a different one on the
+ * host: the manifest registered the container's own port while the browser
+ * reaches the agent on the mapped one. GitHub then sent the browser to a port
+ * where the agent isn't listening — the reported 404.
+ *
+ * Step 2 cannot save a link sent to CHAT: there is no request to derive from,
+ * so it falls to step 3 and offers a port only reachable inside the container.
+ * A container cannot see its own port mapping, so `PUBLIC_BASE_URL` is a
+ * declared input and is the answer there.
  *
  * Resolution order:
  *   1. `PUBLIC_BASE_URL`, then `ASTRO_EXTERNAL_AGENT_URL` — explicit config wins.

@@ -63,12 +63,12 @@ import { InMemoryResultStore } from "./persistence/results.ts";
 import { createStore, type Store } from "./store/index.ts";
 import { persistenceMode } from "./db.ts";
 import { describePg } from "./store/pg-config.ts";
+import { describeSandbox } from "./session/sandbox-mode.ts";
 import { authorizeUrl, exchangeCode, listConnectedRepos } from "./auth/github-app.ts";
 import { githubConfigured, getAppCreds, saveAppCreds, loadAppCreds } from "./auth/app-config.ts";
 import {
   verifyState, buildManifest, convertManifestCode, renderManifestForm,
-  isAdmin, adminListConfigured, canProvision,
-} from "./auth/setup.ts";
+  isAdmin, adminListConfigured, canProvision, describeAdmin } from "./auth/setup.ts";
 import { getServerSecret, mintLink, verifyLink } from "./auth/connect.ts";
 import { resolveBaseUrl } from "./auth/base-url.ts";
 import { Authorizer, oidcIdentity, oidcEmail, type AuthzResult } from "./auth/authz.ts";
@@ -127,6 +127,11 @@ function boot(): Promise<void> {
     runner.start();
 
     console.log(`[ada] ${describeAuth()}`);
+    // "Where do the model's commands run" is the first thing to check.
+    console.log(`[ada] sandbox: ${describeSandbox()}`);
+    console.log(`[ada] web authz: ${authorizer.describe()}`);
+    // Never silent: "anyone unauthenticated is admin here" has to be visible.
+    console.log(`[ada] admin: ${describeAdmin()}`);
     console.log(
       persistenceMode() === "postgres"
         ? `[ada] conversations: postgres ${describePg()} — durable across restarts`
@@ -518,12 +523,9 @@ app.post("/sessions/:id/messages", turnBodyLimit, async (c) => {
   // window — both would dispatch and neither would see a 409.
   const release = runner.reserveTurn(sessionId);
   if (!release) return c.text("session busy", 409);
-  // EVERY path from here has to reach `release()`, including a throw. The body
-  // read is not exception-free — `arrayBuffer()` on a part is unguarded, and a
-  // client that disconnects mid-upload throws right there — and a reservation
-  // leaked that way is permanent: the session stays "starting", which `busy()`
-  // reads as busy, so every later turn on it answers 409 forever. Hence one
-  // try around the read AND the dispatch rather than only the dispatch.
+  // Every path from here must reach `release()`, including a throw: the body
+  // read is not exception-free, and a leaked reservation is PERMANENT — the
+  // session stays "starting", which `busy()` reads as busy forever.
   try {
     const req = await readTurnRequest(c);
     if ("error" in req) {

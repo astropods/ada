@@ -5,7 +5,7 @@
     "": {
       "name": "ada",
       "dependencies": {
-        "@astropods/adapter-core": "^0.10.0",
+        "@astropods/adapter-core": "^0.12.1",
         "@earendil-works/pi-ai": "0.83.0",
         "@flue/cli": "2.0.3",
         "@flue/opentelemetry": "2.0.3",
@@ -38,7 +38,7 @@
 
     "@anthropic-ai/sdk": ["@anthropic-ai/sdk@0.91.1", "", { "dependencies": { "json-schema-to-ts": "^3.1.1" }, "peerDependencies": { "zod": "^3.25.0 || ^4.0.0" }, "optionalPeers": ["zod"], "bin": { "anthropic-ai-sdk": "bin/cli" } }, "sha512-LAmu761tSN9r66ixvmciswUj/ZC+1Q4iAfpedTfSVLeswRwnY3n2Nb6Tsk+cLPP28aLOPWeMgIuTuCcMC6W/iw=="],
 
-    "@astropods/adapter-core": ["@astropods/adapter-core@0.10.0", "", { "dependencies": { "@opentelemetry/api": "^1.9.0", "@opentelemetry/exporter-trace-otlp-http": "^0.200.0", "@opentelemetry/resources": "^2.1.0", "@opentelemetry/sdk-trace-node": "^2.1.0", "@opentelemetry/semantic-conventions": "^1.30.0", "pino": "^10.3.1" }, "peerDependencies": { "@astropods/messaging": "latest" } }, "sha512-2b5F4dPxQ1ssUQTkL0h/TgHRcb6oXha7DObtVpxwuMNNtbmnSnTeYVmpLINLkh579HwlMRy22hET0ux4gDoMjA=="],
+    "@astropods/adapter-core": ["@astropods/adapter-core@0.12.1", "", { "dependencies": { "@opentelemetry/api": "^1.9.0", "@opentelemetry/exporter-trace-otlp-http": "^0.200.0", "@opentelemetry/resources": "^2.1.0", "@opentelemetry/sdk-trace-node": "^2.1.0", "@opentelemetry/semantic-conventions": "^1.30.0", "jose": "^6.2.12", "pino": "^10.3.1" }, "peerDependencies": { "@astropods/messaging": "latest" } }, "sha512-oXZHGHuAHKlXRX6QFI5GtjbzLp/HA1MlxryE1GHwKeDVZoazuGskXUXOSx4uHO1B3nvjsB+UQH6QGr1VS+RmWw=="],
 
     "@astropods/messaging": ["@astropods/messaging@0.2.0", "", { "dependencies": { "@grpc/grpc-js": "^1.9.0", "@grpc/proto-loader": "^0.7.10" } }, "sha512-0atGEha7k1KYVgowCFkxHlXWF1eZYX4fY1TxFOm3w9HinE/RQtCFtcXIkqKHTOnV07hjZXArpWiye8JBEEbd9A=="],
 
@@ -580,7 +580,7 @@
 
     "isexe": ["isexe@2.0.0", "", {}, "sha512-RHxMLp9lnKHGHRng9QFhRCMbYAcVpn69smSGcq3f36xjgVVWThj4qqLbTLlq7Ssj8B+fIQ1EuCEGI2lKsyQeIw=="],
 
-    "jose": ["jose@6.2.3", "", {}, "sha512-YYVDInQKFJfR/xa3ojUTl8c2KoTwiL1R5Wg9YCydwH0x0B9grbzlg5HC7mMjCtUJjbQ/YnGEZIhI5tCgfTb4Hw=="],
+    "jose": ["jose@6.2.12", "", {}, "sha512-9NiFmJEex0sy2Dk58j2UGBSHgUs2ypF9eZSu4L6vjOX3Dp96Sw1F3uL+H+D1sx02jZZdzUT0HgvCy59CuvXcWw=="],
 
     "js-base64": ["js-base64@3.9.2", "", {}, "sha512-6zayE8QlUdiweYI6cETD/XBSqFcoCUlufn/29PJR99r82x1yDnIprRca0YvAYpAW+ez0GuQkVBC6xG5QkD7OjA=="],
 
@@ -880,6 +880,8 @@
 
     "@mistralai/mistralai/zod": ["zod@4.4.3", "", {}, "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="],
 
+    "@modelcontextprotocol/client/jose": ["jose@6.2.3", "", {}, "sha512-YYVDInQKFJfR/xa3ojUTl8c2KoTwiL1R5Wg9YCydwH0x0B9grbzlg5HC7mMjCtUJjbQ/YnGEZIhI5tCgfTb4Hw=="],
+
     "@modelcontextprotocol/client/zod": ["zod@4.4.3", "", {}, "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="],
 
     "@modelcontextprotocol/core/zod": ["zod@4.4.3", "", {}, "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="],
@@ -887,6 +889,8 @@
     "@modelcontextprotocol/sdk/@hono/node-server": ["@hono/node-server@1.19.14", "", { "peerDependencies": { "hono": "^4" } }, "sha512-GwtvgtXxnWsucXvbQXkRgqksiH2Qed37H9xHZocE5sA3N8O8O8/8FA3uclQXxXVzc9XBZuEOMK7+r02FmSpHtw=="],
 
     "@modelcontextprotocol/sdk/hono": ["hono@4.12.30", "", {}, "sha512-emn+JoJjrN9YTpRDS5it/UI2SO9BAE37T6I3d963RxcZ81G9A4pr2SZTEiiaiKbzx+NKRg5BZ89fCL7gCJCUog=="],
+
+    "@modelcontextprotocol/sdk/jose": ["jose@6.2.3", "", {}, "sha512-YYVDInQKFJfR/xa3ojUTl8c2KoTwiL1R5Wg9YCydwH0x0B9grbzlg5HC7mMjCtUJjbQ/YnGEZIhI5tCgfTb4Hw=="],
 
     "@modelcontextprotocol/server/zod": ["zod@4.4.3", "", {}, "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="],
 

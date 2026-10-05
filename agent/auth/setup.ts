@@ -13,6 +13,7 @@
  */
 
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { tokenKind } from "./authz.ts";
 import type { GithubAppCreds } from "./app-config.ts";
 import { resolveBaseUrl } from "./base-url.ts";
 
@@ -35,7 +36,8 @@ function isPublicApp(env: NodeJS.ProcessEnv): boolean {
 }
 
 /**
- * Whether a verified email is on the admin allowlist (ADMIN_EMAILS).
+ * Whether the caller is an admin: on the allowlist (ADMIN_EMAILS), or running
+ * off a deployment at all.
  * Email is the admin key because it's the only human-knowable identity the
  * platform gives us — the opaque platform user id isn't something a deployer can
  * put in config ahead of time. Comparison is case-insensitive. Only the web
@@ -43,8 +45,55 @@ function isPublicApp(env: NodeJS.ProcessEnv): boolean {
  */
 export function isAdmin(email: string, env: NodeJS.ProcessEnv = process.env): boolean {
   const want = (email ?? "").trim().toLowerCase();
-  if (!want) return false;
-  return parseAdminEmails(env).includes(want);
+  // AN IDENTITY WAS PRESENTED, so judge it — whatever kind of run this is.
+  // Only an ALB supplies this, so its presence is per-request evidence of a
+  // real deployment that does not depend on the token being there. A
+  // deployment that somehow lost its token still enforces the allowlist for
+  // every signed-in caller.
+  if (want) return parseAdminEmails(env).includes(want);
+  return localAdmin(env);
+}
+
+/**
+ * Admin for a caller with no identity at all, on a run that is not a deployment.
+ *
+ * Only the ALB supplies the email `isAdmin` matches, so off a deployment it is
+ * always empty and ADMIN_EMAILS can only DENY — setting it to grant yourself
+ * admin locally did the opposite.
+ *
+ * THE INVARIANT THIS RESTS ON: a deployment always carries a deploy
+ * ASTRO_AUTHZ_TOKEN. It is the platform's own contract, not an assumption of
+ * ours — `@astropods/adapter-core`'s authorizer logs "authorization disabled,
+ * ASTRO_AUTHZ_TOKEN not set (dev mode, all requests allowed)" and allows
+ * everything in exactly the same case. So a token-less deployment has already
+ * lost web authorization entirely, and this neither causes that nor deepens
+ * it; Ada's `Authorizer` makes the same call.
+ *
+ * It does not rest on that invariant ALONE, which is the point of checking the
+ * email first: a signed-in caller is judged against the allowlist even if the
+ * token is missing, so the dangerous shape — exposed, token-less, but still
+ * behind the ALB — stays strict.
+ *
+ * Deliberately NOT keyed on binding to loopback: both a local `ast project
+ * start` and a deployment run in a container listening on 0.0.0.0, so the bind
+ * address does not tell them apart and a check on it would be false assurance.
+ *
+ * `ADA_LOCAL_ADMIN=0` declines it, which session-authz.spec.ts sets — it forges
+ * ALB headers to exercise a deployment's rules.
+ */
+export function describeAdmin(env: NodeJS.ProcessEnv = process.env): string {
+  const list = parseAdminEmails(env);
+  if (localAdmin(env)) {
+    return `local run — a caller with no verified identity is admin (ADA_LOCAL_ADMIN=0 to decline)${
+      list.length ? `; ${list.length} address(es) in ADMIN_EMAILS still apply to signed-in callers` : ""
+    }`;
+  }
+  return list.length ? `${list.length} address(es) in ADMIN_EMAILS` : "open — no ADMIN_EMAILS configured";
+}
+
+function localAdmin(env: NodeJS.ProcessEnv): boolean {
+  if (tokenKind(env) === "deploy") return false;
+  return !/^(0|false|no)$/i.test((env.ADA_LOCAL_ADMIN ?? "").trim());
 }
 
 /** True when an explicit admin allowlist is configured (ADMIN_EMAILS non-empty). */

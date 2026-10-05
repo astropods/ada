@@ -17,7 +17,7 @@
     "test:ui": "playwright test --ui"
   },
   "dependencies": {
-    "@astropods/adapter-core": "^0.10.0",
+    "@astropods/adapter-core": "^0.12.1",
     "@earendil-works/pi-ai": "0.83.0",
     "@flue/cli": "2.0.3",
     "@flue/opentelemetry": "2.0.3",

@@ -52,6 +52,12 @@ test.beforeAll(async () => {
       PORT: String(PORT),
       ADA_TEST_HOOKS: "1",
       ADMIN_EMAILS: ADMIN,
+      // This suite forges the ALB's identity headers to exercise a
+      // DEPLOYMENT's rules, so it declines the local-admin default. Its
+      // non-admin caller is modelled as one with no verified email, which is
+      // indistinguishable from a local browser — the distinction has to be
+      // stated here rather than inferred from the request.
+      ADA_LOCAL_ADMIN: "0",
       // Keep this server's SQLite database out of the default workspace root so
       // it cannot interfere with the shared dev server's state.
       WORKSPACE_ROOT: join(ROOT, "test-results", "authz-workspace"),
@@ -215,4 +221,131 @@ test("without an admin list, the documented open posture is unchanged", async ({
   // The native router reaches its handler rather than being refused by our gate.
   expect(await statusOn("/agents/ada/sess_whatever", { headers: as("user-a") })).not.toBe(403);
   expect(await statusOn(`/sessions/${theirs}`, { method: "DELETE", headers: as("user-a") })).toBe(204);
+});
+
+/* ── Which token kind gates the web UI ─────────────────────────────────── */
+
+/**
+ * `ASTRO_AUTHZ_TOKEN` carries two credentials. A DEPLOY token is a deployment's
+ * identity, with an ALB in front that has already established the caller. A
+ * DEV-SESSION token is the developer's own, so every local request is anonymous
+ * and asking the grants table about it denies — a themed 401 that locked
+ * developers out. Distinguishable by `typ: "dev"` (astropods/astro#2724).
+ */
+function token(claims: Record<string, unknown>): string {
+  const payload = Buffer.from(JSON.stringify(claims)).toString("base64url");
+  return `h.${payload}.sig`;
+}
+
+test("a deploy token gates the web UI", async () => {
+  const { Authorizer } = await import("../agent/auth/authz.ts");
+  const a = new Authorizer({ ASTRO_AUTHZ_TOKEN: token({ iss: "https://astropods.com", sub: "dep_1" }) } as NodeJS.ProcessEnv);
+  expect(a.enabled).toBe(true);
+  expect(a.describe()).toContain("enforced via https://astropods.com");
+});
+
+test("a dev-session token does NOT gate the web UI", async () => {
+  const { Authorizer } = await import("../agent/auth/authz.ts");
+  const a = new Authorizer({
+    ASTRO_AUTHZ_TOKEN: token({ iss: "https://astropods.com", sub: "sess_1", typ: "dev" }),
+  } as NodeJS.ProcessEnv);
+  // Declaring a `sandbox` section is enough to make this token appear locally,
+  // so treating it as a deployment credential is what broke the frontend.
+  expect(a.enabled).toBe(false);
+  expect(await a.authorize(""), "and the request is allowed, not denied").toMatchObject({ allowed: true });
+  expect(a.describe()).toContain("dev session");
+});
+
+test("no token at all still means ungated, as it always did", async () => {
+  const { Authorizer } = await import("../agent/auth/authz.ts");
+  const a = new Authorizer({} as NodeJS.ProcessEnv);
+  expect(a.enabled).toBe(false);
+  expect(await a.authorize("")).toMatchObject({ allowed: true });
+  expect(a.describe()).toContain("not configured");
+});
+
+test("a token with no issuer cannot gate anything, whatever its kind", async () => {
+  const { Authorizer } = await import("../agent/auth/authz.ts");
+  // `iss` is where the authorize call would be sent; without it there is
+  // nowhere to ask, so enforcing would deny every request with no recourse.
+  const a = new Authorizer({ ASTRO_AUTHZ_TOKEN: token({ sub: "dep_1" }) } as NodeJS.ProcessEnv);
+  expect(a.enabled).toBe(false);
+});
+
+test("the startup line never contains the token", async () => {
+  const { Authorizer } = await import("../agent/auth/authz.ts");
+  const secret = token({ iss: "https://astropods.com", sub: "dep_1" });
+  expect(new Authorizer({ ASTRO_AUTHZ_TOKEN: secret } as NodeJS.ProcessEnv).describe()).not.toContain(secret);
+});
+
+/* ── Admin off a deployment ────────────────────────────────────────────── */
+
+/**
+ * Only a deployment has an ALB to supply the email `isAdmin` matches, so off one
+ * ADMIN_EMAILS can only deny — setting it to grant yourself admin did the
+ * opposite.
+ */
+test("local development is admin, even with an allowlist set", async () => {
+  const { isAdmin, adminListConfigured } = await import("../agent/auth/setup.ts");
+  const local = { ADMIN_EMAILS: "simon@example.com" } as NodeJS.ProcessEnv;
+  // The allowlist is still configured — that is what used to close the gate.
+  expect(adminListConfigured(local)).toBe(true);
+  expect(isAdmin("", local), "no ALB, so no email to match").toBe(true);
+});
+
+test("local admin can be declined, which is how this suite tests a deployment", async () => {
+  const { isAdmin } = await import("../agent/auth/setup.ts");
+  // Not inferable: a non-admin caller here is modelled as one with no verified
+  // email, which looks exactly like a local browser.
+  const off = { ADMIN_EMAILS: "simon@example.com", ADA_LOCAL_ADMIN: "0" } as NodeJS.ProcessEnv;
+  expect(isAdmin("", off)).toBe(false);
+  expect(isAdmin("simon@example.com", off), "the allowlist still works").toBe(true);
+});
+
+test("a dev-session token is still local, not a deployment", async () => {
+  const { isAdmin } = await import("../agent/auth/setup.ts");
+  const dev = {
+    ADMIN_EMAILS: "simon@example.com",
+    ASTRO_AUTHZ_TOKEN: token({ iss: "https://astropods.com", sub: "sess_1", typ: "dev" }),
+  } as NodeJS.ProcessEnv;
+  // `ast project start` injects one of these for sandbox attach; it does not
+  // make the run a deployment.
+  expect(isAdmin("", dev)).toBe(true);
+});
+
+test("a real deployment still enforces the allowlist", async () => {
+  const { isAdmin } = await import("../agent/auth/setup.ts");
+  const deployed = {
+    ADMIN_EMAILS: "simon@example.com",
+    ASTRO_AUTHZ_TOKEN: token({ iss: "https://astropods.com", sub: "dep_1" }),
+  } as NodeJS.ProcessEnv;
+  expect(isAdmin("simon@example.com", deployed), "on the list").toBe(true);
+  expect(isAdmin("SIMON@EXAMPLE.COM", deployed), "case-insensitive").toBe(true);
+  expect(isAdmin("someone@else.com", deployed), "not on the list").toBe(false);
+  expect(isAdmin("", deployed), "no verified email is not an admin").toBe(false);
+});
+
+test("a signed-in caller is judged on the allowlist even without a deploy token", async () => {
+  const { isAdmin } = await import("../agent/auth/setup.ts");
+  // The hardening: only an ALB supplies this email, so its presence is
+  // per-request evidence of a real deployment that does not depend on the
+  // token being there. An exposed deployment that somehow lost its token still
+  // refuses a non-admin, instead of handing admin to everyone.
+  const tokenless = { ADMIN_EMAILS: "simon@example.com" } as NodeJS.ProcessEnv;
+  expect(isAdmin("someone@else.com", tokenless), "presented an identity, so it is judged").toBe(false);
+  expect(isAdmin("simon@example.com", tokenless)).toBe(true);
+  // Only a caller with NO identity at all gets the local default.
+  expect(isAdmin("", tokenless)).toBe(true);
+});
+
+test("startup says so when anyone unauthenticated is admin", async () => {
+  const { describeAdmin } = await import("../agent/auth/setup.ts");
+  expect(describeAdmin({ ADMIN_EMAILS: "a@b.c" } as NodeJS.ProcessEnv)).toContain("ADA_LOCAL_ADMIN=0");
+  expect(
+    describeAdmin({
+      ADMIN_EMAILS: "a@b.c",
+      ASTRO_AUTHZ_TOKEN: token({ iss: "https://astropods.com", sub: "dep_1" }),
+    } as NodeJS.ProcessEnv),
+  ).toContain("ADMIN_EMAILS");
+  expect(describeAdmin({} as NodeJS.ProcessEnv)).toContain("local run");
 });

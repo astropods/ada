@@ -35,6 +35,9 @@ import {
   remoteSandboxDriver,
   sandboxHost,
 } from "./remote-sandbox.ts";
+import { astroSandboxDriver, explainSandboxFailure } from "./astro-sandbox.ts";
+import { sandboxMode } from "./sandbox-mode.ts";
+import type { SandboxDriver } from "@flue/runtime";
 import {
   describeUploads,
   routeUploads,
@@ -329,7 +332,10 @@ export class SessionRunner {
       // Report ONCE, here, whatever stage failed — then rethrow so an awaiting
       // caller (messaging) still sees it. The background caller swallows it,
       // having already had it delivered over the stream.
-      this.failTurn(instanceId, (e as Error).message);
+      //
+      // Flue wraps a turn failure, so the reason sits in a `cause` — which is
+      // how a hit sandbox cap reached the user as a bare `AGENT_ERROR`.
+      this.failTurn(instanceId, explainSandboxFailure(e) ?? (e as Error).message);
       throw e;
     }
   }
@@ -348,35 +354,48 @@ export class SessionRunner {
     // workspace instead leaves the repo one level down, where Flue's workspace
     // discovery does not look — which is how a session ends up never seeing the
     // project's AGENTS.md.
-    const baseUrl = sandboxHost();
+    const mode = sandboxMode();
     let sandboxCwd = cwd;
     let remote: SessionEnvRemote | undefined;
 
-    // Routed here, not at the HTTP edge, because only the runner knows which
-    // sandbox this session has — and a non-image upload has to be written
-    // where the agent's tools will look for it, which the branches below
-    // settle (local dir vs remote subdir).
+    // Routed here, not at the HTTP edge: a non-image upload has to land where
+    // the agent's tools look, which the branches below settle.
     const routedUploads = opts.uploads?.length ? routeUploads(opts.uploads) : null;
 
-    if (baseUrl) {
-      // Isolated execution: the checkout lives in the sandbox container, and
-      // every path the agent sees is relative to its own workspace there.
+    if (mode !== "local") {
+      // The checkout lives outside this process. A container address doubles as
+      // the discriminator below: non-null is exactly container mode.
+      const containerUrl = mode === "container" ? sandboxHost() : null;
+      if (mode === "container" && !containerUrl) {
+        throw new Error(
+          "ADA_SANDBOX=container but KNOWLEDGE_SANDBOX_HOST is unset. Refusing to fall back to the " +
+            "in-process sandbox, which would run the model's commands in the control plane.",
+        );
+      }
       const token = process.env.SANDBOX_TOKEN;
+      const env = sandboxEnv({ githubToken });
+
+      // On first need only: a turn with no repo and no uploads never touches it.
+      let driver: SandboxDriver | undefined;
+      const sandboxDriver = (): SandboxDriver =>
+        (driver ??= containerUrl
+          ? remoteSandboxDriver({ baseUrl: containerUrl, id: instanceId, token, env })
+          : astroSandboxDriver({ id: instanceId, env }));
+
       let subdir: string | undefined;
-      let driver: ReturnType<typeof remoteSandboxDriver> | undefined;
       if (opts.repo) {
-        driver = remoteSandboxDriver({ baseUrl, id: instanceId, token, env: sandboxEnv({ githubToken }) });
-        subdir = (await ensureRepoInSandbox(driver, opts.repo, { githubToken })).dir;
+        subdir = (await ensureRepoInSandbox(sandboxDriver(), opts.repo, { githubToken })).dir;
       } else {
         // A repo the agent cloned itself on an earlier turn, so the next turn
         // is rooted inside it and Flue's AGENTS.md discovery sees the project.
         subdir = getCheckoutDir(instanceId);
       }
       if (routedUploads?.files.length) {
-        driver ??= remoteSandboxDriver({ baseUrl, id: instanceId, token, env: sandboxEnv({ githubToken }) });
-        await writeUploadsRemote(driver, routedUploads.files, subdir);
+        await writeUploadsRemote(sandboxDriver(), routedUploads.files, subdir);
       }
-      remote = { baseUrl, token, subdir };
+      remote = containerUrl
+        ? { kind: "container", baseUrl: containerUrl, token, subdir }
+        : { kind: "astro", subdir };
     } else if (opts.repo) {
       sandboxCwd = (await ensureRepo(cwd, opts.repo, { githubToken })).dir;
     } else {
@@ -390,7 +409,7 @@ export class SessionRunner {
     // After the local branches above have settled sandboxCwd, so the files land
     // in the directory the agent is actually rooted at (the checkout when there
     // is one, the workspace otherwise) and `uploads/<name>` resolves for it.
-    if (!baseUrl && routedUploads?.files.length) {
+    if (mode === "local" && routedUploads?.files.length) {
       writeUploadsLocal(sandboxCwd, routedUploads.files);
     }
 
