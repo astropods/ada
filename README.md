@@ -333,7 +333,7 @@ npm test                                       # or: npm run test:ui
 | `reviewer-subagent.spec.ts` | Actually **invokes** the delegate via the `task` tool |
 | `repo-rules.spec.ts` | Convention discovery: casing, nesting, symlinks, truncation |
 | `remote-sandbox.spec.ts` | The isolation boundary — containment and env leakage — over real HTTP |
-| `telemetry.spec.ts` | A real agent turn's trace: names, parenting, durations, no content capture |
+| `telemetry.spec.ts` | A real agent turn's trace: names, parenting, durations, and that content arrives |
 | `persistence.spec.ts` | Backend selection always; a real restart when `ADA_TEST_POSTGRES_HOST` is set |
 
 Two habits worth keeping, both learned the hard way here:
@@ -1093,7 +1093,7 @@ the `ResultStore`.
 `telemetry/otel.ts`:
 
 ```ts
-instrument(createOpenTelemetryInstrumentation({ content: false }))
+instrument(createOpenTelemetryInstrumentation({}))
 ```
 
 > This replaced ~440 lines that reimplemented Flue's Cloudflare tracing backend
@@ -1119,10 +1119,16 @@ cache read + cache write.
 
 Two things are ours rather than the framework's, both deliberate:
 
-- **`content: false`.** Prompts, completions, and tool payloads never become
-  span attributes. Ada works on private repositories and attributes are retained
-  by the collector. If content is ever wanted, use the package's `transform`
-  hook to redact in place rather than flipping this on.
+- **Content capture, on.** Prompts, completions and tool payloads become span
+  attributes. This was `content: false` — Ada works on private repositories and
+  the collector retains what it is sent — and the trade changed with FGA, which
+  makes "who may read this agent's logs and traces" a platform access decision
+  rather than one settled here by sending nothing. Withholding it also made the
+  agent unevaluable: a custom evaluator judges a trace's input and output, and
+  both were empty. Content shares a 56 KiB per-span pool with 16 KiB reserved
+  for output, so a large prompt cannot crowd out the reply or the operational
+  attributes. The `transform` hook remains the way to redact one field in place
+  rather than withhold all of them.
 - **A cost histogram** (`gen_ai.usage.cost_usd`). Cost is absent from the GenAI
   semconv and from Flue's instrumentation — it's provider- and pricing-specific
   — but pi-ai computes it per turn, and "tool usage + token usage → money" is a

@@ -18,9 +18,12 @@
  *
  * What is left here is the part that genuinely isn't the framework's job:
  *
- *   - `content: false`. Ada works on private repositories; prompts,
- *     completions, and tool payloads must never reach the collector, where
- *     they would be retained. This is a policy decision, so it lives with us.
+ *   - The content decision. Prompts, completions and tool payloads DO reach
+ *     the collector. Ada works on private repositories, so this was `false`
+ *     until FGA made "who may read an agent's traces" answerable on the
+ *     platform — a better place for it than a flag whose only settings were
+ *     everything or nothing. Content is what makes behaviour evaluable: a
+ *     trace of durations cannot answer whether the agent did the right thing.
  *   - A cost histogram. Cost is absent from the GenAI semconv and from Flue's
  *     instrumentation, deliberately — it is provider- and pricing-specific.
  *     But pi-ai computes it per turn, and "tool usage + token usage → money" is
@@ -118,10 +121,26 @@ export async function installTelemetry(serviceName = "ada"): Promise<() => Promi
     return async () => {};
   }
 
-  // `content: false` opts out of prompt/completion/tool-payload capture
-  // entirely. If content is ever wanted, prefer the `transform` hook (redact
-  // in place) over flipping this on — see the package's ContentOption.
-  const disposeTracing = deps.instrument(deps.createOpenTelemetryInstrumentation({ content: false }));
+  // CONTENT IS CAPTURED: prompts, replies and tool payloads reach the traces.
+  //
+  // This was `content: false`, which is why every trace carried timings, token
+  // usage and tool names but no input or output — and why a custom evaluator,
+  // which judges a trace's input and output, had nothing to score. Whether the
+  // agent behaves correctly is not answerable from durations alone.
+  //
+  // The reason to withhold it was that prompts and replies carry private-repo
+  // code and whatever a user pasted into chat. That is now an access-control
+  // question the platform answers: FGA governs who can read an agent's logs
+  // and traces, which is a better place to decide it than here, where the only
+  // options were everything or nothing.
+  //
+  // Omitted rather than set, because `ContentOption` is `false | {transform}` —
+  // absent IS on, with the safety net: 56 KiB of content per span, 16 KiB of it
+  // reserved for output, so a large prompt cannot crowd out the reply or the
+  // operational attributes that must always land. `{ transform }` remains the
+  // hook if a field ever needs redacting in place rather than withholding all
+  // of it.
+  const disposeTracing = deps.instrument(deps.createOpenTelemetryInstrumentation({}));
 
   const costHistogram = deps.meter.createHistogram(COST_METRIC, { unit: "USD" });
   const reviewRuns = deps.meter.createCounter(REVIEW_RUNS_METRIC);
@@ -180,7 +199,7 @@ export async function installTelemetry(serviceName = "ada"): Promise<() => Promi
 
   console.log(
     process.env.OTEL_EXPORTER_OTLP_ENDPOINT
-      ? "[ada] telemetry: @flue/opentelemetry registered (traces + metrics, no content capture)"
+      ? "[ada] telemetry: @flue/opentelemetry registered (traces + metrics, INCLUDING prompts and replies — platform FGA governs who can read them)"
       : "[ada] telemetry: @flue/opentelemetry registered, but no exporter — spans are discarded",
   );
 

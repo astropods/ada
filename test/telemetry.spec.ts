@@ -30,8 +30,9 @@ import { installTelemetry } from "../agent/telemetry/otel.ts";
  * framework — it is testing that WE INSTALLED IT, and installed it with the
  * settings this deployment requires. Both are easy to get silently wrong: a
  * broken or absent trace looks exactly like a working one until someone opens
- * a dashboard, and a content-capture regression looks like nothing at all
- * while quietly shipping private source to a collector.
+ * a dashboard, and a content-capture regression looks like nothing at all —
+ * in either direction: shipping private source unintentionally, or withholding
+ * it and leaving every evaluator with nothing to score.
  *
  * So this drives an actual agent — real runtime, real interceptor, real tool
  * call — against a faux model provider (no network, no credential).
@@ -206,14 +207,24 @@ test("emits a correctly parented GenAI trace for a real agent turn", async () =>
     "the run span carries a cost attribute",
   ).toContain("gen_ai.usage.cost_usd");
 
-  // ---- no content capture ------------------------------------------------
-  // Ada works on private repositories; prompts, completions and tool payloads
-  // must never travel to the collector.
-  for (const s of spans) {
-    for (const key of Object.keys(s.attributes)) {
-      expect(key, `no message content on ${s.name}`).not.toMatch(
-        /input_messages|output_messages|system_instructions|tool_definitions|arguments|result/,
-      );
-    }
-  }
+  // ---- content capture ---------------------------------------------------
+  // This asserted the OPPOSITE until content was turned on. Withholding
+  // prompts and replies left every trace with timings and no input or output,
+  // which made a custom evaluator — it judges a trace's input and output —
+  // unable to score anything. Who may read them is now the platform's FGA
+  // decision rather than something settled by blinding the agent.
+  //
+  // So the assertion inverts: content must ARRIVE, or trace-based evaluation
+  // silently goes back to scoring nothing.
+  const contentKeys = spans.flatMap((s) => Object.keys(s.attributes));
+  expect(contentKeys, "the prompt reaches the collector").toContain("gen_ai.input.messages");
+  expect(contentKeys, "and so does the reply").toContain("gen_ai.output.messages");
+
+  // Content shares a 56 KiB per-span pool with everything else, and the
+  // backend drops every write after the first overflow — so a span that
+  // carries content must still carry the operational attributes. Checked on
+  // the run span because that is where cost lands.
+  expect(Object.keys(agent!.attributes), "content did not crowd out usage").toContain(
+    "gen_ai.usage.cost_usd",
+  );
 });
