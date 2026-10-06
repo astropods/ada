@@ -1,0 +1,28 @@
+# yaml-language-server: $schema=https://astropods.ai/schema/evaluation.json
+#
+# Custom evaluators for Ada. One concern each, with the rubric in its own file
+# so a reviewer can read what is actually being judged without scrolling YAML.
+schema: evaluation/v1
+
+evaluators:
+  # Ada narrates between tool calls — useful while a turn runs, worthless once
+  # it has finished. Shipping that narration to the thread buried the answer
+  # under screens of "Let me read the ticket…", which is the complaint this
+  # encodes. The fix (post only the final assistant message, narration as a
+  # transient status) is the kind of thing that regresses quietly, so it is
+  # worth a standing check rather than a one-off review.
+  #
+  # Input and output only: the reply either reads as an answer or it does not,
+  # and the tool steps are not needed to tell. Boolean rather than a score,
+  # because the question has a right answer and a trend of one is easier to
+  # read than a drifting average.
+  - key: answer_not_narration
+    label: Answer, not narration
+    description: >-
+      Whether the reply is what the reader needs to know now, rather than a
+      record of how it was found. False when step-by-step narration, pasted
+      tool output, or a quoted sub-report carries the body of the message.
+    type: llm
+    prompt_file: evaluation/answer-not-narration.md
+    output:
+      type: boolean

@@ -1,159 +1,155 @@
 ---
-description: "Ada — a coding agent (built on Flue 2.0) you talk to over Slack, web chat, or an AG-UI/SSE frontend."
-tags: [ada, flue, ag-ui, sse, slack, github, coding-agent]
+description: "Ada — a coding agent you talk to over Slack, web chat, or its own frontend."
+tags: [ada, slack, github, coding-agent]
 capabilities:
-  - "Runs a Flue 2.0 agent loop in-process — no CLI child, no stream-json contract"
-  - "Secure by default: always-on principles, on-demand security playbooks, and enforced diff gates"
-  - "Holds multi-turn conversations, durable in Postgres across restarts and redeploys"
-  - "Runs the model's commands in a separate, secret-less sandbox container"
-  - "Isolates each session in its own writable workspace"
-  - "Scrubs the sandbox env so tools can't read host secrets (AWS/DB/gateway)"
-  - "Translates Flue's event stream into AG-UI protocol events, one-to-one"
-  - "Re-emits AG-UI events over SSE with lossless reconnect (Last-Event-ID replay)"
-  - "Serves an AG-UI-compatible frontend; external AG-UI clients (e.g. CopilotKit) can consume the stream"
-  - "Also exposes Flue's native agent routes for @flue/sdk clients"
-  - "Connects each user's GitHub via per-user OAuth so git/gh act as them"
-  - "Accepts file attachments from Slack, web chat, and the AG-UI frontend — images are shown to the model directly, other files are staged at uploads/<name> for its own tools to read; oversized or too-many-file batches are refused with an explanation"
-  - "Exports OTel traces/metrics via @flue/opentelemetry; content capture off by default"
+  - "Reads, writes, and tests code in your repositories from a chat conversation"
+  - "Works on GitHub as you — clones, commits, and opens pull requests with your account"
+  - "Follows your repository's own conventions (AGENTS.md, CLAUDE.md, and similar)"
+  - "Checks its own work for security issues, weakened tests, and leaked secrets"
+  - "Gets an independent code review on bigger changes before it finishes"
+  - "Remembers the conversation, so you can keep replying with follow-ups"
+  - "Accepts files and screenshots you attach in Slack or web chat"
+  - "Runs every conversation in its own isolated sandbox"
+  - "Shows its work live — every command, file edit, and result as it happens"
 repository: github:astropods/ada
 integrations: [GitHub, Slack]
 ---
 
 ## Overview
 
-**Ada** is a coding agent built on [Flue 2.0](https://flueframework.com), the
-open TypeScript agent framework. The agent is a function — `Ada()` in
-`agent/agents/ada.ts` — that declares what it needs through hooks: `useModel()`
-for the LLM, `useSandbox()` for a filesystem and shell, `useInstruction()` for
-guidance, `useTool()` for capabilities. Flue runs the loop in-process.
+Small coding chores pile up: bump a config value, fix a failing test, rename a
+field across a codebase, open the PR. Each one means cloning, poking around, and
+remembering the project's rules. **Ada** does that legwork for you. Describe
+what you want in plain language — in Slack, in web chat, or in Ada's own web app
+— and Ada reads the code, makes the change, runs the checks, and reports back.
 
-Converse with Ada over Slack / web chat (the platform messaging sidecar) or any
-AG-UI frontend. Flue's event stream is translated into
-[AG-UI](https://docs.ag-ui.com) protocol events and streamed to the browser over
-Server-Sent Events, so any AG-UI-compatible frontend can render a run — a plain
-chat UI or a richer dashboard — without backend changes.
+Ask it things like:
 
-Each session gets its own writable sandbox workspace as its working directory.
-When the sandbox container is deployed, that workspace is also isolated FROM
-OTHER SESSIONS two ways: path resolution rejects a file operation that escapes
-it, and shell commands run under a per-instance uid against a 0700 directory, so
-one conversation cannot read another's checkout by naming an absolute path
-either. Command confinement needs the sandbox service to run as root and is
-reported by its `/health`; the network is not isolated. The in-process `local()`
-fallback has neither — it is for local runs, not a multi-tenant boundary.
+- *"Clone acme/billing and find out why the invoice tests are failing."*
+- *"Read config.json and bump the retries to 5."*
+- *"Add input validation to the signup endpoint and open a PR."*
 
-The sandbox env is scrubbed: Flue's `local()` allowlist plus the proxy/TLS
-and build-cache vars, and the user's GitHub token. So a command the model runs —
-`bash` → `env` — can't read the container's host secrets (AWS, database, gateway
-keys). The model credential is no longer forwarded at all, because no child
-process needs it.
+> **Why the name?** Ada is named after **Ada Lovelace**, widely regarded as the
+> first computer programmer. On Astropods it deploys as `ada`.
 
-Model calls route through the Astro AI Gateway (`astro_ai_gateway: true`) via a
-custom pi-ai provider, so the container needs no personal `ANTHROPIC_API_KEY`.
-Supplying one as an input opts out of the gateway and talks to Anthropic
-directly.
+## What Ada does
 
-> **Why the name?** Named after **Ada Lovelace** — widely regarded as the first
-> computer programmer — a fitting namesake for a coding agent. The Astropods
-> blueprint deploys as `ada-your-personal-coding-agent` because a bare `ada`
-> isn't a valid blueprint name.
-
-## Usage
-
-Message Ada over Slack / web chat, or open the agent's frontend URL and send a
-prompt (e.g. *"read config.json and bump the retries"*). You'll see streaming
-assistant text, tool-call cards with live arguments, tool results, and a final
-result — as AG-UI events. Keep replying to continue the same session: follow-up
-turns resume the prior context in the same workspace. The built-in UI shows a
-per-session token/cost readout, a session-history switcher, and a settings panel
-(GitHub status + connect/setup actions).
-
-External clients can drive the same pipeline over HTTP:
-
-- **`POST /sessions`** `{prompt}` → `{sessionId}` (starts a session)
-- **`POST /sessions/:id/messages`** `{prompt}` → continue that session with a follow-up turn
-- **`GET /sessions/:id/events`** → SSE AG-UI stream; honours `Last-Event-ID` for lossless replay
-
-Flue's own routes are mounted alongside at **`/agents/ada/:id`** for `@flue/sdk`
-clients. Both address the same durable instances, so a session started over one
-is readable over the other — which is why `/agents/ada/*` is admin-gated rather
-than open, and why every `/sessions/:id` route checks session OWNERSHIP and not
-just whether the caller is authorized. See "Who may touch which session" in the
-README; set `ADMIN_EMAILS` in any multi-user deployment.
-
-The native router is **read/abort only**: `POST /agents/ada/:id` (prompt
-dispatch) returns 405. It renders the agent without `SessionRunner`, so the
-per-session context that selects the sandbox was never published and the turn
-executed in the control-plane container at `process.cwd()` instead. Start turns
-with `POST /sessions`.
-
-Three ways to run it:
-
-```bash
-node agent/index.ts                                   # no build step (type-stripping)
-vite build && node dist/server.mjs                    # the Flue Node target
-npx flue run agent/agents/ada.ts --message "…"        # one turn, terminal only
-```
-
-## GitHub
-
-Ada can act on GitHub as the individual user it's talking to — no static token
-baked into the container.
-
-- **Connect** — a user runs `connect github` in a DM (or clicks **Connect
-  GitHub** in the web UI); Ada replies with a link to authorize. Their token is
-  stored per-user and injected as `GH_TOKEN` into the sandbox env, so `git` and
-  `gh` inside the session act as them. A connected user's render also gains the
-  `checkout_repo` tool, which clones with that token server-side — the model
-  names `owner/repo` and never handles a credential.
-- **Set up** — an admin (whose verified email is listed in `ADMIN_EMAILS`) opens
-  the web UI and clicks **Set up GitHub App** to provision the App through
-  GitHub's App-Manifest flow. No manual App registration, no client id/secret to
-  copy. The App is provisioned **private** by default (single-tenant); set
-  `GITHUB_APP_PUBLIC=true` for multi-tenant so other users can install it on their
-  own repos and connect. (Setup is web-only: admin is verified by email, which chat doesn't carry.
-  If `ADMIN_EMAILS` is unset, any signed-in user can perform the *initial* setup;
-  provisioning then locks.)
+- **Talks wherever you are** — message Ada in Slack or web chat, or open its web
+  app. Keep replying in the same thread to build on what it already did.
+- **Shows its work** — you watch it in real time: what it's thinking, which
+  commands it runs, which files it edits, and the final result. The web app also
+  shows how much each conversation costs, lets you switch between past
+  conversations, and has a settings panel.
+- **Works as you on GitHub** — once you connect your account, Ada clones, commits,
+  and opens pull requests under your name, with your permissions. Nobody else's
+  access is involved.
+- **Respects your project's rules** — before it starts, Ada reads the repo's own
+  guidance files (`AGENTS.md`, `AGENT.md`, `CLAUDE.md`, `CONVENTIONS.md`) and
+  follows them over its own defaults. If your project says "every PR needs a
+  changelog entry," Ada adds one instead of finding out from CI.
+- **Takes attachments** — drop a screenshot or file into Slack or web chat. Ada
+  sees images directly and can open other files with its tools. If a batch is
+  too large or has too many files, Ada tells you why it can't take them.
 
 ## Secure by default
 
-Ada is opinionated about how code gets written, in three layers: a short set of
-always-on principles, seven security playbooks loaded on demand as Flue skills
-(API authorization, safe migrations, injection defence, docs, dependencies,
-secrets, agent integrity), and enforcement gates that read the real diff at
-every would-stop point and send the model back when a default was missed.
+Ada is opinionated about writing safe code, and it checks itself:
 
-Before planning, Ada also reads the repository's own conventions
-(`AGENTS.md`/`AGENT.md`/`CLAUDE.md`/`CONVENTIONS.md`, matched case-insensitively
-in the working directory or a checkout one level below it) and treats them as
-overriding its own defaults — so project rules like "every PR needs a changelog
-file" are followed rather than discovered by CI.
+- **Built-in good habits** — a short set of principles Ada always follows, plus
+  in-depth playbooks it pulls in when the task calls for them: access control,
+  database migrations, injection attacks, dependencies, secrets, documentation,
+  and AI agent safety.
+- **Checks before it finishes** — Ada looks over its actual changes before saying
+  it's done. It won't hand back work that contains a password or API key, or
+  that "passes" only because a test was skipped or a check was switched off. It
+  also flags softer issues, like a changed endpoint without tests or a new
+  dependency without an updated lockfile.
+- **A second pair of eyes** — for bigger changes, a separate reviewer reads the
+  diff fresh, looking at test quality, error handling, API compatibility, and
+  concurrency. Serious findings get fixed before Ada finishes. Small or
+  docs-only changes skip the review, and you can turn it off at any time by
+  asking Ada.
+- **Kept in a sandbox** — the commands Ada runs execute in their own isolated
+  space, one per conversation, with no access to the server's secrets or to
+  other people's conversations.
 
-A further layer runs on substantive changes: an independent `code-reviewer`
-subagent whose lenses are ported from Cruise Line (test quality, error handling,
-API contract, concurrency). It reviews with fresh context — an agent re-reading
-its own work has already convinced itself — and its critical/high findings send
-Ada back before finishing. Enabled by `ADA_REVIEWER_ENABLED`, and switchable
-mid-conversation by just asking Ada to turn review off.
+## Usage
 
-The gates block on credentials appearing in a diff and on controls being
-weakened to reach green (a skipped test, a `@ts-ignore`, `--no-verify`), and
-advise on endpoints changed without tests, stale API specs, migrations without a
-reversal, and dependencies added without a lockfile. Advisory rules fire once
-per session and blocking ones escalate three times then stop, so a gate can
-never loop.
+### Start a conversation
+
+Message Ada in Slack or web chat, or open the agent's web app, and describe what
+you want. Reply in the same thread to continue — Ada picks up where it left off,
+with the same files and context.
+
+### Connect GitHub
+
+To let Ada work on your repositories, send **`connect github`** in a direct
+message (or click **Connect GitHub** in the web app) and follow the link to
+authorize. From then on Ada acts as you on GitHub; it never sees or handles your
+password.
+
+### First-time setup (admins)
+
+Before anyone can connect, an admin sets up Ada's GitHub App once. Open the web
+app and click **Set up GitHub App**: Ada walks you through GitHub's own setup in
+a couple of clicks, with no keys or secrets to copy by hand.
+
+- **Who counts as an admin** — list their email addresses in the `ADMIN_EMAILS`
+  setting. If it's empty, the first signed-in user can do the initial setup,
+  after which it locks. Setup only works from the web app, since chat doesn't
+  verify email addresses.
+- **Just you, or your team?** — by default the App is private: only you can
+  install it. Set `GITHUB_APP_PUBLIC=true` to let teammates install it on their
+  own repositories and connect too.
+
+### Settings
+
+| Setting | What it does |
+| --- | --- |
+| `ADMIN_EMAILS` | Who can perform the GitHub App setup. |
+| `GITHUB_APP_PUBLIC` | Let other people install the GitHub App (default: off). |
+| `ADA_REVIEWER_ENABLED` | Whether the independent code review runs by default (default: on). |
+| `MAX_CONCURRENT_RUNS` | How many tasks can run at once (default: 3). Lower it if the agent runs short on memory. |
+| `ANTHROPIC_API_KEY` | Use your own Anthropic key instead of the Astro AI Gateway (optional). |
+| `PUBLIC_BASE_URL` | The address people use to reach Ada. Usually detected automatically; needed for GitHub links sent in chat. |
+
+## For developers
+
+Ada is built on [Flue 2.0](https://flueframework.com), an open-source TypeScript
+agent framework, and streams its progress using the open
+[AG-UI](https://docs.ag-ui.com) protocol, so any AG-UI-compatible frontend (e.g.
+CopilotKit) can display a conversation. Model calls go through the Astro AI
+Gateway by default, so no personal API key is needed.
+
+You can also drive Ada over HTTP:
+
+- **`POST /sessions`** `{prompt}` → `{sessionId}` starts a conversation
+- **`POST /sessions/:id/messages`** `{prompt}` sends a follow-up
+- **`GET /sessions/:id/events`** streams progress (Server-Sent Events, with
+  replay on reconnect)
+
+Flue's native routes (`/agents/ada/:id`) are available to admins for reading and
+cancelling conversations; start new turns with `POST /sessions`. Each
+conversation is only visible to the person who started it, so set
+`ADMIN_EMAILS` in any shared deployment. See the README for the full access
+rules.
+
+Run it locally:
+
+```bash
+node agent/index.ts                                   # no build step
+vite build && node dist/server.mjs                    # production build
+npx flue run agent/agents/ada.ts --message "…"        # a single turn in the terminal
+```
 
 ## Limitations
 
-- Flue's conversation database and the sandbox workspaces live on the container
-  filesystem, so **conversation history does not survive a restart or
-  redeploy** — a resumed Slack thread re-clones its repo and starts fresh. A
-  volume can only attach to a knowledge *container*, and the out-of-process
-  sandbox that used to provide one is gone; the durable fix is a
-  Postgres-backed Flue `PersistenceAdapter`. GitHub tokens and repo bindings
-  are unaffected (those are in Postgres).
-- Locally, with no database, conversations are in SQLite and do not survive a
-  restart. Deployed they are in Postgres and do.
-- The AG-UI event log is in memory with no GC yet. (The OAuth CSRF state is no
-  longer among these — it is a signed, self-contained token now.)
-- One turn runs at a time per session — an overlapping follow-up gets `409 busy`.
+- **One request at a time per conversation** — if you send a new message while
+  Ada is still working, it'll tell you it's busy. Wait for it to finish, or start
+  a new conversation.
+- **Local runs forget conversations** — without a database, history is kept in a
+  local file and lost on restart. Deployed instances keep it in Postgres.
+- **Sandboxes don't restrict network access** — Ada's sandbox isolates files and
+  secrets, but commands can still reach the internet.
+- **The live progress feed is kept in memory** — reconnecting to a conversation's
+  live feed after the server restarts won't replay earlier progress.
