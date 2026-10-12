@@ -1,6 +1,6 @@
 # Ada
 
-[![Deploy on Astropods](assets/deploy-button.svg)](https://astropods.com/astropods/ada-your-personal-coding-agent)
+[![Deploy on Astropods](https://raw.githubusercontent.com/astropods/agents/latest/assets/deploy-button.svg)](https://astropods.com/astropods/ada-your-personal-coding-agent)
 
 **Ada** is a coding agent built on **[Flue 2.0](https://flueframework.com)**, the
 open TypeScript agent framework. The agent loop runs **in-process**; its event
